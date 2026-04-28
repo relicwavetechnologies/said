@@ -1,0 +1,16 @@
+# Secrets
+.env
+
+# Rust
+/target
+
+# Python (legacy)
+venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Temp audio
+*.wav
