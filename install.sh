@@ -11,6 +11,7 @@
 #    vp update       → get latest version
 #    vp status       → check if running
 #    vp logs         → live logs
+#    vp errors       → show recent errors
 #    vp delete       → remove everything
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -19,6 +20,8 @@ INSTALL_URL="https://raw.githubusercontent.com/relicwavetechnologies/said/main/i
 REPO="relicwavetechnologies/said"
 
 INSTALL_DIR="$HOME/VoicePolish"
+APP_BUNDLE="$INSTALL_DIR/VoicePolish.app"
+APP_EXEC="$APP_BUNDLE/Contents/MacOS/VoicePolish"
 PLIST_NAME="com.voicepolish.app"
 PLIST_PATH="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
 LOG_OUT="/tmp/voice-polish.log"
@@ -40,14 +43,17 @@ echo "════════════════════════�
 
 # ── 1. Stop any running instance ─────────────────────────────────────────────
 step "1/5" "Stopping any running instance"
-pkill -f "VoicePolish/voice-polish" 2>/dev/null || true
-pkill -f "VoicePolish.app" 2>/dev/null || true
-launchctl bootout "gui/$(id -u)/$PLIST_NAME" 2>/dev/null || true
+pkill -f "VoicePolish/voice-polish"            2>/dev/null || true
+pkill -f "VoicePolish.app/Contents/MacOS"      2>/dev/null || true
+launchctl bootout "gui/$(id -u)/$PLIST_NAME"   2>/dev/null || true
+sleep 1
 ok "Ready"
 
 # ── 2. Download binary ──────────────────────────────────────────────────────
 step "2/5" "Downloading Voice Polish"
 mkdir -p "$INSTALL_DIR"
+mkdir -p "$APP_BUNDLE/Contents/MacOS"
+mkdir -p "$APP_BUNDLE/Contents/Resources"
 
 ARCH=$(uname -m)
 case "$ARCH" in
@@ -58,27 +64,26 @@ esac
 
 info "Downloading latest release for $ARCH …"
 
-# Get the latest tag name, then build a direct download URL
 TAG=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
     | grep '"tag_name"' | head -1 | cut -d'"' -f4)
 
-if [ -z "$TAG" ]; then
-    fail "Could not find latest release. Check https://github.com/$REPO/releases"
-fi
+[ -z "$TAG" ] && fail "Could not find latest release — check https://github.com/$REPO/releases"
 
 DOWNLOAD_URL="https://github.com/$REPO/releases/download/$TAG/$ASSET_NAME"
-curl -fsSL -o "$INSTALL_DIR/voice-polish" "$DOWNLOAD_URL" \
+curl -fsSL -o "$APP_EXEC" "$DOWNLOAD_URL" \
     || fail "Download failed — check https://github.com/$REPO/releases"
-chmod +x "$INSTALL_DIR/voice-polish"
-ok "Binary downloaded ($(du -h "$INSTALL_DIR/voice-polish" | cut -f1 | xargs))"
+chmod +x "$APP_EXEC"
+
+# Remove the old standalone binary if it exists (no longer needed)
+rm -f "$INSTALL_DIR/voice-polish"
+
+ok "Binary downloaded $(du -h "$APP_EXEC" | cut -f1 | xargs) — tag $TAG"
 
 # ── 3. API key ──────────────────────────────────────────────────────────────
 step "3/5" "API key"
 
 EXISTING_KEY=""
-if [ -f "$INSTALL_DIR/.env" ]; then
-    EXISTING_KEY=$(grep "^GATEWAY_API_KEY=" "$INSTALL_DIR/.env" 2>/dev/null | cut -d= -f2-)
-fi
+[ -f "$INSTALL_DIR/.env" ] && EXISTING_KEY=$(grep "^GATEWAY_API_KEY=" "$INSTALL_DIR/.env" 2>/dev/null | cut -d= -f2-)
 
 if [ -n "$EXISTING_KEY" ] && [ "$EXISTING_KEY" != "$DEFAULT_GATEWAY_KEY" ]; then
     skip "Custom API key already in .env"
@@ -86,7 +91,7 @@ if [ -n "$EXISTING_KEY" ] && [ "$EXISTING_KEY" != "$DEFAULT_GATEWAY_KEY" ]; then
 else
     echo ""
     echo -e "  ${BOLD}Enter your Gateway API key${NC} (press Enter to use the default shared key):"
-    echo -e "  ${CYAN}[default key will be used if you leave this blank]${NC}"
+    echo -e "  ${CYAN}[leave blank for the shared key]${NC}"
     echo -n "  Key: "
     read -r USER_KEY
     if [ -n "$USER_KEY" ]; then
@@ -100,13 +105,8 @@ else
     ok ".env written"
 fi
 
-# ── 4. Build .app bundle ────────────────────────────────────────────────────
-step "4/5" "Building .app bundle"
-APP_BUNDLE="$INSTALL_DIR/VoicePolish.app"
-APP_EXEC="$APP_BUNDLE/Contents/MacOS/VoicePolish"
-
-mkdir -p "$APP_BUNDLE/Contents/MacOS"
-mkdir -p "$APP_BUNDLE/Contents/Resources"
+# ── 4. .app bundle ──────────────────────────────────────────────────────────
+step "4/5" "Configuring .app bundle"
 
 cat > "$APP_BUNDLE/Contents/Info.plist" << 'INFOPLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -131,26 +131,24 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'INFOPLIST'
   <true/>
   <key>NSMicrophoneUsageDescription</key>
   <string>Voice Polish needs microphone access to record and transcribe your voice.</string>
-  <key>NSAppleEventsUsageDescription</key>
-  <string>Voice Polish pastes the polished text at your cursor.</string>
+  <key>NSAccessibilityUsageDescription</key>
+  <string>Voice Polish needs Accessibility access to paste transcribed text at your cursor.</string>
+  <key>NSInputMonitoringUsageDescription</key>
+  <string>Voice Polish needs Input Monitoring access to detect the fn+Shift hotkey.</string>
 </dict>
 </plist>
 INFOPLIST
 
-cat > "$APP_EXEC" << LAUNCHER
-#!/bin/bash
-cd "$INSTALL_DIR"
-exec "$INSTALL_DIR/voice-polish"
-LAUNCHER
-chmod +x "$APP_EXEC"
-
+# Clear quarantine flag so macOS doesn't block the unsigned binary
 xattr -cr "$APP_BUNDLE" 2>/dev/null || true
+
+# Register the bundle with Launch Services
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
     -f "$APP_BUNDLE" 2>/dev/null || true
 
-ok ".app bundle created"
+ok ".app bundle ready"
 
-# ── 5. vp command + auto-start ───────────────────────────────────────────────
+# ── 5. vp command + LaunchAgent ─────────────────────────────────────────────
 step "5/5" "Installing vp command + auto-start"
 
 mkdir -p "$HOME/Library/LaunchAgents"
@@ -171,14 +169,14 @@ PLEOF
 
 launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || \
 launchctl load      "$PLIST_PATH"                 2>/dev/null || true
-
-ok "Auto-start registered"
+ok "Auto-start at login registered"
 
 mkdir -p "$HOME/bin"
 cat > "$HOME/bin/vp" << 'VPEOF'
 #!/bin/bash
 INSTALL_DIR="$HOME/VoicePolish"
 APP_BUNDLE="$INSTALL_DIR/VoicePolish.app"
+APP_EXEC="$APP_BUNDLE/Contents/MacOS/VoicePolish"
 PLIST_NAME="com.voicepolish.app"
 PLIST_PATH="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
 INSTALL_URL="https://raw.githubusercontent.com/relicwavetechnologies/said/main/install.sh"
@@ -187,25 +185,23 @@ LOG_ERR="/tmp/voice-polish.err"
 
 case "${1:-}" in
   start|"")
-    if pgrep -f "VoicePolish/voice-polish" &>/dev/null; then
+    if pgrep -f "VoicePolish.app/Contents/MacOS" &>/dev/null; then
       echo "✅  Already running — look for ● in menu bar"
     else
       : > "$LOG_ERR"
-      open -g -a "$APP_BUNDLE" 2>/dev/null
-      if [ $? -ne 0 ]; then
-        "$APP_BUNDLE/Contents/MacOS/VoicePolish" >> "$LOG_OUT" 2>> "$LOG_ERR" &
-      fi
+      open -g -a "$APP_BUNDLE" 2>/dev/null || \
+        "$APP_EXEC" >> "$LOG_OUT" 2>> "$LOG_ERR" &
       sleep 2
-      if pgrep -f "VoicePolish/voice-polish" &>/dev/null; then
+      if pgrep -f "VoicePolish.app/Contents/MacOS" &>/dev/null; then
         echo "✅  Voice Polish started — look for ● in menu bar"
       else
-        echo "❌  Failed to start. Check errors with: vp errors"
+        echo "❌  Failed to start. Run: vp errors"
       fi
     fi
     ;;
   stop)
     launchctl bootout "gui/$(id -u)/$PLIST_NAME" 2>/dev/null || true
-    pkill -f "VoicePolish/voice-polish" 2>/dev/null || true
+    pkill -f "VoicePolish.app/Contents/MacOS"    2>/dev/null || true
     echo "⏹   Voice Polish stopped"
     ;;
   update)
@@ -213,8 +209,8 @@ case "${1:-}" in
     curl -fsSL "$INSTALL_URL" | bash
     ;;
   status)
-    if pgrep -f "VoicePolish/voice-polish" &>/dev/null; then
-      echo "● Running (pid $(pgrep -f 'VoicePolish/voice-polish'))"
+    if pgrep -f "VoicePolish.app/Contents/MacOS" &>/dev/null; then
+      echo "● Running (pid $(pgrep -f 'VoicePolish.app/Contents/MacOS'))"
     else
       echo "○ Stopped"
     fi
@@ -223,33 +219,41 @@ case "${1:-}" in
     tail -f "$LOG_OUT"
     ;;
   errors)
-    if [ -s "$LOG_ERR" ]; then
-      tail -30 "$LOG_ERR"
-    else
-      echo "No errors logged."
-    fi
+    if [ -s "$LOG_ERR" ]; then tail -30 "$LOG_ERR"; else echo "No errors."; fi
+    ;;
+  permissions)
+    echo ""
+    echo "Opening System Settings for the two required permissions…"
+    echo ""
+    # Input Monitoring — for the fn+Shift hotkey
+    open "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
+    sleep 1
+    # Accessibility — for paste
+    open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+    echo "  1. Find 'VoicePolish' in each list and toggle it ON"
+    echo "  2. Run 'vp' to start"
     ;;
   delete)
     echo "→  Removing Voice Polish completely…"
-    pkill -f "VoicePolish/voice-polish" 2>/dev/null || true
+    pkill -f "VoicePolish.app/Contents/MacOS"    2>/dev/null || true
     launchctl bootout "gui/$(id -u)/$PLIST_NAME" 2>/dev/null || true
     rm -f "$PLIST_PATH"
     rm -rf "$INSTALL_DIR"
     rm -f "$HOME/bin/vp"
-    echo "✓  Done."
-    echo "   To reinstall: curl -fsSL $INSTALL_URL | bash"
+    echo "✓  Done. To reinstall: curl -fsSL $INSTALL_URL | bash"
     ;;
   *)
     echo ""
     echo "  Voice Polish"
     echo ""
-    echo "  vp              start"
-    echo "  vp stop         stop"
-    echo "  vp status       check if running"
-    echo "  vp logs         live output logs"
-    echo "  vp errors       show recent errors"
-    echo "  vp update       get latest version"
-    echo "  vp delete       remove everything"
+    echo "  vp                start"
+    echo "  vp stop           stop"
+    echo "  vp status         check if running"
+    echo "  vp logs           live output log"
+    echo "  vp errors         show recent errors"
+    echo "  vp permissions    open System Settings for mic + accessibility"
+    echo "  vp update         download latest version"
+    echo "  vp delete         remove everything"
     echo ""
     ;;
 esac
@@ -258,11 +262,10 @@ chmod +x "$HOME/bin/vp"
 export PATH="$HOME/bin:$PATH"
 
 for PROFILE in "$HOME/.zshrc" "$HOME/.bash_profile"; do
-    if [ -f "$PROFILE" ] && ! grep -q 'PATH="$HOME/bin' "$PROFILE" 2>/dev/null; then
+    if [ -f "$PROFILE" ] && ! grep -q 'HOME/bin' "$PROFILE" 2>/dev/null; then
         echo 'export PATH="$HOME/bin:$PATH"' >> "$PROFILE"
     fi
 done
-
 ok "vp command installed"
 
 # ── Launch ───────────────────────────────────────────────────────────────────
@@ -272,31 +275,37 @@ info "Starting Voice Polish …"
 open -g -a "$APP_BUNDLE" 2>/dev/null || "$APP_EXEC" >> "$LOG_OUT" 2>> "$LOG_ERR" &
 sleep 3
 
-if pgrep -f "VoicePolish/voice-polish" &>/dev/null; then
+if pgrep -f "VoicePolish.app/Contents/MacOS" &>/dev/null; then
     ok "App running — look for ● in your menu bar"
 else
-    echo ""
     echo -e "  ${YELLOW}⚠  App may not have started. Run: vp errors${NC}"
 fi
 
-# ── Permissions ──────────────────────────────────────────────────────────────
+# ── Permission instructions ───────────────────────────────────────────────────
 echo ""
 echo "══════════════════════════════════════════════"
-echo -e "${YELLOW}${BOLD}⚠️  Grant 2 permissions — takes ~30 seconds${NC}"
+echo -e "${YELLOW}${BOLD}⚠️  2 permissions required — takes 1 minute${NC}"
 echo "══════════════════════════════════════════════"
 echo ""
-echo -e "  ${BOLD}1. Microphone${NC} (lets the app hear you)"
-echo -e "     System Settings → Privacy & Security → ${BOLD}Microphone${NC}"
-echo -e "     Find ${BOLD}Voice Polish${NC} → toggle it ${BOLD}ON${NC}"
-echo -e "     (macOS may have already shown a popup — say Allow)"
+echo -e "  Run this to open both settings pages automatically:"
+echo -e "  ${CYAN}${BOLD}vp permissions${NC}"
 echo ""
-echo -e "  ${BOLD}2. Accessibility${NC} (lets the app paste text at your cursor)"
-echo -e "     System Settings → Privacy & Security → ${BOLD}Accessibility${NC}"
-echo -e "     Find ${BOLD}Voice Polish${NC} → toggle it ${BOLD}ON${NC}"
+echo -e "  Or open manually:"
+echo ""
+echo -e "  ${BOLD}1. Input Monitoring${NC}  (for the fn+Shift hotkey)"
+echo -e "     System Settings → Privacy & Security → Input Monitoring"
+echo -e "     Find ${BOLD}VoicePolish${NC} → toggle ${BOLD}ON${NC}"
+echo ""
+echo -e "  ${BOLD}2. Accessibility${NC}  (to paste text at your cursor)"
+echo -e "     System Settings → Privacy & Security → Accessibility"
+echo -e "     Find ${BOLD}VoicePolish${NC} → toggle ${BOLD}ON${NC}"
+echo ""
+echo -e "  ${BOLD}3. Microphone${NC}  (auto-prompted on first recording)"
+echo -e "     Just say Allow when the popup appears."
 echo ""
 echo "══════════════════════════════════════════════"
 echo -e "${GREEN}${BOLD}✅  Done!${NC}"
 echo ""
-echo -e "  ${BOLD}Usage:${NC}  Hold Shift → tap fn  to toggle recording"
-echo -e "  ${BOLD}Manage:${NC} type ${CYAN}vp${NC} for commands"
+echo -e "  ${BOLD}Hotkey:${NC}  Hold Shift → tap fn  (start / stop recording)"
+echo -e "  ${BOLD}Manage:${NC}  type ${CYAN}vp${NC} in Terminal for all commands"
 echo ""

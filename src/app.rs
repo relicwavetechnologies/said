@@ -66,7 +66,7 @@ impl AppCore {
                 let data = wav_data.ok_or("no audio data")?;
                 println!("[app] ── sending to gateway ─────────────────────");
                 let polished = api::process(data)?;
-                paster::paste(&polished);
+                paster::paste(&polished).map_err(|e| format!("[paste] ✗ {e}"))?;
                 println!("[app] ✓ pasted");
                 println!("[app] ─────────────────────────────────────────");
                 Ok(())

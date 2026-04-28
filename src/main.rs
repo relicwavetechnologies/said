@@ -35,18 +35,27 @@ fn preflight() {
 }
 
 fn main() {
-    // Load .env from the directory the binary is in, or current dir
+    // 1. Exe dir — works for local dev (./target/release/voice-polish)
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
     if let Some(dir) = &exe_dir {
         let _ = dotenvy::from_path(dir.join(".env"));
     }
-    let _ = dotenvy::dotenv(); // also check cwd
+    // 2. ~/VoicePolish/.env — works when binary lives inside .app bundle
+    if std::env::var("GATEWAY_API_KEY").is_err() {
+        if let Ok(home) = std::env::var("HOME") {
+            let fallback = std::path::Path::new(&home).join("VoicePolish").join(".env");
+            let _ = dotenvy::from_path(fallback);
+        }
+    }
+    // 3. CWD fallback
+    let _ = dotenvy::dotenv();
 
     let _lock = acquire_lock();
     config::validate();
     preflight();
+    paster::request_permission(); // trigger Accessibility permission dialog on first run
 
     let mode = config::current_mode();
     println!("🎤  Voice Polish");
