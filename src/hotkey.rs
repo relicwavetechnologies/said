@@ -1,8 +1,8 @@
 use core_foundation::runloop::kCFRunLoopCommonModes;
 use core_graphics::event::CGEventFlags;
 use std::sync::Arc;
+use std::time::Instant;
 
-// Raw Core Graphics FFI for event taps
 #[allow(non_upper_case_globals)]
 mod ffi {
     use std::ffi::c_void;
@@ -18,11 +18,14 @@ mod ffi {
         user_info: *mut c_void,
     ) -> CGEventRef;
 
+    // CGEventField for keycode
+    pub const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
+
     unsafe extern "C" {
         pub fn CGEventTapCreate(
-            tap: u32,        // kCGHIDEventTap = 0
-            place: u32,      // kCGHeadInsertEventTap = 0
-            options: u32,    // kCGEventTapOptionListenOnly = 1
+            tap: u32,
+            place: u32,
+            options: u32,
             events_of_interest: u64,
             callback: CGEventTapCallBack,
             user_info: *mut c_void,
@@ -35,28 +38,23 @@ mod ffi {
         ) -> *mut c_void;
 
         pub fn CGEventGetFlags(event: CGEventRef) -> u64;
+        pub fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
 
-        pub fn CFRunLoopAddSource(
-            rl: *mut c_void,
-            source: *mut c_void,
-            mode: *const c_void,
-        );
-
+        pub fn CFRunLoopAddSource(rl: *mut c_void, source: *mut c_void, mode: *const c_void);
         pub fn CFRunLoopGetCurrent() -> *mut c_void;
         pub fn CFRunLoopRun();
     }
 
-    // Event type masks
     pub const K_CG_EVENT_FLAGS_CHANGED: u32 = 12;
-    pub const K_CG_EVENT_KEY_DOWN: u32 = 10;
-    pub const K_CG_EVENT_KEY_UP: u32 = 11;
 }
 
-const FN_FLAG: u64 = CGEventFlags::CGEventFlagSecondaryFn.bits();
+const FN_KEYCODE: i64 = 63; // fn/Globe key
 const SHIFT_FLAG: u64 = CGEventFlags::CGEventFlagShift.bits();
+const DEBOUNCE_MS: u128 = 400;
 
 struct CallbackState {
-    prev_fn: bool,
+    fn_down: bool,
+    last_fire: Instant,
     callback: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -64,38 +62,51 @@ static mut CALLBACK_STATE: Option<CallbackState> = None;
 
 unsafe extern "C" fn tap_callback(
     _proxy: ffi::CGEventTapProxy,
-    _event_type: u32,
+    event_type: u32,
     event: ffi::CGEventRef,
     _user_info: *mut std::ffi::c_void,
 ) -> ffi::CGEventRef {
     unsafe {
+        if event_type != ffi::K_CG_EVENT_FLAGS_CHANGED {
+            return event;
+        }
+
+        let keycode = ffi::CGEventGetIntegerValueField(event, ffi::K_CG_KEYBOARD_EVENT_KEYCODE);
         let flags = ffi::CGEventGetFlags(event);
-        let has_fn = (flags & FN_FLAG) != 0;
         let has_shift = (flags & SHIFT_FLAG) != 0;
 
         if let Some(ref mut state) = CALLBACK_STATE {
-            if state.prev_fn && !has_fn && has_shift {
-                println!("[hotkey] 🔥 fn+Shift → toggling");
-                (state.callback)();
+            if keycode == FN_KEYCODE {
+                let fn_flag_now = (flags & CGEventFlags::CGEventFlagSecondaryFn.bits()) != 0;
+
+                if fn_flag_now {
+                    // fn pressed
+                    state.fn_down = true;
+                } else if state.fn_down {
+                    // fn released
+                    state.fn_down = false;
+                    if has_shift && state.last_fire.elapsed().as_millis() > DEBOUNCE_MS {
+                        state.last_fire = Instant::now();
+                        println!("[hotkey] 🔥 fn+Shift → toggling");
+                        (state.callback)();
+                    }
+                }
             }
-            state.prev_fn = has_fn;
         }
     }
-    event // pass through
+    event
 }
 
 pub fn start_listener(callback: Arc<dyn Fn() + Send + Sync>) {
     std::thread::spawn(move || {
         unsafe {
             CALLBACK_STATE = Some(CallbackState {
-                prev_fn: false,
+                fn_down: false,
+                last_fire: Instant::now() - std::time::Duration::from_secs(10),
                 callback,
             });
 
-            // Event mask: FlagsChanged | KeyDown | KeyUp
-            let mask: u64 = (1u64 << ffi::K_CG_EVENT_FLAGS_CHANGED)
-                | (1u64 << ffi::K_CG_EVENT_KEY_DOWN)
-                | (1u64 << ffi::K_CG_EVENT_KEY_UP);
+            let mask: u64 = 1u64 << ffi::K_CG_EVENT_FLAGS_CHANGED;
 
             let tap = ffi::CGEventTapCreate(
                 0, // kCGHIDEventTap
