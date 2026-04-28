@@ -5,7 +5,7 @@
 #  Install (first time or update):
 #    curl -fsSL https://raw.githubusercontent.com/relicwavetechnologies/said/main/install.sh | bash
 #
-#  After install, everything is managed with one command:
+#  After install, manage with:
 #    vp              → start
 #    vp stop         → stop
 #    vp update       → get latest version
@@ -14,7 +14,7 @@
 #    vp delete       → remove everything
 # ══════════════════════════════════════════════════════════════════════════════
 
-GATEWAY_KEY="cnsc_gw_23450226f2fdcaa1f661284ae8d54c12acae140c51c24fc7"
+DEFAULT_GATEWAY_KEY="cnsc_gw_23450226f2fdcaa1f661284ae8d54c12acae140c51c24fc7"
 INSTALL_URL="https://raw.githubusercontent.com/relicwavetechnologies/said/main/install.sh"
 
 INSTALL_DIR="$HOME/VoicePolish"
@@ -24,24 +24,25 @@ LOG_OUT="/tmp/voice-polish.log"
 LOG_ERR="/tmp/voice-polish.err"
 
 # ─────────────────────────────────────────────────────────────────────────────
-BOLD='\033[1m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
+BOLD='\033[1m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; CYAN='\033[0;36m'; NC='\033[0m'
 
 ok()   { echo -e "  ${GREEN}✓ $1${NC}"; }
 skip() { echo -e "  ${GREEN}✓ $1 — already done, skipping${NC}"; }
 info() { echo -e "  ${YELLOW}→ $1${NC}"; }
-fail() { echo -e "  ${RED}✗ $1${NC}"; exit 1; }
+fail() { echo -e "\n  ${RED}✗ ERROR: $1${NC}\n"; exit 1; }
 step() { echo -e "\n${BOLD}[$1]${NC} $2"; }
+note() { echo -e "  ${CYAN}ℹ $1${NC}"; }
 
 echo ""
 echo -e "${BOLD}🎤  Voice Polish — Setup${NC}"
 echo "══════════════════════════════════════════════"
 
 # ── 1. Homebrew ───────────────────────────────────────────────────────────────
-step "1/9" "Homebrew"
+step "1/10" "Homebrew"
 if command -v brew &>/dev/null; then
     skip "Homebrew $(brew --version | head -1)"
 else
-    info "Not found — installing Homebrew (takes ~2 min, needs your password) …"
+    info "Not found — installing Homebrew (~2 min, may ask for your password) …"
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
         || fail "Homebrew install failed"
     [ -f /opt/homebrew/bin/brew ] && eval "$(/opt/homebrew/bin/brew shellenv)"
@@ -50,7 +51,7 @@ fi
 [ -f /opt/homebrew/bin/brew ] && eval "$(/opt/homebrew/bin/brew shellenv)"
 
 # ── 2. Python 3.11+ ───────────────────────────────────────────────────────────
-step "2/9" "Python 3.11+"
+step "2/10" "Python 3.11+"
 PYTHON=""
 for c in /opt/homebrew/bin/python3.11 /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.13 \
          /usr/local/bin/python3.11 python3.11 python3.12; do
@@ -65,14 +66,27 @@ else
     ok "$($PYTHON --version) installed"
 fi
 
-# ── 3. Project folder ─────────────────────────────────────────────────────────
-step "3/9" "Project folder"
-if [ -d "$INSTALL_DIR" ]; then skip "$INSTALL_DIR"
-else mkdir -p "$INSTALL_DIR" || fail "Could not create $INSTALL_DIR"; ok "Created $INSTALL_DIR"
+# ── 3. PortAudio (required by sounddevice for mic recording) ──────────────────
+step "3/10" "PortAudio"
+if brew list portaudio &>/dev/null; then
+    skip "portaudio"
+else
+    info "Installing portaudio (needed for microphone access) …"
+    brew install portaudio || fail "portaudio install failed"
+    ok "portaudio installed"
 fi
 
-# ── 4. Source files (always written — ensures latest version) ─────────────────
-step "4/9" "Writing source files"
+# ── 4. Project folder ─────────────────────────────────────────────────────────
+step "4/10" "Project folder"
+if [ -d "$INSTALL_DIR" ]; then
+    skip "$INSTALL_DIR"
+else
+    mkdir -p "$INSTALL_DIR" || fail "Could not create $INSTALL_DIR"
+    ok "Created $INSTALL_DIR"
+fi
+
+# ── 5. Source files (always written — ensures latest version) ─────────────────
+step "5/10" "Writing source files"
 
 cat > "$INSTALL_DIR/requirements.txt" << 'REQEOF'
 python-dotenv>=1.0
@@ -398,7 +412,7 @@ APPEOF
 
 # ── main.py ───────────────────────────────────────────────────────────────────
 cat > "$INSTALL_DIR/main.py" << 'MAINEOF'
-import sys, os, fcntl, tempfile
+import sys, os, tempfile
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
@@ -409,8 +423,8 @@ LOCK_FILE = os.path.join(tempfile.gettempdir(), "voice-polish.lock")
 def acquire_lock():
     lock = open(LOCK_FILE, "w")
     try:
-        import fcntl as _fcntl
-        _fcntl.flock(lock, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        import fcntl
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         print("[voice] already running — only one instance allowed. Exiting.")
         sys.exit(0)
@@ -438,15 +452,38 @@ MAINEOF
 
 ok "All source files written"
 
-# ── 5. API key ────────────────────────────────────────────────────────────────
-step "5/9" "API key"
-cat > "$INSTALL_DIR/.env" << ENVEOF
+# ── 6. API key ────────────────────────────────────────────────────────────────
+step "6/10" "API key"
+
+EXISTING_KEY=""
+if [ -f "$INSTALL_DIR/.env" ]; then
+    EXISTING_KEY=$(grep "^GATEWAY_API_KEY=" "$INSTALL_DIR/.env" 2>/dev/null | cut -d= -f2-)
+fi
+
+if [ -n "$EXISTING_KEY" ] && [ "$EXISTING_KEY" != "$DEFAULT_GATEWAY_KEY" ]; then
+    skip "Custom API key already in .env"
+    GATEWAY_KEY="$EXISTING_KEY"
+else
+    echo ""
+    echo -e "  ${BOLD}Enter your Gateway API key${NC} (press Enter to use the default shared key):"
+    echo -e "  ${CYAN}[default key will be used if you leave this blank]${NC}"
+    echo -n "  Key: "
+    read -r USER_KEY
+    if [ -n "$USER_KEY" ]; then
+        GATEWAY_KEY="$USER_KEY"
+        ok "Using your custom API key"
+    else
+        GATEWAY_KEY="$DEFAULT_GATEWAY_KEY"
+        note "Using default shared key"
+    fi
+    cat > "$INSTALL_DIR/.env" << ENVEOF
 GATEWAY_API_KEY=${GATEWAY_KEY}
 ENVEOF
-ok ".env written"
+    ok ".env written"
+fi
 
-# ── 6. Virtual environment ────────────────────────────────────────────────────
-step "6/9" "Python virtual environment"
+# ── 7. Virtual environment + packages ────────────────────────────────────────
+step "7/10" "Python virtual environment"
 if [ -d "$INSTALL_DIR/venv" ] && [ -f "$INSTALL_DIR/venv/bin/python" ]; then
     skip "venv already exists"
 else
@@ -456,16 +493,36 @@ else
 fi
 source "$INSTALL_DIR/venv/bin/activate"
 
-# ── 7. Python packages ────────────────────────────────────────────────────────
-step "7/9" "Python packages"
+step "8/10" "Python packages"
 info "Installing / updating packages …"
 pip install -q --upgrade pip
 pip install -q -r "$INSTALL_DIR/requirements.txt" \
     && ok "All packages installed" \
     || fail "pip install failed — check your internet connection"
 
-# ── 8. Auto-start on login ────────────────────────────────────────────────────
-step "8/9" "Auto-start on login"
+# ── Quick mic test ────────────────────────────────────────────────────────────
+info "Testing microphone access …"
+MIC_NAME=$("$INSTALL_DIR/venv/bin/python" - 2>/dev/null << 'MICTEST'
+import sounddevice as sd, sys
+try:
+    devices = sd.query_devices()
+    inputs = [d for d in devices if d['max_input_channels'] > 0]
+    if inputs:
+        print(inputs[0]['name'])
+except Exception:
+    pass
+MICTEST
+)
+
+if [ -n "$MIC_NAME" ]; then
+    ok "Microphone detected: $MIC_NAME"
+else
+    echo ""
+    echo -e "  ${YELLOW}⚠  No microphone detected yet — permission may be needed (handled in step 9).${NC}"
+fi
+
+# ── 9. Auto-start on login ────────────────────────────────────────────────────
+step "9/10" "Auto-start on login"
 PYTHON_BIN="$INSTALL_DIR/venv/bin/python"
 mkdir -p "$HOME/Library/LaunchAgents"
 
@@ -493,8 +550,8 @@ fail "Could not register auto-start"
 
 ok "Auto-start registered"
 
-# ── 9. vp command ─────────────────────────────────────────────────────────────
-step "9/9" "vp command"
+# ── 10. vp command ────────────────────────────────────────────────────────────
+step "10/10" "vp command"
 mkdir -p "$HOME/bin"
 
 cat > "$HOME/bin/vp" << VPEOF
@@ -561,35 +618,61 @@ esac
 VPEOF
 
 chmod +x "$HOME/bin/vp"
+export PATH="$HOME/bin:$PATH"
 
-# Add ~/bin to PATH in shell profiles (idempotent)
 for PROFILE in "$HOME/.zshrc" "$HOME/.bash_profile"; do
     if [ -f "$PROFILE" ] && ! grep -q 'PATH="$HOME/bin' "$PROFILE" 2>/dev/null; then
         echo 'export PATH="$HOME/bin:$PATH"' >> "$PROFILE"
     fi
 done
-# Also ensure it's available right now
-export PATH="$HOME/bin:$PATH"
 
-ok "vp command installed to ~/bin/vp"
+ok "vp command installed"
 
-# ── Accessibility permission ──────────────────────────────────────────────────
+# ── Permissions (Accessibility + Microphone) ──────────────────────────────────
 echo ""
-echo -e "${YELLOW}${BOLD}⚠️  One manual step — takes 10 seconds:${NC}"
+echo "══════════════════════════════════════════════"
+echo -e "${YELLOW}${BOLD}⚠️  Two quick permissions needed — takes ~30 seconds${NC}"
+echo "══════════════════════════════════════════════"
 echo ""
-echo -e "  System Settings is opening now."
-echo -e "  Find ${BOLD}Terminal${NC} in the list → toggle it ${BOLD}ON${NC}"
-echo -e "  (This lets the app paste text at your cursor)"
+echo -e "  ${BOLD}1. Accessibility${NC} (lets the app paste text at your cursor)"
+echo -e "     System Settings is opening now."
+echo -e "     Find ${BOLD}Terminal${NC} in the list → toggle it ${BOLD}ON${NC}"
 echo ""
+echo -e "  ${BOLD}2. Microphone${NC} (lets the app hear you)"
+echo -e "     Go to Privacy & Security → ${BOLD}Microphone${NC}"
+echo -e "     Find ${BOLD}Terminal${NC} in the list → toggle it ${BOLD}ON${NC}"
+echo ""
+echo -e "  ${CYAN}Press Enter after you've granted both permissions…${NC}"
+
 open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+sleep 1
+open "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+
+read -r _
 
 # ── Launch app now ────────────────────────────────────────────────────────────
-sleep 2
+echo ""
+info "Starting Voice Polish …"
+
 if pgrep -f "VoicePolish/main.py" &>/dev/null; then
-    info "App is already running"
+    # Already running from LaunchAgent — restart to pick up any updates
+    pkill -f "VoicePolish/main.py" 2>/dev/null || true
+    sleep 1
+fi
+
+"$PYTHON_BIN" "$INSTALL_DIR/main.py" >> "$LOG_OUT" 2>> "$LOG_ERR" &
+APP_PID=$!
+
+# Wait a moment then check the logs to confirm startup
+sleep 3
+if kill -0 "$APP_PID" 2>/dev/null; then
+    ok "App running (PID $APP_PID) — look for ● in your menu bar"
 else
-    info "Launching app …"
-    "$PYTHON_BIN" "$INSTALL_DIR/main.py" >> "$LOG_OUT" 2>> "$LOG_ERR" &
+    echo ""
+    echo -e "  ${YELLOW}⚠  App may not have started. Last log lines:${NC}"
+    tail -5 "$LOG_ERR" 2>/dev/null | sed 's/^/    /'
+    echo ""
+    note "Try running manually: vp logs"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
@@ -602,9 +685,10 @@ echo -e "    Hold Shift → tap fn   start recording"
 echo -e "    Hold Shift → tap fn   stop & paste"
 echo ""
 echo -e "  ${BOLD}MENU BAR${NC}"
-echo -e "    Look for ${BOLD}●${NC} — click to cycle:  ⚡ fast → 🧠 smart → 🤖 claude → ✨ gemini"
+echo -e "    Look for ${BOLD}●${NC} — click to cycle mode:"
+echo -e "    ⚡ Fast → 🧠 Smart → 🤖 Claude → ✨ Gemini"
 echo ""
-echo -e "  ${BOLD}COMMANDS  (open a new Terminal tab first)${NC}"
+echo -e "  ${BOLD}COMMANDS${NC}"
 echo -e "    vp              start"
 echo -e "    vp stop         stop"
 echo -e "    vp update       get latest version"
@@ -612,7 +696,12 @@ echo -e "    vp status       check if running"
 echo -e "    vp logs         live logs"
 echo -e "    vp delete       remove everything"
 echo ""
-echo -e "  ${BOLD}INSTALL URL  (share this to set up on a new Mac)${NC}"
+echo -e "  ${BOLD}TROUBLESHOOTING${NC}"
+echo -e "    If hotkey doesn't work  → check Accessibility permission"
+echo -e "    If mic doesn't record   → check Microphone permission"
+echo -e "    If nothing appears      → run: vp logs"
+echo ""
+echo -e "  ${BOLD}SHARE${NC}"
 echo -e "    curl -fsSL ${INSTALL_URL} | bash"
 echo ""
 echo "══════════════════════════════════════════════"
