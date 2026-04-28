@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use crate::config::{CHANNELS, MIN_DURATION_S, SAMPLE_RATE};
 
 enum RecCmd {
-    Stop(mpsc::Sender<Vec<i16>>),
+    Stop(mpsc::Sender<(Vec<f32>, u32)>),
 }
 
 pub struct AudioRecorder {
@@ -19,19 +19,17 @@ impl AudioRecorder {
     }
 
     pub fn start(&mut self) -> Result<(), String> {
-        // Verify device exists before spawning thread
         let host = cpal::default_host();
         let _device = host
             .default_input_device()
             .ok_or("no input device found")?;
 
-        let frames: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::new()));
+        let frames: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
         let frames_for_reply = Arc::clone(&frames);
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<RecCmd>();
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, String>>();
 
-        // Build and own the stream on a dedicated thread (cpal::Stream is !Send)
         std::thread::spawn(move || {
             let host = cpal::default_host();
             let device = match host.default_input_device() {
@@ -42,16 +40,25 @@ impl AudioRecorder {
                 }
             };
 
+            let default_config = match device.default_input_config() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!("no default input config: {e}")));
+                    return;
+                }
+            };
+
+            let native_rate = default_config.sample_rate().0;
             let config = cpal::StreamConfig {
                 channels: CHANNELS,
-                sample_rate: cpal::SampleRate(SAMPLE_RATE),
+                sample_rate: cpal::SampleRate(native_rate),
                 buffer_size: cpal::BufferSize::Default,
             };
 
             let frames_cb = Arc::clone(&frames_for_reply);
             let stream = match device.build_input_stream(
                 &config,
-                move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     frames_cb.lock().unwrap().extend_from_slice(data);
                 },
                 |err| eprintln!("[rec] ⚠ stream error: {err}"),
@@ -69,19 +76,18 @@ impl AudioRecorder {
                 return;
             }
 
-            let _ = ready_tx.send(Ok(()));
+            let _ = ready_tx.send(Ok(native_rate));
 
-            // Wait for stop command, keeping stream alive
             if let Ok(RecCmd::Stop(reply)) = cmd_rx.recv() {
                 let data = frames_for_reply.lock().unwrap().clone();
-                let _ = reply.send(data);
+                let _ = reply.send((data, native_rate));
             }
-            // stream drops here
         });
 
-        // Wait for stream to start
         match ready_rx.recv() {
-            Ok(Ok(())) => {}
+            Ok(Ok(rate)) => {
+                println!("[rec] opened at {rate}Hz F32, will resample to {SAMPLE_RATE}Hz I16");
+            }
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err("recording thread died".into()),
         }
@@ -95,20 +101,23 @@ impl AudioRecorder {
         let cmd_tx = self.cmd_tx.take()?;
         let (reply_tx, reply_rx) = mpsc::channel();
         let _ = cmd_tx.send(RecCmd::Stop(reply_tx));
-        let samples = reply_rx.recv().ok()?;
+        let (samples_f32, native_rate) = reply_rx.recv().ok()?;
 
-        if samples.is_empty() {
+        if samples_f32.is_empty() {
             println!("[rec] no audio captured");
             return None;
         }
 
-        let duration = samples.len() as f32 / SAMPLE_RATE as f32;
-        println!("[rec] ⏹  {duration:.1}s recorded");
+        let duration = samples_f32.len() as f32 / native_rate as f32;
+        println!("[rec] ⏹  {duration:.1}s recorded ({native_rate}Hz)");
 
         if duration < MIN_DURATION_S {
             println!("[rec] too short — ignored");
             return None;
         }
+
+        // Resample from native_rate to SAMPLE_RATE and convert F32 → I16
+        let samples_i16 = resample_f32_to_i16(&samples_f32, native_rate, SAMPLE_RATE);
 
         let mut buf = Cursor::new(Vec::new());
         let spec = hound::WavSpec {
@@ -118,8 +127,8 @@ impl AudioRecorder {
             sample_format: hound::SampleFormat::Int,
         };
         let mut writer = hound::WavWriter::new(&mut buf, spec).ok()?;
-        for &sample in samples.iter() {
-            writer.write_sample(sample).ok()?;
+        for sample in &samples_i16 {
+            writer.write_sample(*sample).ok()?;
         }
         writer.finalize().ok()?;
 
@@ -134,4 +143,37 @@ impl AudioRecorder {
         let name = device.name().unwrap_or_else(|_| "unknown".into());
         Ok(name)
     }
+}
+
+fn resample_f32_to_i16(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<i16> {
+    if from_rate == to_rate {
+        return input.iter().map(|&s| f32_to_i16(s)).collect();
+    }
+
+    let ratio = from_rate as f64 / to_rate as f64;
+    let out_len = (input.len() as f64 / ratio) as usize;
+    let mut output = Vec::with_capacity(out_len);
+
+    for i in 0..out_len {
+        let src_pos = i as f64 * ratio;
+        let idx = src_pos as usize;
+        let frac = src_pos - idx as f64;
+
+        let sample = if idx + 1 < input.len() {
+            input[idx] as f64 * (1.0 - frac) + input[idx + 1] as f64 * frac
+        } else if idx < input.len() {
+            input[idx] as f64
+        } else {
+            0.0
+        };
+
+        output.push(f32_to_i16(sample as f32));
+    }
+
+    output
+}
+
+fn f32_to_i16(s: f32) -> i16 {
+    let clamped = s.clamp(-1.0, 1.0);
+    (clamped * 32767.0) as i16
 }
