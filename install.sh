@@ -627,9 +627,8 @@ case "\${1:-}" in
     if pgrep -f "VoicePolish/main.py" &>/dev/null; then
       echo "✅  Already running — look for ● in menu bar"
     else
-      open -g "\$APP_BUNDLE" 2>/dev/null && \
-        echo "✅  Voice Polish started — look for ● in menu bar" || \
-        echo "✗   Failed to launch — try: vp logs"
+      "\$APP_BUNDLE/Contents/MacOS/VoicePolish" >> "\$LOG_OUT" 2>> "\$LOG_ERR" &
+      echo "✅  Voice Polish started — look for ● in menu bar"
     fi
     ;;
   stop)
@@ -698,7 +697,7 @@ pkill -f "VoicePolish.app"      2>/dev/null || true
 sleep 1
 
 # Launch via `open` so macOS recognizes the .app bundle and prompts for mic
-open -g "$APP_BUNDLE"
+"$APP_EXEC" >> "$LOG_OUT" 2>> "$LOG_ERR" &
 sleep 3
 
 if pgrep -f "VoicePolish/main.py" &>/dev/null; then
@@ -738,7 +737,7 @@ info "Restarting app to apply permissions …"
 pkill -f "VoicePolish/main.py" 2>/dev/null || true
 pkill -f "VoicePolish.app"      2>/dev/null || true
 sleep 1
-open -g "$APP_BUNDLE"
+"$APP_EXEC" >> "$LOG_OUT" 2>> "$LOG_ERR" &
 sleep 2
 if pgrep -f "VoicePolish/main.py" &>/dev/null; then
     ok "App running with new permissions"
