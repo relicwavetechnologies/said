@@ -292,18 +292,14 @@ class HotkeyListener:
             except: is_fn = False
             if is_fn:
                 sh = self._shift()
-                print(f"[hotkey] ↑ {_label(key):<35} shift={'YES ← FIRING!' if sh else 'no ← need Shift'}")
-                if sh and not self._fired:
-                    print("[hotkey] 🔥 fn+Shift → toggling"); self._fired = True; self._on_toggle()
-                    self._track(key, False); return
-            else:
-                print(f"[hotkey] ↑ {_label(key)}")
-        else:
-            print(f"[hotkey] ↑ {_label(key)}")
+                print(f"[hotkey] ↑ fn  shift={'YES ← FIRING!' if sh else 'no ← need Shift'}")
+                if sh:
+                    print("[hotkey] 🔥 fn+Shift → toggling"); self._on_toggle()
+                self._track(key, False)
+                return
+        print(f"[hotkey] ↑ {_label(key)}")
         self._track(key, False)
-        if IS_MAC:
-            if FN_VK not in self._vk: self._fired = False
-        else:
+        if not IS_MAC:
             c = Key.ctrl_l in self._sp or Key.ctrl_r in self._sp
             a = Key.alt_l  in self._sp or Key.alt_r  in self._sp
             if not (c and a and self._shift()): self._fired = False
