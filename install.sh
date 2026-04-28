@@ -476,9 +476,7 @@ else
         GATEWAY_KEY="$DEFAULT_GATEWAY_KEY"
         note "Using default shared key"
     fi
-    cat > "$INSTALL_DIR/.env" << ENVEOF
-GATEWAY_API_KEY=${GATEWAY_KEY}
-ENVEOF
+    printf 'GATEWAY_API_KEY=%s\n' "$GATEWAY_KEY" > "$INSTALL_DIR/.env"
     ok ".env written"
 fi
 
