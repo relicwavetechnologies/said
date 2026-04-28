@@ -91,6 +91,7 @@ step "5/10" "Writing source files"
 cat > "$INSTALL_DIR/requirements.txt" << 'REQEOF'
 python-dotenv>=1.0
 sounddevice>=0.4.6
+numpy>=1.24
 pynput>=1.7
 rumps>=0.4
 pyobjc-framework-Cocoa>=10.0
@@ -352,7 +353,13 @@ class Core:
             else: print("[app] busy — waiting for gateway response")
 
     def _start(self):
-        self.state=self.REC; self._status("🔴"); self._rec.start()
+        try:
+            self._rec.start()
+            self.state=self.REC; self._status("🔴")
+        except Exception as e:
+            print(f"[app] ✗ failed to start recording: {e}")
+            self.state=self.IDLE; self._status("❌")
+            time.sleep(2); self._status("●")
 
     def _stop(self):
         self.state=self.PROC; self._status("⏳")
