@@ -438,9 +438,31 @@ def acquire_lock():
     lock.write(str(os.getpid())); lock.flush()
     return lock
 
+def preflight():
+    """Quick sanity check before entering main loop."""
+    errors = []
+    try:
+        import numpy
+    except ImportError:
+        errors.append("numpy not installed — run: pip install numpy")
+    try:
+        import sounddevice as sd
+        devs = [d for d in sd.query_devices() if d['max_input_channels'] > 0]
+        if not devs:
+            errors.append("no input device found — check microphone connection")
+        else:
+            print(f"[preflight] mic: {devs[0]['name']}")
+    except Exception as e:
+        errors.append(f"sounddevice error: {e}")
+    if errors:
+        for e in errors:
+            print(f"[preflight] ✗ {e}")
+        sys.exit(1)
+
 def main():
     _lock = acquire_lock()
     config.validate()
+    preflight()
     mode_map = {"fast": "gpt-5.4-mini", "smart": "gpt-5.4",
                 "claude": "claude-sonnet-4-6", "gemini": "gemini-3.1-flash-lite-preview"}
     mode = config.get_mode()
@@ -594,7 +616,7 @@ cat > "$PLIST_PATH" << PLEOF
   <array><string>${APP_EXEC}</string></array>
   <key>WorkingDirectory</key><string>${INSTALL_DIR}</string>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key><false/>
   <key>StandardOutPath</key><string>${LOG_OUT}</string>
   <key>StandardErrorPath</key><string>${LOG_ERR}</string>
 </dict></plist>
@@ -627,8 +649,17 @@ case "\${1:-}" in
     if pgrep -f "VoicePolish/main.py" &>/dev/null; then
       echo "✅  Already running — look for ● in menu bar"
     else
-      "\$APP_BUNDLE/Contents/MacOS/VoicePolish" >> "\$LOG_OUT" 2>> "\$LOG_ERR" &
-      echo "✅  Voice Polish started — look for ● in menu bar"
+      : > "\$LOG_ERR"
+      open -g -a "\$APP_BUNDLE" 2>/dev/null
+      if [ \$? -ne 0 ]; then
+        "\$APP_BUNDLE/Contents/MacOS/VoicePolish" >> "\$LOG_OUT" 2>> "\$LOG_ERR" &
+      fi
+      sleep 2
+      if pgrep -f "VoicePolish/main.py" &>/dev/null; then
+        echo "✅  Voice Polish started — look for ● in menu bar"
+      else
+        echo "❌  Failed to start. Check errors with: vp errors"
+      fi
     fi
     ;;
   stop)
@@ -643,13 +674,20 @@ case "\${1:-}" in
     ;;
   status)
     if pgrep -f "VoicePolish/main.py" &>/dev/null; then
-      echo "● Running"
+      echo "● Running (pid \$(pgrep -f 'VoicePolish/main.py'))"
     else
       echo "○ Stopped"
     fi
     ;;
   logs)
     tail -f "\$LOG_OUT"
+    ;;
+  errors)
+    if [ -s "\$LOG_ERR" ]; then
+      tail -30 "\$LOG_ERR"
+    else
+      echo "No errors logged."
+    fi
     ;;
   delete)
     echo "→  Removing Voice Polish completely…"
@@ -667,9 +705,10 @@ case "\${1:-}" in
     echo ""
     echo "  vp              start"
     echo "  vp stop         stop"
-    echo "  vp update       get latest version"
     echo "  vp status       check if running"
-    echo "  vp logs         live logs"
+    echo "  vp logs         live output logs"
+    echo "  vp errors       show recent errors"
+    echo "  vp update       get latest version"
     echo "  vp delete       remove everything"
     echo ""
     ;;
@@ -697,7 +736,8 @@ pkill -f "VoicePolish.app"      2>/dev/null || true
 sleep 1
 
 # Launch via `open` so macOS recognizes the .app bundle and prompts for mic
-"$APP_EXEC" >> "$LOG_OUT" 2>> "$LOG_ERR" &
+> "$LOG_ERR"
+open -g -a "$APP_BUNDLE" 2>/dev/null || "$APP_EXEC" >> "$LOG_OUT" 2>> "$LOG_ERR" &
 sleep 3
 
 if pgrep -f "VoicePolish/main.py" &>/dev/null; then
