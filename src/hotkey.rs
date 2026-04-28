@@ -38,6 +38,7 @@ mod ffi {
 
         pub fn CGEventGetFlags(event: CGEventRef) -> u64;
         pub fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+        pub fn CGEventTapIsEnabled(tap: CFMachPortRef) -> bool;
 
         pub fn CFRunLoopAddSource(rl: *mut c_void, source: *mut c_void, mode: *const c_void);
         pub fn CFRunLoopGetCurrent() -> *mut c_void;
@@ -127,10 +128,10 @@ pub fn start_listener(callback: Arc<dyn Fn() + Send + Sync>) {
             );
 
             if tap.is_null() {
-                eprintln!(
-                    "[hotkey] ✗ failed to create event tap — grant Accessibility permission"
-                );
-                eprintln!("         System Settings → Privacy & Security → Accessibility");
+                eprintln!("[hotkey] ✗ failed to create event tap");
+                eprintln!("         → grant Input Monitoring permission:");
+                eprintln!("           System Settings → Privacy & Security → Input Monitoring");
+                eprintln!("           Add voice-polish and toggle it ON, then restart.");
                 return;
             }
 
@@ -147,7 +148,16 @@ pub fn start_listener(callback: Arc<dyn Fn() + Send + Sync>) {
                 kCFRunLoopCommonModes as *const _ as *const std::ffi::c_void,
             );
 
-            println!("[hotkey] listening for fn + Shift");
+            // A tap can be created but silently disabled when Input Monitoring
+            // permission is not yet granted.  Catch that here.
+            if !ffi::CGEventTapIsEnabled(tap) {
+                eprintln!("[hotkey] ✗ event tap created but DISABLED — no Input Monitoring permission");
+                eprintln!("         → System Settings → Privacy & Security → Input Monitoring");
+                eprintln!("           Add voice-polish and toggle it ON, then restart.");
+                return;
+            }
+
+            println!("[hotkey] ✓ listening for fn + Shift");
             ffi::CFRunLoopRun();
         }
     });
