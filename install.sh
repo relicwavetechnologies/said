@@ -58,17 +58,17 @@ esac
 
 info "Downloading latest release for $ARCH …"
 
-DOWNLOAD_URL=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-    | grep -o "\"browser_download_url\": *\"[^\"]*${ASSET_NAME}\"" \
-    | head -1 \
-    | cut -d'"' -f4)
+# Get the latest tag name, then build a direct download URL
+TAG=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+    | grep '"tag_name"' | head -1 | cut -d'"' -f4)
 
-if [ -z "$DOWNLOAD_URL" ]; then
-    fail "Could not find release asset for $ASSET_NAME. Check https://github.com/$REPO/releases"
+if [ -z "$TAG" ]; then
+    fail "Could not find latest release. Check https://github.com/$REPO/releases"
 fi
 
+DOWNLOAD_URL="https://github.com/$REPO/releases/download/$TAG/$ASSET_NAME"
 curl -fsSL -o "$INSTALL_DIR/voice-polish" "$DOWNLOAD_URL" \
-    || fail "Download failed"
+    || fail "Download failed — check https://github.com/$REPO/releases"
 chmod +x "$INSTALL_DIR/voice-polish"
 ok "Binary downloaded ($(du -h "$INSTALL_DIR/voice-polish" | cut -f1 | xargs))"
 
