@@ -3,7 +3,7 @@ use std::io::Cursor;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use crate::config::{CHANNELS, MIN_DURATION_S, SAMPLE_RATE};
+use crate::config::{CHANNELS, MIN_DURATION_S};
 
 enum RecCmd {
     Stop(mpsc::Sender<(Vec<f32>, u32)>),
@@ -86,7 +86,7 @@ impl AudioRecorder {
 
         match ready_rx.recv() {
             Ok(Ok(rate)) => {
-                println!("[rec] opened at {rate}Hz F32, will resample to {SAMPLE_RATE}Hz I16");
+                println!("[rec] opened at {rate}Hz F32");
             }
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err("recording thread died".into()),
@@ -109,26 +109,33 @@ impl AudioRecorder {
         }
 
         let duration = samples_f32.len() as f32 / native_rate as f32;
-        println!("[rec] ⏹  {duration:.1}s recorded ({native_rate}Hz)");
+        let max_amp = samples_f32.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        println!("[rec] ⏹  {duration:.1}s recorded ({native_rate}Hz, peak={max_amp:.4})");
+
+        if max_amp < 0.0001 {
+            eprintln!("[rec] ⚠ audio is silence — microphone permission not granted");
+            eprintln!("[rec]   System Settings → Privacy & Security → Microphone → enable for Voice Polish");
+            return None;
+        }
 
         if duration < MIN_DURATION_S {
             println!("[rec] too short — ignored");
             return None;
         }
 
-        // Resample from native_rate to SAMPLE_RATE and convert F32 → I16
-        let samples_i16 = resample_f32_to_i16(&samples_f32, native_rate, SAMPLE_RATE);
-
+        // Send at native sample rate — Deepgram handles any rate
+        // Convert F32 → I16 without resampling for maximum quality
         let mut buf = Cursor::new(Vec::new());
         let spec = hound::WavSpec {
             channels: CHANNELS,
-            sample_rate: SAMPLE_RATE,
+            sample_rate: native_rate,
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
         };
         let mut writer = hound::WavWriter::new(&mut buf, spec).ok()?;
-        for sample in &samples_i16 {
-            writer.write_sample(*sample).ok()?;
+        for &sample in &samples_f32 {
+            let clamped = sample.clamp(-1.0, 1.0);
+            writer.write_sample((clamped * 32767.0) as i16).ok()?;
         }
         writer.finalize().ok()?;
 
@@ -143,37 +150,4 @@ impl AudioRecorder {
         let name = device.name().unwrap_or_else(|_| "unknown".into());
         Ok(name)
     }
-}
-
-fn resample_f32_to_i16(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<i16> {
-    if from_rate == to_rate {
-        return input.iter().map(|&s| f32_to_i16(s)).collect();
-    }
-
-    let ratio = from_rate as f64 / to_rate as f64;
-    let out_len = (input.len() as f64 / ratio) as usize;
-    let mut output = Vec::with_capacity(out_len);
-
-    for i in 0..out_len {
-        let src_pos = i as f64 * ratio;
-        let idx = src_pos as usize;
-        let frac = src_pos - idx as f64;
-
-        let sample = if idx + 1 < input.len() {
-            input[idx] as f64 * (1.0 - frac) + input[idx + 1] as f64 * frac
-        } else if idx < input.len() {
-            input[idx] as f64
-        } else {
-            0.0
-        };
-
-        output.push(f32_to_i16(sample as f32));
-    }
-
-    output
-}
-
-fn f32_to_i16(s: f32) -> i16 {
-    let clamped = s.clamp(-1.0, 1.0);
-    (clamped * 32767.0) as i16
 }

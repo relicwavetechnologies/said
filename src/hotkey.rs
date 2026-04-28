@@ -18,7 +18,6 @@ mod ffi {
         user_info: *mut c_void,
     ) -> CGEventRef;
 
-    // CGEventField for keycode
     pub const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
 
     unsafe extern "C" {
@@ -48,12 +47,14 @@ mod ffi {
     pub const K_CG_EVENT_FLAGS_CHANGED: u32 = 12;
 }
 
-const FN_KEYCODE: i64 = 63; // fn/Globe key
+const FN_KEYCODE: i64 = 63;
 const SHIFT_FLAG: u64 = CGEventFlags::CGEventFlagShift.bits();
 const DEBOUNCE_MS: u128 = 400;
+const SHIFT_GRACE_MS: u128 = 300; // shift can be released up to 300ms before fn
 
 struct CallbackState {
     fn_down: bool,
+    shift_last_seen: Instant,
     last_fire: Instant,
     callback: Arc<dyn Fn() + Send + Sync>,
 }
@@ -76,16 +77,24 @@ unsafe extern "C" fn tap_callback(
         let has_shift = (flags & SHIFT_FLAG) != 0;
 
         if let Some(ref mut state) = CALLBACK_STATE {
+            // Track when shift was last held
+            if has_shift {
+                state.shift_last_seen = Instant::now();
+            }
+
             if keycode == FN_KEYCODE {
                 let fn_flag_now = (flags & CGEventFlags::CGEventFlagSecondaryFn.bits()) != 0;
 
                 if fn_flag_now {
-                    // fn pressed
                     state.fn_down = true;
                 } else if state.fn_down {
-                    // fn released
                     state.fn_down = false;
-                    if has_shift && state.last_fire.elapsed().as_millis() > DEBOUNCE_MS {
+
+                    // Fire if shift is held NOW, or was held within the grace period
+                    let shift_ok = has_shift
+                        || state.shift_last_seen.elapsed().as_millis() < SHIFT_GRACE_MS;
+
+                    if shift_ok && state.last_fire.elapsed().as_millis() > DEBOUNCE_MS {
                         state.last_fire = Instant::now();
                         println!("[hotkey] 🔥 fn+Shift → toggling");
                         (state.callback)();
@@ -100,18 +109,18 @@ unsafe extern "C" fn tap_callback(
 pub fn start_listener(callback: Arc<dyn Fn() + Send + Sync>) {
     std::thread::spawn(move || {
         unsafe {
+            let past = Instant::now() - std::time::Duration::from_secs(10);
             CALLBACK_STATE = Some(CallbackState {
                 fn_down: false,
-                last_fire: Instant::now() - std::time::Duration::from_secs(10),
+                shift_last_seen: past,
+                last_fire: past,
                 callback,
             });
 
             let mask: u64 = 1u64 << ffi::K_CG_EVENT_FLAGS_CHANGED;
 
             let tap = ffi::CGEventTapCreate(
-                0, // kCGHIDEventTap
-                0, // kCGHeadInsertEventTap
-                1, // kCGEventTapOptionListenOnly
+                0, 0, 1,
                 mask,
                 tap_callback,
                 std::ptr::null_mut(),
