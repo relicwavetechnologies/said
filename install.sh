@@ -526,9 +526,63 @@ else
     echo -e "  ${YELLOW}⚠  No microphone detected yet — permission may be needed (handled in step 9).${NC}"
 fi
 
-# ── 9. Auto-start on login ────────────────────────────────────────────────────
-step "9/10" "Auto-start on login"
+# ── 9. .app bundle (so macOS grants mic permission to the app, not python) ───
+step "9/10" "Building .app bundle"
 PYTHON_BIN="$INSTALL_DIR/venv/bin/python"
+APP_BUNDLE="$INSTALL_DIR/VoicePolish.app"
+APP_EXEC="$APP_BUNDLE/Contents/MacOS/VoicePolish"
+
+mkdir -p "$APP_BUNDLE/Contents/MacOS"
+mkdir -p "$APP_BUNDLE/Contents/Resources"
+
+cat > "$APP_BUNDLE/Contents/Info.plist" << INFOPLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.voicepolish.app</string>
+  <key>CFBundleName</key>
+  <string>Voice Polish</string>
+  <key>CFBundleDisplayName</key>
+  <string>Voice Polish</string>
+  <key>CFBundleExecutable</key>
+  <string>VoicePolish</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Voice Polish needs microphone access to record and transcribe your voice.</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Voice Polish pastes the polished text at your cursor.</string>
+</dict>
+</plist>
+INFOPLIST
+
+cat > "$APP_EXEC" << LAUNCHER
+#!/bin/bash
+cd "$INSTALL_DIR"
+exec "$PYTHON_BIN" "$INSTALL_DIR/main.py"
+LAUNCHER
+
+chmod +x "$APP_EXEC"
+
+# Remove any quarantine attribute so macOS doesn't show the "downloaded from internet" warning
+xattr -cr "$APP_BUNDLE" 2>/dev/null || true
+
+# Force macOS to re-register the bundle so TCC sees the updated Info.plist
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+    -f "$APP_BUNDLE" 2>/dev/null || true
+
+ok ".app bundle created at $APP_BUNDLE"
+
+# ── 10. Auto-start on login (LaunchAgent points at the .app) ─────────────────
+step "10/10" "Auto-start on login + vp command"
 mkdir -p "$HOME/Library/LaunchAgents"
 
 cat > "$PLIST_PATH" << PLEOF
@@ -537,7 +591,7 @@ cat > "$PLIST_PATH" << PLEOF
 <plist version="1.0"><dict>
   <key>Label</key><string>${PLIST_NAME}</string>
   <key>ProgramArguments</key>
-  <array><string>${PYTHON_BIN}</string><string>${INSTALL_DIR}/main.py</string></array>
+  <array><string>${APP_EXEC}</string></array>
   <key>WorkingDirectory</key><string>${INSTALL_DIR}</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -555,13 +609,13 @@ fail "Could not register auto-start"
 
 ok "Auto-start registered"
 
-# ── 10. vp command ────────────────────────────────────────────────────────────
-step "10/10" "vp command"
+# ── vp command ────────────────────────────────────────────────────────────────
 mkdir -p "$HOME/bin"
 
 cat > "$HOME/bin/vp" << VPEOF
 #!/bin/bash
 INSTALL_DIR="\$HOME/VoicePolish"
+APP_BUNDLE="\$INSTALL_DIR/VoicePolish.app"
 PLIST_NAME="com.voicepolish.app"
 PLIST_PATH="\$HOME/Library/LaunchAgents/\$PLIST_NAME.plist"
 INSTALL_URL="${INSTALL_URL}"
@@ -573,14 +627,15 @@ case "\${1:-}" in
     if pgrep -f "VoicePolish/main.py" &>/dev/null; then
       echo "✅  Already running — look for ● in menu bar"
     else
-      launchctl bootstrap "gui/\$(id -u)" "\$PLIST_PATH" 2>/dev/null || \
-        "\$INSTALL_DIR/venv/bin/python" "\$INSTALL_DIR/main.py" >> "\$LOG_OUT" 2>> "\$LOG_ERR" &
-      echo "✅  Voice Polish started — look for ● in menu bar"
+      open -g "\$APP_BUNDLE" 2>/dev/null && \
+        echo "✅  Voice Polish started — look for ● in menu bar" || \
+        echo "✗   Failed to launch — try: vp logs"
     fi
     ;;
   stop)
     launchctl bootout "gui/\$(id -u)/\$PLIST_NAME" 2>/dev/null || true
     pkill -f "VoicePolish/main.py" 2>/dev/null || true
+    pkill -f "VoicePolish.app" 2>/dev/null || true
     echo "⏹   Voice Polish stopped"
     ;;
   update)
@@ -633,51 +688,62 @@ done
 
 ok "vp command installed"
 
-# ── Permissions (Accessibility + Microphone) ──────────────────────────────────
-echo ""
-echo "══════════════════════════════════════════════"
-echo -e "${YELLOW}${BOLD}⚠️  Two quick permissions needed — takes ~30 seconds${NC}"
-echo "══════════════════════════════════════════════"
-echo ""
-echo -e "  ${BOLD}1. Accessibility${NC} (lets the app paste text at your cursor)"
-echo -e "     System Settings is opening now."
-echo -e "     Find ${BOLD}Terminal${NC} in the list → toggle it ${BOLD}ON${NC}"
-echo ""
-echo -e "  ${BOLD}2. Microphone${NC} (lets the app hear you)"
-echo -e "     Go to Privacy & Security → ${BOLD}Microphone${NC}"
-echo -e "     Find ${BOLD}Terminal${NC} in the list → toggle it ${BOLD}ON${NC}"
-echo ""
-echo -e "  ${CYAN}Press Enter after you've granted both permissions…${NC}"
-
-open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
-sleep 1
-open "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
-
-read -r _
-
-# ── Launch app now ────────────────────────────────────────────────────────────
+# ── Launch the .app first so macOS can show the mic permission dialog ─────────
 echo ""
 info "Starting Voice Polish …"
 
-if pgrep -f "VoicePolish/main.py" &>/dev/null; then
-    # Already running from LaunchAgent — restart to pick up any updates
-    pkill -f "VoicePolish/main.py" 2>/dev/null || true
-    sleep 1
-fi
+# Kill any prior instances
+pkill -f "VoicePolish/main.py" 2>/dev/null || true
+pkill -f "VoicePolish.app"      2>/dev/null || true
+sleep 1
 
-"$PYTHON_BIN" "$INSTALL_DIR/main.py" >> "$LOG_OUT" 2>> "$LOG_ERR" &
-APP_PID=$!
-
-# Wait a moment then check the logs to confirm startup
+# Launch via `open` so macOS recognizes the .app bundle and prompts for mic
+open -g "$APP_BUNDLE"
 sleep 3
-if kill -0 "$APP_PID" 2>/dev/null; then
-    ok "App running (PID $APP_PID) — look for ● in your menu bar"
+
+if pgrep -f "VoicePolish/main.py" &>/dev/null; then
+    ok "App running — look for ● in your menu bar"
 else
     echo ""
     echo -e "  ${YELLOW}⚠  App may not have started. Last log lines:${NC}"
     tail -5 "$LOG_ERR" 2>/dev/null | sed 's/^/    /'
-    echo ""
-    note "Try running manually: vp logs"
+fi
+
+# ── Permissions ───────────────────────────────────────────────────────────────
+echo ""
+echo "══════════════════════════════════════════════"
+echo -e "${YELLOW}${BOLD}⚠️  Grant 2 permissions — takes ~30 seconds${NC}"
+echo "══════════════════════════════════════════════"
+echo ""
+echo -e "  ${BOLD}1. Microphone${NC} (lets the app hear you)"
+echo -e "     System Settings → Privacy & Security → ${BOLD}Microphone${NC}"
+echo -e "     Find ${BOLD}Voice Polish${NC} → toggle it ${BOLD}ON${NC}"
+echo -e "     (macOS may have already shown a popup — say Allow)"
+echo ""
+echo -e "  ${BOLD}2. Accessibility${NC} (lets the app paste text at your cursor)"
+echo -e "     System Settings → Privacy & Security → ${BOLD}Accessibility${NC}"
+echo -e "     Find ${BOLD}Voice Polish${NC} → toggle it ${BOLD}ON${NC}"
+echo -e "     (If not in the list, click + and add: $APP_BUNDLE)"
+echo ""
+echo -e "  ${CYAN}Opening both settings panes now. Press Enter when done…${NC}"
+
+open "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+sleep 1
+open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+
+read -r _
+
+# Restart the app so it picks up the new permissions cleanly
+info "Restarting app to apply permissions …"
+pkill -f "VoicePolish/main.py" 2>/dev/null || true
+pkill -f "VoicePolish.app"      2>/dev/null || true
+sleep 1
+open -g "$APP_BUNDLE"
+sleep 2
+if pgrep -f "VoicePolish/main.py" &>/dev/null; then
+    ok "App running with new permissions"
+else
+    note "App not running — try: vp start"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
