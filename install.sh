@@ -197,26 +197,51 @@ INSTALL_URL="https://raw.githubusercontent.com/relicwavetechnologies/said/main/i
 LOG_OUT="/tmp/voice-polish.log"
 LOG_ERR="/tmp/voice-polish.err"
 
+_launch() {
+  # Always start via LaunchAgent so stdout/stderr go to the log files.
+  # open -a bypasses the LaunchAgent plist and logs nothing — never use it.
+  : > "$LOG_OUT"
+  : > "$LOG_ERR"
+  launchctl bootout "gui/$(id -u)/$PLIST_NAME" 2>/dev/null || true
+  pkill -f "VoicePolish.app/Contents/MacOS" 2>/dev/null || true
+  sleep 0.5
+  launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || \
+    launchctl load "$PLIST_PATH" 2>/dev/null || true
+  sleep 2
+}
+
 case "${1:-}" in
   start|"")
     if pgrep -f "VoicePolish.app/Contents/MacOS" &>/dev/null; then
       echo "✅  Already running — look for ● in menu bar"
+      echo "   (run 'vp stop && vp' to restart)"
     else
-      : > "$LOG_ERR"
-      open -g -a "$APP_BUNDLE" 2>/dev/null || \
-        "$APP_EXEC" >> "$LOG_OUT" 2>> "$LOG_ERR" &
-      sleep 2
+      echo "→  Starting…"
+      _launch
       if pgrep -f "VoicePolish.app/Contents/MacOS" &>/dev/null; then
         echo "✅  Voice Polish started — look for ● in menu bar"
       else
-        echo "❌  Failed to start. Run: vp errors"
+        echo "❌  Failed to start. Errors:"
+        echo "──────────────────────────────"
+        cat "$LOG_ERR" 2>/dev/null || echo "(no error log)"
+        echo "──────────────────────────────"
       fi
     fi
     ;;
   stop)
     launchctl bootout "gui/$(id -u)/$PLIST_NAME" 2>/dev/null || true
-    pkill -f "VoicePolish.app/Contents/MacOS"    2>/dev/null || true
-    echo "⏹   Voice Polish stopped"
+    pkill -f "VoicePolish.app/Contents/MacOS" 2>/dev/null || true
+    rm -f /tmp/voice-polish.lock
+    echo "⏹   Stopped"
+    ;;
+  restart)
+    echo "→  Restarting…"
+    _launch
+    if pgrep -f "VoicePolish.app/Contents/MacOS" &>/dev/null; then
+      echo "✅  Restarted — look for ● in menu bar"
+    else
+      echo "❌  Failed. Run: vp doctor"
+    fi
     ;;
   update)
     echo "→  Fetching latest version…"
@@ -224,48 +249,100 @@ case "${1:-}" in
     ;;
   status)
     if pgrep -f "VoicePolish.app/Contents/MacOS" &>/dev/null; then
-      echo "● Running (pid $(pgrep -f 'VoicePolish.app/Contents/MacOS'))"
+      echo "● Running  (pid $(pgrep -f 'VoicePolish.app/Contents/MacOS' | head -1))"
     else
       echo "○ Stopped"
     fi
     ;;
   logs)
-    tail -f "$LOG_OUT"
+    echo "── stdout (/tmp/voice-polish.log) ──"
+    tail -40 "$LOG_OUT" 2>/dev/null || echo "(empty)"
     ;;
   errors)
-    if [ -s "$LOG_ERR" ]; then tail -30 "$LOG_ERR"; else echo "No errors."; fi
+    echo "── stderr (/tmp/voice-polish.err) ──"
+    if [ -s "$LOG_ERR" ]; then
+      cat "$LOG_ERR"
+    else
+      echo "(no errors — good!)"
+    fi
+    ;;
+  doctor)
+    echo ""
+    echo "🩺  Voice Polish — diagnostics"
+    echo "──────────────────────────────────────────"
+    # Running?
+    if pgrep -f "VoicePolish.app/Contents/MacOS" &>/dev/null; then
+      echo "  Process   : ✅ running (pid $(pgrep -f 'VoicePolish.app/Contents/MacOS' | head -1))"
+    else
+      echo "  Process   : ❌ NOT running  →  run: vp"
+    fi
+    # Binary present?
+    if [ -x "$APP_EXEC" ]; then
+      echo "  Binary    : ✅ $APP_EXEC"
+    else
+      echo "  Binary    : ❌ not found  →  run: vp update"
+    fi
+    # LaunchAgent?
+    if [ -f "$PLIST_PATH" ]; then
+      echo "  LaunchAgent: ✅ registered"
+    else
+      echo "  LaunchAgent: ❌ missing  →  run: vp update"
+    fi
+    echo ""
+    echo "  Recent errors:"
+    echo "  ──────────────"
+    if [ -s "$LOG_ERR" ]; then
+      sed 's/^/  /' "$LOG_ERR" | tail -20
+    else
+      echo "  (none)"
+    fi
+    echo ""
+    echo "  Recent output:"
+    echo "  ──────────────"
+    grep -E "hotkey|paste|startup|preflight" "$LOG_OUT" 2>/dev/null | tail -10 | sed 's/^/  /' \
+      || echo "  (none)"
+    echo ""
+    echo "  If hotkey or paste says NOT granted, run:"
+    echo "    vp stop && vp"
+    echo "  Then grant permissions in System Settings and run:"
+    echo "    vp restart"
+    echo ""
     ;;
   permissions)
     echo ""
-    echo "Opening System Settings for the two required permissions…"
+    echo "  Binary to add in BOTH permission pages:"
+    echo "  $APP_EXEC"
     echo ""
-    # Input Monitoring — for the fn+Shift hotkey
+    echo "  In each page: click + → press Cmd+Shift+G → paste the path above"
+    echo "  → select VoicePolish → Open → toggle ON"
+    echo ""
     open "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
     sleep 1
-    # Accessibility — for paste
     open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
-    echo "  1. Find 'VoicePolish' in each list and toggle it ON"
-    echo "  2. Run 'vp' to start"
+    echo "  Both System Settings pages are now open."
+    echo "  After granting both, run:  vp restart"
+    echo ""
     ;;
   delete)
     echo "→  Removing Voice Polish completely…"
-    pkill -f "VoicePolish.app/Contents/MacOS"    2>/dev/null || true
+    pkill -f "VoicePolish.app/Contents/MacOS" 2>/dev/null || true
     launchctl bootout "gui/$(id -u)/$PLIST_NAME" 2>/dev/null || true
     rm -f "$PLIST_PATH"
     rm -rf "$INSTALL_DIR"
     rm -f "$HOME/bin/vp"
+    rm -f /tmp/voice-polish.lock /tmp/voice-polish.log /tmp/voice-polish.err
     echo "✓  Done. To reinstall: curl -fsSL $INSTALL_URL | bash"
     ;;
   *)
     echo ""
-    echo "  Voice Polish"
-    echo ""
     echo "  vp                start"
     echo "  vp stop           stop"
-    echo "  vp status         check if running"
-    echo "  vp logs           live output log"
-    echo "  vp errors         show recent errors"
-    echo "  vp permissions    open System Settings for mic + accessibility"
+    echo "  vp restart        stop + start (use after granting permissions)"
+    echo "  vp status         is it running?"
+    echo "  vp logs           recent output"
+    echo "  vp errors         recent errors"
+    echo "  vp doctor         full diagnostics"
+    echo "  vp permissions    open System Settings + show exact binary path"
     echo "  vp update         download latest version"
     echo "  vp delete         remove everything"
     echo ""
@@ -282,17 +359,24 @@ for PROFILE in "$HOME/.zshrc" "$HOME/.bash_profile"; do
 done
 ok "vp command installed"
 
-# ── Launch ───────────────────────────────────────────────────────────────────
+# ── Launch via LaunchAgent (logs captured to /tmp/voice-polish.*) ─────────────
 echo ""
 info "Starting Voice Polish …"
+> "$LOG_OUT"
 > "$LOG_ERR"
-open -g -a "$APP_BUNDLE" 2>/dev/null || "$APP_EXEC" >> "$LOG_OUT" 2>> "$LOG_ERR" &
+launchctl bootout "gui/$(id -u)/$PLIST_NAME" 2>/dev/null || true
+pkill -f "VoicePolish.app/Contents/MacOS" 2>/dev/null || true
+rm -f /tmp/voice-polish.lock
+sleep 1
+launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || \
+    launchctl load "$PLIST_PATH" 2>/dev/null || true
 sleep 3
 
 if pgrep -f "VoicePolish.app/Contents/MacOS" &>/dev/null; then
     ok "App running — look for ● in your menu bar"
 else
-    echo -e "  ${YELLOW}⚠  App may not have started. Run: vp errors${NC}"
+    echo -e "  ${YELLOW}⚠  App may not have started. Errors:${NC}"
+    cat "$LOG_ERR" 2>/dev/null || true
 fi
 
 # ── Permission instructions ───────────────────────────────────────────────────
