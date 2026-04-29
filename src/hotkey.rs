@@ -1,9 +1,7 @@
 use core_foundation::runloop::kCFRunLoopCommonModes;
-use core_graphics::event::CGEventFlags;
 use std::sync::Arc;
 use std::time::Instant;
 
-#[allow(non_upper_case_globals)]
 mod ffi {
     use std::ffi::c_void;
 
@@ -19,6 +17,7 @@ mod ffi {
     ) -> CGEventRef;
 
     pub const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
+    pub const K_CG_EVENT_FLAGS_CHANGED: u32 = 12;
 
     unsafe extern "C" {
         pub fn CGEventTapCreate(
@@ -36,7 +35,6 @@ mod ffi {
             order: i64,
         ) -> *mut c_void;
 
-        pub fn CGEventGetFlags(event: CGEventRef) -> u64;
         pub fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
         pub fn CGEventTapIsEnabled(tap: CFMachPortRef) -> bool;
 
@@ -44,18 +42,12 @@ mod ffi {
         pub fn CFRunLoopGetCurrent() -> *mut c_void;
         pub fn CFRunLoopRun();
     }
-
-    pub const K_CG_EVENT_FLAGS_CHANGED: u32 = 12;
 }
 
-const FN_KEYCODE: i64 = 63;
-const SHIFT_FLAG: u64 = CGEventFlags::CGEventFlagShift.bits();
-const DEBOUNCE_MS: u128 = 400;
-const SHIFT_GRACE_MS: u128 = 300; // shift can be released up to 300ms before fn
+const CAPS_LOCK_KEYCODE: i64 = 57;
+const DEBOUNCE_MS: u128 = 300;
 
 struct CallbackState {
-    fn_down: bool,
-    shift_last_seen: Instant,
     last_fire: Instant,
     callback: Arc<dyn Fn() + Send + Sync>,
 }
@@ -73,33 +65,15 @@ unsafe extern "C" fn tap_callback(
             return event;
         }
 
-        let keycode = ffi::CGEventGetIntegerValueField(event, ffi::K_CG_KEYBOARD_EVENT_KEYCODE);
-        let flags = ffi::CGEventGetFlags(event);
-        let has_shift = (flags & SHIFT_FLAG) != 0;
+        let keycode =
+            ffi::CGEventGetIntegerValueField(event, ffi::K_CG_KEYBOARD_EVENT_KEYCODE);
 
-        if let Some(ref mut state) = CALLBACK_STATE {
-            // Track when shift was last held
-            if has_shift {
-                state.shift_last_seen = Instant::now();
-            }
-
-            if keycode == FN_KEYCODE {
-                let fn_flag_now = (flags & CGEventFlags::CGEventFlagSecondaryFn.bits()) != 0;
-
-                if fn_flag_now {
-                    state.fn_down = true;
-                } else if state.fn_down {
-                    state.fn_down = false;
-
-                    // Fire if shift is held NOW, or was held within the grace period
-                    let shift_ok = has_shift
-                        || state.shift_last_seen.elapsed().as_millis() < SHIFT_GRACE_MS;
-
-                    if shift_ok && state.last_fire.elapsed().as_millis() > DEBOUNCE_MS {
-                        state.last_fire = Instant::now();
-                        println!("[hotkey] 🔥 fn+Shift → toggling");
-                        (state.callback)();
-                    }
+        if keycode == CAPS_LOCK_KEYCODE {
+            if let Some(ref mut state) = CALLBACK_STATE {
+                if state.last_fire.elapsed().as_millis() > DEBOUNCE_MS {
+                    state.last_fire = Instant::now();
+                    println!("[hotkey] 🔥 Caps Lock → toggling");
+                    (state.callback)();
                 }
             }
         }
@@ -112,8 +86,6 @@ pub fn start_listener(callback: Arc<dyn Fn() + Send + Sync>) {
         unsafe {
             let past = Instant::now() - std::time::Duration::from_secs(10);
             CALLBACK_STATE = Some(CallbackState {
-                fn_down: false,
-                shift_last_seen: past,
                 last_fire: past,
                 callback,
             });
@@ -148,8 +120,6 @@ pub fn start_listener(callback: Arc<dyn Fn() + Send + Sync>) {
                 kCFRunLoopCommonModes as *const _ as *const std::ffi::c_void,
             );
 
-            // A tap can be created but silently disabled when Input Monitoring
-            // permission is not yet granted.  Catch that here.
             if !ffi::CGEventTapIsEnabled(tap) {
                 eprintln!("[hotkey] ✗ event tap created but DISABLED — no Input Monitoring permission");
                 eprintln!("         → System Settings → Privacy & Security → Input Monitoring");
@@ -157,7 +127,7 @@ pub fn start_listener(callback: Arc<dyn Fn() + Send + Sync>) {
                 return;
             }
 
-            println!("[hotkey] ✓ listening for fn + Shift");
+            println!("[hotkey] ✓ listening for Caps Lock");
             ffi::CFRunLoopRun();
         }
     });
