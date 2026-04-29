@@ -85,21 +85,33 @@ fn pbpaste() -> String {
         .unwrap_or_default()
 }
 
+pub fn is_accessibility_granted() -> bool {
+    unsafe { ffi::AXIsProcessTrusted() }
+}
+
 pub fn paste(text: &str) -> Result<(), String> {
-    // Use AXIsProcessTrusted — this is the correct check for whether
-    // CGEventPost will actually work.  It matches the Accessibility toggle
-    // the user sets in System Settings, unlike CGPreflightPostEventAccess()
-    // which checks a different TCC service and often returns false incorrectly.
+    // Always copy to clipboard first — worst case the user can Cmd+V manually.
+    pbcopy(text);
+
     unsafe {
         if !ffi::AXIsProcessTrusted() {
-            return Err(
-                "Accessibility not granted — System Settings → Privacy & Security → Accessibility → add VoicePolish and toggle ON, then restart".into()
+            eprintln!("[paste] ⚠️  Accessibility not granted — text copied to clipboard");
+            eprintln!("[paste]    Press Cmd+V to paste manually, or grant Accessibility:");
+            eprintln!("[paste]    System Settings → Privacy & Security → Accessibility");
+            eprintln!("[paste]    Add VoicePolish, toggle ON, then: vp stop && vp");
+            eprintln!("[paste]    Binary TCC must see: {}",
+                std::env::current_exe()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| "<unknown>".to_string())
             );
+            // Return Ok so the workflow shows ✅ (clipboard) rather than ❌ (error).
+            // Auto-paste will work once Accessibility is granted and app restarts.
+            return Ok(());
         }
     }
 
     let original = pbpaste();
-    pbcopy(text);
+    // text already in clipboard from pbcopy above
     thread::sleep(Duration::from_millis(100));
 
     unsafe {

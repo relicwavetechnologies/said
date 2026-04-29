@@ -1,154 +1,168 @@
-// Uses IOKit HID Manager instead of CGEventTap.
-// CGEventTap misses Caps Lock on modern macOS because the OS processes it at
-// driver level before any event tap sees it. IOHIDManager receives raw hardware
-// events before that processing happens.
-
 use core_foundation::runloop::kCFRunLoopCommonModes;
-use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::Instant;
 
 mod ffi {
     use std::ffi::c_void;
 
-    pub type IOReturn = i32;
-    pub type IOOptionBits = u32;
+    pub type CGEventRef = *mut c_void;
+    pub type CGEventTapProxy = *mut c_void;
+    pub type CFMachPortRef = *mut c_void;
 
-    pub type IOHIDValueCallback = unsafe extern "C" fn(
-        context: *mut c_void,
-        result: IOReturn,
-        sender: *mut c_void,
-        value: *mut c_void,
-    );
+    pub type CGEventTapCallBack = unsafe extern "C" fn(
+        proxy: CGEventTapProxy,
+        event_type: u32,
+        event: CGEventRef,
+        user_info: *mut c_void,
+    ) -> CGEventRef;
 
-    #[link(name = "IOKit", kind = "framework")]
+    pub const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
+    pub const K_CG_EVENT_FLAGS_CHANGED: u32 = 12;
+    // macOS sends these pseudo-types when it auto-disables an active tap
+    pub const K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFFFFFE;
+    pub const K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFFFFFF;
+
     unsafe extern "C" {
-        pub fn IOHIDManagerCreate(
+        pub fn CGEventTapCreate(
+            tap: u32,
+            place: u32,
+            options: u32,
+            events_of_interest: u64,
+            callback: CGEventTapCallBack,
+            user_info: *mut c_void,
+        ) -> CFMachPortRef;
+
+        pub fn CFMachPortCreateRunLoopSource(
             allocator: *const c_void,
-            options: IOOptionBits,
+            port: CFMachPortRef,
+            order: i64,
         ) -> *mut c_void;
 
-        pub fn IOHIDManagerSetDeviceMatching(
-            manager: *mut c_void,
-            matching: *const c_void,
-        );
+        pub fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+        pub fn CGEventTapIsEnabled(tap: CFMachPortRef) -> bool;
+        pub fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
 
-        pub fn IOHIDManagerRegisterInputValueCallback(
-            manager: *mut c_void,
-            callback: IOHIDValueCallback,
-            context: *mut c_void,
-        );
-
-        pub fn IOHIDManagerScheduleWithRunLoop(
-            manager: *mut c_void,
-            run_loop: *mut c_void,
-            run_loop_mode: *const c_void,
-        );
-
-        pub fn IOHIDManagerOpen(
-            manager: *mut c_void,
-            options: IOOptionBits,
-        ) -> IOReturn;
-
-        pub fn IOHIDValueGetElement(value: *mut c_void) -> *mut c_void;
-        pub fn IOHIDValueGetIntegerValue(value: *mut c_void) -> i64;
-        pub fn IOHIDElementGetUsagePage(element: *mut c_void) -> u32;
-        pub fn IOHIDElementGetUsage(element: *mut c_void) -> u32;
-    }
-
-    // CoreFoundation run loop (already linked via core-foundation crate)
-    unsafe extern "C" {
+        pub fn CFRunLoopAddSource(rl: *mut c_void, source: *mut c_void, mode: *const c_void);
         pub fn CFRunLoopGetCurrent() -> *mut c_void;
         pub fn CFRunLoopRun();
     }
 }
 
-// HID Usage Table: Usage Page 0x07 = Keyboard/Keypad, Usage 0x39 = Caps Lock
-const HID_USAGE_PAGE_KEYBOARD: u32 = 0x07;
-const HID_USAGE_CAPS_LOCK: u32 = 0x39;
+const CAPS_LOCK_KEYCODE: i64 = 57;
 const DEBOUNCE_MS: u128 = 300;
 
-struct HotkeyState {
+struct CallbackState {
     last_fire: Instant,
     callback: Arc<dyn Fn() + Send + Sync>,
 }
 
-static mut HOTKEY_STATE: Option<HotkeyState> = None;
+static mut CALLBACK_STATE: Option<CallbackState> = None;
+// Stored so the re-enable handler inside the callback can reference it
+static mut EVENT_TAP: ffi::CFMachPortRef = std::ptr::null_mut();
 
-unsafe extern "C" fn hid_callback(
-    _context: *mut c_void,
-    _result: ffi::IOReturn,
-    _sender: *mut c_void,
-    value: *mut c_void,
-) {
+unsafe extern "C" fn tap_callback(
+    _proxy: ffi::CGEventTapProxy,
+    event_type: u32,
+    event: ffi::CGEventRef,
+    _user_info: *mut std::ffi::c_void,
+) -> ffi::CGEventRef {
     unsafe {
-        let element = ffi::IOHIDValueGetElement(value);
-        if element.is_null() {
-            return;
+        // macOS auto-disables active taps that process events too slowly.
+        // Re-enable immediately so the hotkey keeps working.
+        if event_type == ffi::K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT
+            || event_type == ffi::K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT
+        {
+            if !EVENT_TAP.is_null() {
+                ffi::CGEventTapEnable(EVENT_TAP, true);
+                eprintln!("[hotkey] ⚡ tap auto-disabled by macOS → re-enabled");
+            }
+            return event;
         }
 
-        let usage_page = ffi::IOHIDElementGetUsagePage(element);
-        let usage = ffi::IOHIDElementGetUsage(element);
-        let int_value = ffi::IOHIDValueGetIntegerValue(value);
+        if event_type != ffi::K_CG_EVENT_FLAGS_CHANGED {
+            return event;
+        }
 
-        // Fire on physical Caps Lock press only (int_value==1 = key down, 0 = key up)
-        if usage_page == HID_USAGE_PAGE_KEYBOARD
-            && usage == HID_USAGE_CAPS_LOCK
-            && int_value == 1
-        {
-            if let Some(ref mut state) = HOTKEY_STATE {
+        let keycode = ffi::CGEventGetIntegerValueField(event, ffi::K_CG_KEYBOARD_EVENT_KEYCODE);
+
+        if keycode == CAPS_LOCK_KEYCODE {
+            if let Some(ref mut state) = CALLBACK_STATE {
                 if state.last_fire.elapsed().as_millis() > DEBOUNCE_MS {
                     state.last_fire = Instant::now();
-                    println!("[hotkey] 🔥 Caps Lock pressed → toggling");
+                    println!("[hotkey] 🔥 Caps Lock → toggling");
                     (state.callback)();
                 }
             }
         }
     }
+    event // always pass the event through — don't suppress Caps Lock
 }
 
 pub fn start_listener(callback: Arc<dyn Fn() + Send + Sync>) {
     std::thread::spawn(move || {
         unsafe {
             let past = Instant::now() - std::time::Duration::from_secs(10);
-            HOTKEY_STATE = Some(HotkeyState {
+            CALLBACK_STATE = Some(CallbackState {
                 last_fire: past,
                 callback,
             });
 
-            let manager = ffi::IOHIDManagerCreate(std::ptr::null(), 0);
-            if manager.is_null() {
-                eprintln!("[hotkey] ✗ IOHIDManagerCreate failed");
-                return;
-            }
+            let mask: u64 = 1u64 << ffi::K_CG_EVENT_FLAGS_CHANGED;
 
-            // NULL matching = observe all HID devices; we filter by usage in the callback
-            ffi::IOHIDManagerSetDeviceMatching(manager, std::ptr::null());
-
-            ffi::IOHIDManagerRegisterInputValueCallback(
-                manager,
-                hid_callback,
+            // options=0 → kCGEventTapOptionDefault (active intercepting tap).
+            // Active taps are more reliably delivered for Caps Lock than passive (1).
+            // Requires Input Monitoring permission in System Settings.
+            let tap = ffi::CGEventTapCreate(
+                0, 0, 0,
+                mask,
+                tap_callback,
                 std::ptr::null_mut(),
             );
 
-            let rl = ffi::CFRunLoopGetCurrent();
-            ffi::IOHIDManagerScheduleWithRunLoop(
-                manager,
-                rl,
-                kCFRunLoopCommonModes as *const _ as *const c_void,
-            );
-
-            let ret = ffi::IOHIDManagerOpen(manager, 0);
-            if ret != 0 {
-                eprintln!("[hotkey] ✗ IOHIDManagerOpen failed (code {ret})");
-                eprintln!("         → grant Input Monitoring permission:");
-                eprintln!("           System Settings → Privacy & Security → Input Monitoring");
-                eprintln!("           Add VoicePolish, toggle ON, then restart.");
+            if tap.is_null() {
+                eprintln!("[hotkey] ✗ CGEventTapCreate failed — null tap returned");
+                eprintln!("         Input Monitoring not granted. Fix:");
+                eprintln!("         1. System Settings → Privacy & Security → Input Monitoring");
+                eprintln!("         2. Click + and add: {}", current_exe_str());
+                eprintln!("         3. Toggle it ON, then run: vp stop && vp");
                 return;
             }
 
-            println!("[hotkey] ✓ IOKit HID: listening for Caps Lock");
+            EVENT_TAP = tap;
+
+            if !ffi::CGEventTapIsEnabled(tap) {
+                eprintln!("[hotkey] ✗ tap created but DISABLED — Input Monitoring not granted");
+                eprintln!("         Fix:");
+                eprintln!("         1. System Settings → Privacy & Security → Input Monitoring");
+                eprintln!("         2. Find VoicePolish (or add it), toggle ON");
+                eprintln!("         3. Run: vp stop && vp");
+                eprintln!("         Binary TCC must see: {}", current_exe_str());
+                // Don't return — keep the run loop alive so the menu bar stays up.
+                // Hotkey won't fire until the user restarts after granting permission.
+            } else {
+                println!("[hotkey] ✓ CGEventTap active — listening for Caps Lock");
+            }
+
+            let source = ffi::CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
+            if source.is_null() {
+                eprintln!("[hotkey] ✗ CFMachPortCreateRunLoopSource failed");
+                return;
+            }
+
+            let rl = ffi::CFRunLoopGetCurrent();
+            ffi::CFRunLoopAddSource(
+                rl,
+                source,
+                kCFRunLoopCommonModes as *const _ as *const std::ffi::c_void,
+            );
+
             ffi::CFRunLoopRun();
         }
     });
+}
+
+fn current_exe_str() -> String {
+    std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string())
 }

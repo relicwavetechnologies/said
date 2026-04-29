@@ -142,7 +142,21 @@ INFOPLIST
 # Clear quarantine flag so macOS doesn't block the unsigned binary
 xattr -cr "$APP_BUNDLE" 2>/dev/null || true
 
-# Register the bundle with Launch Services
+# Ad-hoc code-sign the bundle.
+# Without a signature, TCC (Privacy permissions) tracks the binary by its hash.
+# That means every "vp update" changes the hash and macOS silently revokes
+# Input Monitoring + Accessibility — making the app appear broken after updates.
+# An ad-hoc signature (-) makes TCC track by bundle ID (com.voicepolish.app)
+# so permissions survive future updates.
+if command -v codesign &>/dev/null; then
+    codesign --force --deep --sign - "$APP_BUNDLE" 2>/dev/null && \
+        ok "Bundle signed (ad-hoc) — permissions will survive future updates" || \
+        note "codesign failed (non-fatal) — permissions may need re-granting after updates"
+else
+    note "codesign not found — install Xcode CLI tools to avoid re-granting permissions after updates"
+fi
+
+# Register the bundle with Launch Services so it gets a proper icon in System Settings
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
     -f "$APP_BUNDLE" 2>/dev/null || true
 
