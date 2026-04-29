@@ -10,9 +10,7 @@ const KEY_CMD: u16 = 55; // kVK_Command — left Command key
 const K_CG_HID_EVENT_TAP: u32 = 0;
 const K_CG_FLAG_COMMAND: u64 = 1 << 20;
 
-// kCGEventSourceStateCombinedSessionState = 1
-// This is what pynput uses — matches the current combined HID/app state.
-// Using null source instead produces events the system may silently drop.
+// kCGEventSourceStateCombinedSessionState = 1 — matches what pynput uses
 const K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION: u32 = 1;
 
 mod ffi {
@@ -27,34 +25,43 @@ mod ffi {
         pub fn CGEventSetFlags(event: *mut c_void, flags: u64);
         pub fn CGEventPost(tap: u32, event: *mut c_void);
         pub fn CFRelease(cf: *mut c_void);
-        pub fn CGPreflightPostEventAccess() -> bool;
-        pub fn CGRequestPostEventAccess() -> bool;
+
+        // AXIsProcessTrusted checks whether this process is in the
+        // Accessibility list in System Settings — the right question to ask
+        // before calling CGEventPost.  CGPreflightPostEventAccess() checks a
+        // *different* TCC service (kTCCServicePostEvent) and returns false
+        // even when the app is trusted for Accessibility.
+        pub fn AXIsProcessTrusted() -> bool;
+
+        // Shows the "allow in System Settings" prompt when not trusted.
+        pub fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> bool;
+    }
+}
+
+/// Call once at startup — shows the Accessibility permission prompt if needed.
+pub fn request_permission() {
+    unsafe {
+        if ffi::AXIsProcessTrusted() {
+            println!("[paste] Accessibility permission: granted ✓");
+        } else {
+            eprintln!("[paste] requesting Accessibility permission…");
+            eprintln!("[paste]   System Settings → Privacy & Security → Accessibility");
+            eprintln!("[paste]   Add VoicePolish and toggle it ON, then restart the app.");
+            // Pass NULL — we'll show the dialog via System Settings guidance.
+            // Passing a prompt dict here requires ObjC bridge; the eprintln
+            // above is sufficient since the install script already opens the page.
+            ffi::AXIsProcessTrustedWithOptions(std::ptr::null());
+        }
     }
 }
 
 fn post_key(source: *mut std::ffi::c_void, keycode: u16, key_down: bool, flags: u64) {
     unsafe {
-        let event =
-            ffi::CGEventCreateKeyboardEvent(source as *const _, keycode, key_down);
+        let event = ffi::CGEventCreateKeyboardEvent(source as *const _, keycode, key_down);
         if !event.is_null() {
             ffi::CGEventSetFlags(event, flags);
             ffi::CGEventPost(K_CG_HID_EVENT_TAP, event);
             ffi::CFRelease(event);
-        }
-    }
-}
-
-/// Call once at startup — triggers the macOS Accessibility permission dialog.
-pub fn request_permission() {
-    unsafe {
-        if !ffi::CGPreflightPostEventAccess() {
-            eprintln!("[paste] requesting Accessibility permission…");
-            eprintln!("[paste]   If no dialog appears, open:");
-            eprintln!("[paste]   System Settings → Privacy & Security → Accessibility");
-            eprintln!("[paste]   and add voice-polish manually.");
-            ffi::CGRequestPostEventAccess();
-        } else {
-            println!("[paste] Accessibility permission: granted ✓");
         }
     }
 }
@@ -79,10 +86,14 @@ fn pbpaste() -> String {
 }
 
 pub fn paste(text: &str) -> Result<(), String> {
+    // Use AXIsProcessTrusted — this is the correct check for whether
+    // CGEventPost will actually work.  It matches the Accessibility toggle
+    // the user sets in System Settings, unlike CGPreflightPostEventAccess()
+    // which checks a different TCC service and often returns false incorrectly.
     unsafe {
-        if !ffi::CGPreflightPostEventAccess() {
+        if !ffi::AXIsProcessTrusted() {
             return Err(
-                "Accessibility permission not granted — open System Settings → Privacy & Security → Accessibility and add voice-polish".into()
+                "Accessibility not granted — System Settings → Privacy & Security → Accessibility → add VoicePolish and toggle ON, then restart".into()
             );
         }
     }
@@ -92,22 +103,14 @@ pub fn paste(text: &str) -> Result<(), String> {
     thread::sleep(Duration::from_millis(100));
 
     unsafe {
-        // Create an event source matching the combined HID+session state —
-        // exactly what pynput does.  A null source produces events the OS
-        // may silently discard on macOS 12+.
         let source = ffi::CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION);
 
-        // Exactly what pynput does:
-        // press Cmd, press V (with Cmd flag), release V, release Cmd
         post_key(source, KEY_CMD, true, 0);
         thread::sleep(Duration::from_millis(10));
-
         post_key(source, KEY_V, true, K_CG_FLAG_COMMAND);
         thread::sleep(Duration::from_millis(10));
-
         post_key(source, KEY_V, false, K_CG_FLAG_COMMAND);
         thread::sleep(Duration::from_millis(10));
-
         post_key(source, KEY_CMD, false, 0);
 
         if !source.is_null() {

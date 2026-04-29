@@ -28,7 +28,7 @@ pub fn process(wav_data: Vec<u8>) -> Result<String, String> {
 
     let form = multipart::Form::new()
         .text("mode", mode.key.to_string())
-        .text("lang", "auto")
+        .text("lang", "hi")
         .part(
             "audio",
             multipart::Part::bytes(wav_data)
