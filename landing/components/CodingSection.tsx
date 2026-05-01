@@ -122,25 +122,25 @@ export function CodingSection() {
           </div>
 
           {/* Caption */}
-          <div className="mt-4 grid shrink-0 grid-cols-1 items-start gap-y-3 md:grid-cols-12 md:gap-x-8">
+          <div className="mt-3 grid shrink-0 grid-cols-1 items-start gap-y-2 md:grid-cols-12 md:gap-x-6">
             <div className="md:col-span-7">
-              <h3 className="text-[16px] font-medium tracking-[-0.005em]">
+              <h3 className="text-[14px] font-medium tracking-[-0.005em]">
                 {SLIDES[active].title}
               </h3>
-              <p className="mt-1 max-w-[520px] text-[13px] leading-[1.5] text-white/50">
+              <p className="mt-0.5 max-w-[520px] text-[12px] leading-[1.45] text-white/50">
                 {SLIDES[active].description}
               </p>
             </div>
-            <div className="md:col-span-5 md:flex md:justify-end md:pt-1">
+            <div className="md:col-span-5 md:flex md:justify-end md:pt-0.5">
               <DesignedFor logos={SLIDES[active].designedFor} />
             </div>
           </div>
 
           {/* Pagination + Hold Space row */}
-          <div className="mt-4 flex shrink-0 flex-wrap items-center justify-between gap-y-3">
-            <div className="flex items-center gap-2.5 text-[13.5px] text-white/75">
+          <div className="mt-3 flex shrink-0 flex-wrap items-center justify-between gap-y-2">
+            <div className="flex items-center gap-2 text-[12.5px] text-white/75">
               <span>Hold</span>
-              <kbd className="inline-flex h-7 min-w-[60px] items-center justify-center rounded-[6px] bg-white/10 px-2.5 font-sans text-[12px] font-medium text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.10)]">
+              <kbd className="inline-flex h-6 min-w-[52px] items-center justify-center rounded-[5px] bg-white/10 px-2 font-sans text-[11px] font-medium text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.10)]">
                 Space
               </kbd>
               <span>and try yourself</span>
@@ -156,14 +156,14 @@ export function CodingSection() {
 
 function DesignedFor({ logos }: { logos: Slide['designedFor'] }) {
   return (
-    <div className="flex items-center gap-3 text-[13px] text-white/40">
+    <div className="flex items-center gap-2.5 text-[12px] text-white/40">
       <span>Designed for</span>
-      <ul className="flex items-center gap-1.5">
+      <ul className="flex items-center gap-1">
         {logos.map((logo) => (
           <li
             key={logo.name}
             aria-label={logo.name}
-            className="flex h-7 w-7 items-center justify-center rounded-[7px] bg-white/[0.06] ring-1 ring-white/[0.08]"
+            className="flex h-6 w-6 items-center justify-center rounded-[6px] bg-white/[0.06] ring-1 ring-white/[0.08]"
           >
             {logo.mark}
           </li>
@@ -175,14 +175,14 @@ function DesignedFor({ logos }: { logos: Slide['designedFor'] }) {
 
 function Pagination({ count, active }: { count: number; active: number }) {
   return (
-    <div className="flex items-center gap-1.5" aria-hidden>
+    <div className="flex items-center gap-1" aria-hidden>
       {Array.from({ length: count }).map((_, i) => {
         const isActive = i === active;
         return (
           <span
             key={i}
-            className={`h-[3px] rounded-full transition-all duration-500 ${
-              isActive ? 'w-10 bg-white' : 'w-5 bg-white/20'
+            className={`h-[2px] rounded-full transition-all duration-500 ${
+              isActive ? 'w-8 bg-white' : 'w-4 bg-white/20'
             }`}
           />
         );
