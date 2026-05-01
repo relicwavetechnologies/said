@@ -3,6 +3,7 @@ import { Hero } from '@/components/Hero';
 import { Navbar } from '@/components/Navbar';
 import { SpeakSection } from '@/components/SpeakSection';
 import { SpeedSection } from '@/components/SpeedSection';
+import { FeaturesSection } from '@/components/FeaturesSection';
 
 export default function HomePage() {
   return (
@@ -16,6 +17,7 @@ export default function HomePage() {
       <Hero />
       <SpeakSection />
       <SpeedSection />
+      <FeaturesSection />
     </main>
   );
 }
