@@ -31,6 +31,44 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+// ── Audio file helpers ────────────────────────────────────────────────────────
+
+/// Directory where WAV recordings are saved locally (1-day retention).
+fn audio_dir() -> std::path::PathBuf {
+    let base = dirs::data_local_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    base.join("VoicePolish").join("audio")
+}
+
+/// Save WAV bytes to disk. Returns the path on success.
+fn save_audio(id: &str, data: &[u8]) -> Option<std::path::PathBuf> {
+    let dir = audio_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{id}.wav"));
+    std::fs::write(&path, data).ok()?;
+    debug!("[voice] saved audio to {}", path.display());
+    Some(path)
+}
+
+/// Delete WAV files older than 24 hours. Called from the cleanup task.
+pub fn cleanup_old_audio() {
+    let dir = audio_dir();
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(86_400))
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(modified) = meta.modified() else { continue };
+        if modified < cutoff {
+            let _ = std::fs::remove_file(entry.path());
+            debug!("[voice] deleted old audio {}", entry.path().display());
+        }
+    }
+}
+
 use crate::{
     embedder::gemini,
     llm::{gateway, gemini_direct, openai_codex, prompt::{build_system_prompt, build_user_message}},
@@ -67,12 +105,18 @@ pub async fn polish(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
+    // Save audio to disk for 1-day retention (retry support)
+    let audio_id = Uuid::new_v4().to_string();
+    save_audio(&audio_id, &wav_data);
+
     let user_id = state.default_user_id.as_str().to_string();
     let pool    = state.pool.clone();
 
     // ── Build SSE stream ───────────────────────────────────────────────────────
+    let audio_id_ref = audio_id.clone();
     let stream = async_stream::stream! {
         let total_start = Instant::now();
+        let aid = audio_id_ref.as_str(); // available for error payloads
 
         // 1. Load prefs
         let prefs = match get_prefs(&pool, &user_id) {
@@ -80,7 +124,7 @@ pub async fn polish(
             None => {
                 yield Ok::<Event, Infallible>(
                     Event::default().event("error").data(
-                        json!({"message": "preferences not found"}).to_string()
+                        json!({"message": "preferences not found", "audio_id": aid}).to_string()
                     )
                 );
                 return;
@@ -130,7 +174,7 @@ pub async fn polish(
                 Err(e) => {
                     warn!("[voice] STT error: {e}");
                     yield Ok(Event::default().event("error").data(
-                        json!({"message": e}).to_string()
+                        json!({"message": e, "audio_id": aid}).to_string()
                     ));
                     return;
                 }
@@ -184,12 +228,8 @@ pub async fn polish(
         // Resolve model string and gather any provider-specific credentials
         let (model_for_llm, openai_token_opt) = if llm_provider == "openai_codex" {
             let tok = openai_oauth::get_token(&pool, &user_id);
-            // "mini" or "fast" → gpt-5.4-mini, anything else → gpt-5.4
-            let m = if prefs.selected_model == "mini" || prefs.selected_model == "fast" {
-                openai_codex::MODEL_MINI.to_string()
-            } else {
-                openai_codex::MODEL_SMART.to_string()
-            };
+            // Always use mini — smart model removed
+            let m = openai_codex::MODEL_MINI.to_string();
             (m, tok.map(|t| t.access_token))
         } else if llm_provider == "gemini_direct" {
             (gemini_direct::GEMINI_DIRECT_MODEL.to_string(), None)
@@ -231,14 +271,14 @@ pub async fn polish(
             Ok(Err(e))  => {
                 warn!("[voice] LLM error: {e}");
                 yield Ok(Event::default().event("error").data(
-                    json!({"message": e}).to_string()
+                    json!({"message": e, "audio_id": aid}).to_string()
                 ));
                 return;
             }
             Err(e) => {
                 warn!("[voice] LLM task panicked: {e}");
                 yield Ok(Event::default().event("error").data(
-                    json!({"message": "internal error"}).to_string()
+                    json!({"message": "internal error", "audio_id": aid}).to_string()
                 ));
                 return;
             }

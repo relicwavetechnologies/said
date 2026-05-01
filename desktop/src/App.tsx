@@ -15,17 +15,19 @@ import {
   onVoiceDone,
   onVoiceStatus,
   onVoiceToken,
+  onVoiceError,
+  onEditDetected,
   cloudLogin,
   cloudSignup,
   getCloudStatus,
   getOpenAIStatus,
   initiateOpenAIOAuth,
-  patchPreferences,
   requestInputMonitoring,
+  submitEditFeedback,
 } from "@/lib/invoke";
 import { useTheme } from "@/lib/useTheme";
 import type { AppSnapshot, HistoryItem, Recording } from "@/types";
-import { getPreferences } from "@/lib/invoke";
+import { RetryToast, EditConfirmToast } from "@/components/NotificationToast";
 
 export type ActiveView = "dashboard" | "history" | "insights" | "settings";
 const VALID_VIEWS: ActiveView[] = ["dashboard", "history", "insights", "settings"];
@@ -74,6 +76,14 @@ export default function App() {
   const [errorBanner, setErrorBanner] = useState<string>("");
   const [activeView,  setActiveView]  = useState<ActiveView>("dashboard");
 
+  // ── Retry toast ───────────────────────────────────────────────────────────
+  const [retryToast, setRetryToast] = useState<{ message: string; audioId: string } | null>(null);
+
+  // ── Edit confirmation toast ────────────────────────────────────────────────
+  const [editToast, setEditToast] = useState<{
+    recordingId: string; aiOutput: string; userKept: string;
+  } | null>(null);
+
   // ── Cloud auth gate ────────────────────────────────────────────────────────
   // null = still checking, false = signed in, true = needs sign-in
   const [needsAuth,   setNeedsAuth]   = useState<boolean | null>(null);
@@ -109,13 +119,6 @@ export default function App() {
         // OpenAI connection — REQUIRED
         const oaStatus = await getOpenAIStatus();
         setOpenAIConnected(oaStatus?.connected ?? false);
-        // Load saved model preference
-        const prefs = await getPreferences();
-        if (prefs?.selected_model === "mini" || prefs?.selected_model === "fast") {
-          setOpenAIModel("mini");
-        } else {
-          setOpenAIModel("smart");
-        }
       })
       .catch((err: unknown) => {
         setErrorBanner(err instanceof Error ? err.message : String(err));
@@ -124,9 +127,6 @@ export default function App() {
       });
     refreshHistory();
   }, [refreshHistory]);
-
-  // ── OpenAI model switch (called from Dashboard pills) ─────────────────────
-  const [openAIModel, setOpenAIModel] = useState<"smart" | "mini">("smart");
 
   // ── OpenAI OAuth connect ───────────────────────────────────────────────────
   const handleOpenAIConnect = useCallback(async () => {
@@ -207,6 +207,24 @@ export default function App() {
       setStatusPhase("");
     });
 
+    // Voice error → show retry toast
+    const unsubError = onVoiceError((msg, audioId) => {
+      setRetryToast({ message: msg, audioId: audioId ?? "" });
+      setBusy(false);
+      setSnapshot((p) => (p ? { ...p, state: "idle" } : p));
+      setStatusPhase("");
+      setTokenBuf("");
+    });
+
+    // Edit detected → show confirmation toast
+    const unsubEdit = onEditDetected((payload) => {
+      setEditToast({
+        recordingId: payload.recording_id,
+        aiOutput:    payload.ai_output,
+        userKept:    payload.user_kept,
+      });
+    });
+
     // Tray menu → navigate to Settings
     const unsubNav = onNavSettings(() => setActiveView("settings"));
 
@@ -240,10 +258,13 @@ export default function App() {
       unsubStatus();
       unsubToken();
       unsubDone();
+      unsubError();
+      unsubEdit();
     };
   }, [refreshHistory]);
 
-  // ── Periodic snapshot poll — picks up permission changes + state sync ──────
+  // ── Periodic snapshot poll — picks up Accessibility/Input Monitoring grants ──
+  // 5 s is fast enough — permission changes require a user trip to System Settings.
   useEffect(() => {
     const interval = setInterval(async () => {
       if (busy) return;
@@ -253,7 +274,7 @@ export default function App() {
       } catch {
         // silently ignore
       }
-    }, 1500); // 1.5 s — fast enough to detect permission changes in real time
+    }, 5000);
     return () => clearInterval(interval);
   }, [busy]);
 
@@ -278,17 +299,6 @@ export default function App() {
       setBusy(false);
     }
   }, [snapshot, refreshHistory]);
-
-  // ── Mode change ────────────────────────────────────────────────────────────
-  const handleMode = useCallback(async (key: string) => {
-    setErrorBanner("");
-    try {
-      const next = await invoke("set_mode", { key });
-      setSnapshot(next);
-    } catch (err: unknown) {
-      setErrorBanner(err instanceof Error ? err.message : String(err));
-    }
-  }, []);
 
   // ── Accessibility ──────────────────────────────────────────────────────────
   const handleAccessibility = useCallback(async () => {
@@ -489,11 +499,6 @@ export default function App() {
         activeView={activeView}
         onViewChange={handleViewChange}
         busy={busy}
-        openAIModel={openAIModel}
-        onOpenAIModel={(m) => {
-          setOpenAIModel(m);
-          patchPreferences({ selected_model: m }).catch(() => {});
-        }}
       />
 
       {/* ── Right column: topbar + content ───────────── */}
@@ -509,17 +514,10 @@ export default function App() {
                 snapshot={snapshotWithHistory}
                 busy={busy}
                 onToggle={handleToggle}
-                onMode={handleMode}
                 onAccessibility={handleAccessibility}
                 onNavigate={handleViewChange}
                 statusPhase={statusPhase}
                 liveText={liveText}
-                openAIConnected={openAIConnected === true}
-                openAIModel={openAIModel}
-                onOpenAIModel={(m) => {
-                  setOpenAIModel(m);
-                  patchPreferences({ selected_model: m }).catch(() => {});
-                }}
               />
             )}
             {activeView === "history"  && <HistoryView  snapshot={snapshotWithHistory} />}
@@ -529,16 +527,44 @@ export default function App() {
                 snapshot={snapshotWithHistory}
                 onAccessibility={handleAccessibility}
                 onInputMonitoring={handleInputMonitoring}
-                openAIModel={openAIModel}
-                onOpenAIModel={(m) => {
-                  setOpenAIModel(m);
-                  patchPreferences({ selected_model: m }).catch(() => {});
-                }}
               />
             )}
           </div>
         </main>
       </div>
+
+      {/* ── Retry toast (bottom-center) ──────────────── */}
+      {retryToast && (
+        <RetryToast
+          message={retryToast.message}
+          onRetry={async () => {
+            setRetryToast(null);
+            if (retryToast.audioId) {
+              try {
+                await invoke("retry_recording", { audioId: retryToast.audioId });
+              } catch (e) {
+                setErrorBanner(e instanceof Error ? e.message : String(e));
+              }
+            }
+          }}
+          onDismiss={() => setRetryToast(null)}
+        />
+      )}
+
+      {/* ── Edit confirmation toast (bottom-center) ── */}
+      {editToast && !retryToast && (
+        <EditConfirmToast
+          aiOutput={editToast.aiOutput}
+          userKept={editToast.userKept}
+          onSave={async () => {
+            setEditToast(null);
+            try {
+              await submitEditFeedback(editToast.recordingId, editToast.userKept);
+            } catch { /* non-critical */ }
+          }}
+          onDismiss={() => setEditToast(null)}
+        />
+      )}
 
       {/* ── Floating error toast ──────────────────────── */}
       {errorBanner && (

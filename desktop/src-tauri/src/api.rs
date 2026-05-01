@@ -115,7 +115,7 @@ pub enum PolishEvent {
     Status { phase: String, transcript: Option<String> },
     Token  { token: String },
     Done   (PolishDone),
-    Error  { message: String },
+    Error  { message: String, audio_id: Option<String> },
 }
 
 // ── Voice polish ──────────────────────────────────────────────────────────────
@@ -288,7 +288,8 @@ fn parse_and_dispatch(
         }
         "error" => {
             if let Some(msg) = val.get("message").and_then(Value::as_str) {
-                on_event(PolishEvent::Error { message: msg.to_string() });
+                let audio_id = val.get("audio_id").and_then(Value::as_str).map(str::to_string);
+                on_event(PolishEvent::Error { message: msg.to_string(), audio_id });
             }
         }
         // Key-sniff fallback (handles backends that omit the `event:` line)
@@ -306,7 +307,8 @@ fn parse_and_dispatch(
                     *done_event = Some(done);
                 }
             } else if let Some(msg) = val.get("message").and_then(Value::as_str) {
-                on_event(PolishEvent::Error { message: msg.to_string() });
+                let audio_id = val.get("audio_id").and_then(Value::as_str).map(str::to_string);
+                on_event(PolishEvent::Error { message: msg.to_string(), audio_id });
             }
         }
     }

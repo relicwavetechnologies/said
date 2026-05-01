@@ -6,7 +6,7 @@
 
 use std::time::Instant;
 
-use voice_polish_core::{all_modes, current_mode, set_mode as core_set_mode, AppSnapshot, ProcessSummary};
+use voice_polish_core::{all_modes, AppSnapshot, ProcessSummary};
 use voice_polish_paster::is_accessibility_granted;
 use voice_polish_recorder::{AudioRecorder, ChunkReceiver};
 
@@ -50,30 +50,28 @@ impl DesktopApp {
     }
 
     /// Build a snapshot for the frontend.
-    /// History, total_words, daily_streak now come from the backend SQLite;
-    /// this snapshot only carries ephemeral UI state.
+    /// History, total_words, daily_streak come from backend SQLite.
+    /// Mode is always "mini" — model switching has been removed.
     pub fn snapshot(&self) -> AppSnapshot {
-        let current = current_mode();
         AppSnapshot {
-            state:                 self.state.as_str().to_string(),
-            platform:              std::env::consts::OS.to_string(),
-            current_mode:          current.key,
-            current_mode_label:    current.label,
-            current_model:         current.model,
+            state:                    self.state.as_str().to_string(),
+            platform:                 std::env::consts::OS.to_string(),
+            current_mode:             "mini",
+            current_mode_label:       "Fast (gpt-5.4-mini)",
+            current_model:            "gpt-5.4-mini",
             auto_paste_supported:     cfg!(target_os = "macos"),
             accessibility_granted:    is_accessibility_granted(),
             #[cfg(target_os = "macos")]
             input_monitoring_granted: is_input_monitoring_granted(),
             #[cfg(not(target_os = "macos"))]
             input_monitoring_granted: false,
-            modes:                 all_modes().to_vec(),
-            last_result:           self.last_result.clone(),
-            last_error:            self.last_error.clone(),
-            // These fields are populated from backend in Phase E
-            history:       vec![],
-            total_words:   0,
-            daily_streak:  0,
-            avg_wpm:       0,
+            modes:       all_modes().to_vec(),
+            last_result: self.last_result.clone(),
+            last_error:  self.last_error.clone(),
+            history:     vec![],
+            total_words: 0,
+            daily_streak: 0,
+            avg_wpm:     0,
         }
     }
 
@@ -81,12 +79,6 @@ impl DesktopApp {
     /// Returns `None` if the recorder hasn't started yet or the receiver was already taken.
     pub fn take_chunk_receiver(&mut self) -> Option<ChunkReceiver> {
         self.recorder.take_chunk_receiver()
-    }
-
-    pub fn set_mode(&mut self, key: &str) -> Result<AppSnapshot, String> {
-        core_set_mode(key)?;
-        self.last_error = None;
-        Ok(self.snapshot())
     }
 
     /// Begin recording. Returns the snapshot for the UI.

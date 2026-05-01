@@ -62,7 +62,7 @@ async fn main() {
 
     info!("polish-backend listening on http://{addr}");
 
-    // ── 7-day cleanup task (every 6 hours) ────────────────────────────────────
+    // ── 7-day recording + 24h audio file cleanup (every 6 hours) ─────────────
     {
         let pool2 = pool.clone();
         tokio::spawn(async move {
@@ -71,7 +71,8 @@ async fn main() {
             loop {
                 interval.tick().await;
                 polish_backend::store::history::cleanup_old_recordings(&pool2);
-                info!("[cleanup] 7-day recording sweep complete");
+                polish_backend::routes::voice::cleanup_old_audio();
+                info!("[cleanup] 7-day recording + 24h audio sweep complete");
             }
         });
     }

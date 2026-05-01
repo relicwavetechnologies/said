@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 
 use serde::{Deserialize, Serialize};
 
@@ -18,53 +18,30 @@ pub struct Mode {
 }
 
 pub const MODES: &[Mode] = &[
-    Mode { key: "fast",  label: "Fast (gpt-5.4-mini)", model: "gpt-5.4-mini", icon: "fast"  },
-    Mode { key: "smart", label: "Smart (gpt-5.4)",     model: "gpt-5.4",      icon: "smart" },
+    Mode { key: "mini", label: "Fast (gpt-5.4-mini)", model: "gpt-5.4-mini", icon: "fast" },
 ];
 
 static MODE_INDEX: AtomicUsize = AtomicUsize::new(0);
 
 pub fn current_mode() -> &'static Mode {
-    &MODES[MODE_INDEX.load(Ordering::Relaxed)]
+    &MODES[0]
 }
 
 pub fn all_modes() -> &'static [Mode] {
     MODES
 }
 
-pub fn cycle_mode() -> &'static Mode {
-    let next = (MODE_INDEX.load(Ordering::Relaxed) + 1) % MODES.len();
-    MODE_INDEX.store(next, Ordering::Relaxed);
-    &MODES[next]
-}
-
-pub fn set_mode(key: &str) -> Result<&'static Mode, String> {
-    let index = MODES
-        .iter()
-        .position(|m| m.key == key)
-        .ok_or_else(|| format!("unknown mode: {key}"))?;
-    MODE_INDEX.store(index, Ordering::Relaxed);
-    Ok(&MODES[index])
+pub fn set_mode(_key: &str) -> Result<&'static Mode, String> {
+    Ok(&MODES[0])
 }
 
 pub fn mode_label() -> &'static str {
-    current_mode().label
+    MODES[0].label
 }
 
-/// Resolve the LLM model string from a mode key or direct model string.
-/// If `key_or_model` matches a mode key, returns that mode's model field.
-/// Otherwise returns the value as-is (allows direct model strings).
-pub fn resolve_model(key_or_model: &str) -> &'static str {
-    MODES.iter()
-        .find(|m| m.key == key_or_model)
-        .map(|m| m.model)
-        .unwrap_or_else(|| {
-            // Try to find by model field
-            MODES.iter()
-                .find(|m| m.model == key_or_model)
-                .map(|m| m.model)
-                .unwrap_or("gpt-5.4")  // safe default
-        })
+/// Always returns gpt-5.4-mini — the only supported model.
+pub fn resolve_model(_key_or_model: &str) -> &'static str {
+    "gpt-5.4-mini"
 }
 
 pub fn api_key() -> String {
