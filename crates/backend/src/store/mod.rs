@@ -6,6 +6,7 @@ use tracing::info;
 
 pub mod history;
 pub mod openai_oauth;
+pub mod pending_edits;
 pub mod prefs;
 pub mod users;
 pub mod vectors;
@@ -18,6 +19,7 @@ const MIGRATION_003: &str = include_str!("migrations/003_output_language.sql");
 const MIGRATION_004: &str = include_str!("migrations/004_api_keys.sql");
 const MIGRATION_005: &str = include_str!("migrations/005_llm_provider.sql");
 const MIGRATION_006: &str = include_str!("migrations/006_openai_oauth.sql");
+const MIGRATION_007: &str = include_str!("migrations/007_pending_edits.sql");
 
 /// Open (or create) the SQLite database at `path`, run pending migrations,
 /// and return a connection pool.
@@ -101,6 +103,14 @@ fn run_migrations(pool: &DbPool) {
             .expect("migration 006 failed");
         conn.execute_batch("PRAGMA user_version = 6")
             .expect("failed to set user_version to 6");
+    }
+
+    if version < 7 {
+        info!("running migration 007_pending_edits");
+        conn.execute_batch(MIGRATION_007)
+            .expect("migration 007 failed");
+        conn.execute_batch("PRAGMA user_version = 7")
+            .expect("failed to set user_version to 7");
     }
 }
 

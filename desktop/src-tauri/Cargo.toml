@@ -30,6 +30,9 @@ open = "5"
 # Resolve platform-specific directories (audio retry files)
 dirs = "5"
 
+# Native OS notifications (permission-based, best-effort)
+notify-rust = { version = "4", default-features = false }
+
 # Workspace crates
 voice-polish-core     = { path = "../../crates/core" }
 voice-polish-paster   = { path = "../../crates/paster" }

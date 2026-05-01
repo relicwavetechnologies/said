@@ -613,3 +613,80 @@ pub async fn submit_feedback(
         Err(format!("edit-feedback error: {status}"))
     }
 }
+
+// ── Pending edits ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingEdit {
+    pub id:           String,
+    pub recording_id: Option<String>,
+    pub ai_output:    String,
+    pub user_kept:    String,
+    pub timestamp_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingEditsResponse {
+    pub edits: Vec<PendingEdit>,
+    pub total: i64,
+}
+
+/// Store a detected edit for user review (called right after detection, before notifying).
+pub async fn store_pending_edit(
+    ep:           &BackendEndpoint,
+    recording_id: Option<&str>,
+    ai_output:    &str,
+    user_kept:    &str,
+) -> Result<String, String> {
+    let url  = format!("{}/v1/pending-edits", ep.url);
+    let body = serde_json::json!({
+        "recording_id": recording_id,
+        "ai_output":    ai_output,
+        "user_kept":    user_kept,
+    });
+    let resp = Client::new()
+        .post(&url)
+        .header("Authorization", ep.bearer())
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("store pending edit failed: {e}"))?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("parse pending edit response: {e}"))?;
+    resp["id"].as_str().map(str::to_string).ok_or_else(|| "no id in response".into())
+}
+
+pub async fn get_pending_edits(ep: &BackendEndpoint) -> Result<PendingEditsResponse, String> {
+    let url = format!("{}/v1/pending-edits", ep.url);
+    Client::new()
+        .get(&url)
+        .header("Authorization", ep.bearer())
+        .send()
+        .await
+        .map_err(|e| format!("get pending edits failed: {e}"))?
+        .json::<PendingEditsResponse>()
+        .await
+        .map_err(|e| format!("parse pending edits: {e}"))
+}
+
+pub async fn resolve_pending_edit(
+    ep:     &BackendEndpoint,
+    id:     &str,
+    action: &str, // "approve" | "skip"
+) -> Result<(), String> {
+    let url    = format!("{}/v1/pending-edits/{id}/resolve", ep.url);
+    let status = Client::new()
+        .post(&url)
+        .header("Authorization", ep.bearer())
+        .json(&serde_json::json!({ "action": action }))
+        .send()
+        .await
+        .map_err(|e| format!("resolve pending edit failed: {e}"))?
+        .status();
+    if status.is_success() || status.as_u16() == 204 {
+        Ok(())
+    } else {
+        Err(format!("resolve error: {status}"))
+    }
+}

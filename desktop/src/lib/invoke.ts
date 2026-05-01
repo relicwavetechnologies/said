@@ -7,6 +7,7 @@ import type {
   CloudStatus,
   HistoryItem,
   OpenAIStatus,
+  PendingEditsResponse,
   PolishDone,
   Preferences,
   PrefsUpdate,
@@ -467,12 +468,44 @@ export async function disconnectOpenAI(): Promise<void> {
   await tauriInvoke("disconnect_openai");
 }
 
+// ── Pending-edit review ───────────────────────────────────────────────────────
+
+export async function getPendingEdits(): Promise<PendingEditsResponse> {
+  if (!isTauriRuntime()) return { edits: [], total: 0 };
+  try {
+    return await tauriInvoke<PendingEditsResponse>("get_pending_edits");
+  } catch {
+    return { edits: [], total: 0 };
+  }
+}
+
+export async function resolvePendingEdit(
+  id: string,
+  action: "approve" | "skip"
+): Promise<void> {
+  if (!isTauriRuntime()) return;
+  try {
+    await tauriInvoke("resolve_pending_edit", { id, action });
+  } catch {
+    // non-critical
+  }
+}
+
+/** Listen for the backend's signal that pending edits list changed. */
+export function onPendingEditsChanged(handler: () => void): () => void {
+  if (!isTauriRuntime()) return () => {};
+  let unsub: () => void = () => {};
+  listen("pending-edits-changed", () => handler()).then((fn) => { unsub = fn; });
+  return () => unsub();
+}
+
 // Suppress unused-import warnings for types only used in exported signatures
 export type {
   CloudAuthResponse,
   CloudStatus,
   HistoryItem,
   OpenAIStatus,
+  PendingEditsResponse,
   PolishDone,
   Preferences,
   PrefsUpdate,

@@ -155,6 +155,21 @@ export interface OpenAIStatus {
   model_mini:   string;      // "gpt-5.4-mini"
 }
 
+// ── Pending edits ────────────────────────────────────────────────────────────
+
+export interface PendingEdit {
+  id:           string;
+  recording_id: string | null;
+  ai_output:    string;
+  user_kept:    string;
+  timestamp_ms: number;
+}
+
+export interface PendingEditsResponse {
+  edits: PendingEdit[];
+  total: number;
+}
+
 // ── Display helpers ──────────────────────────────────────────────────────────
 
 export interface TimelineItem {

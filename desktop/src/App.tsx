@@ -17,6 +17,9 @@ import {
   onVoiceToken,
   onVoiceError,
   onEditDetected,
+  onPendingEditsChanged,
+  getPendingEdits,
+  resolvePendingEdit,
   cloudLogin,
   cloudSignup,
   getCloudStatus,
@@ -26,7 +29,7 @@ import {
   submitEditFeedback,
 } from "@/lib/invoke";
 import { useTheme } from "@/lib/useTheme";
-import type { AppSnapshot, HistoryItem, Recording } from "@/types";
+import type { AppSnapshot, HistoryItem, PendingEdit, Recording } from "@/types";
 import { RetryToast, EditConfirmToast } from "@/components/NotificationToast";
 
 export type ActiveView = "dashboard" | "history" | "insights" | "settings";
@@ -83,6 +86,9 @@ export default function App() {
   const [editToast, setEditToast] = useState<{
     recordingId: string; aiOutput: string; userKept: string;
   } | null>(null);
+
+  // ── Pending edits ─────────────────────────────────────────────────────────
+  const [pendingEdits, setPendingEdits] = useState<PendingEdit[]>([]);
 
   // ── Cloud auth gate ────────────────────────────────────────────────────────
   // null = still checking, false = signed in, true = needs sign-in
@@ -216,7 +222,7 @@ export default function App() {
       setTokenBuf("");
     });
 
-    // Edit detected → show confirmation toast
+    // Edit detected (legacy in-app toast — still fires as fallback)
     const unsubEdit = onEditDetected((payload) => {
       setEditToast({
         recordingId: payload.recording_id,
@@ -224,6 +230,11 @@ export default function App() {
         userKept:    payload.user_kept,
       });
     });
+
+    // Pending edits changed → refresh list
+    const refreshPending = () => getPendingEdits().then((r) => setPendingEdits(r.edits));
+    refreshPending();
+    const unsubPending = onPendingEditsChanged(refreshPending);
 
     // Tray menu → navigate to Settings
     const unsubNav = onNavSettings(() => setActiveView("settings"));
@@ -260,6 +271,7 @@ export default function App() {
       unsubDone();
       unsubError();
       unsubEdit();
+      unsubPending();
     };
   }, [refreshHistory]);
 
@@ -518,6 +530,11 @@ export default function App() {
                 onNavigate={handleViewChange}
                 statusPhase={statusPhase}
                 liveText={liveText}
+                pendingEdits={pendingEdits}
+                onResolvePending={async (id, action) => {
+                  await resolvePendingEdit(id, action);
+                  setPendingEdits((prev) => prev.filter((e) => e.id !== id));
+                }}
               />
             )}
             {activeView === "history"  && <HistoryView  snapshot={snapshotWithHistory} />}

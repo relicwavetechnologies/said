@@ -1,9 +1,9 @@
 import React, { useMemo, useState } from "react";
-import { Mic, Zap, Bot, Sparkles, Copy, Check, Timer } from "lucide-react";
+import { Mic, Zap, Bot, Sparkles, Copy, Check, Timer, BookOpen, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { HeroBanner } from "@/components/HeroBanner";
-import type { AppSnapshot, HistoryItem } from "@/types";
+import type { AppSnapshot, HistoryItem, PendingEdit } from "@/types";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -256,6 +256,8 @@ interface DashboardViewProps {
   onNavigate?:     (view: string) => void;
   statusPhase?:    string;
   liveText?:       string;
+  pendingEdits?:   PendingEdit[];
+  onResolvePending?: (id: string, action: "approve" | "skip") => void;
 }
 
 // ── View ───────────────────────────────────────────────────────────────────────
@@ -266,10 +268,13 @@ export function DashboardView({
   onToggle,
   onAccessibility,
   onNavigate,
-  statusPhase = "",
-  liveText    = "",
+  statusPhase    = "",
+  liveText       = "",
+  pendingEdits   = [],
+  onResolvePending,
 }: DashboardViewProps) {
-  const [filterTab, setFilterTab] = useState<FilterTab>("all");
+  const [filterTab, setFilterTab]       = useState<FilterTab>("all");
+  const [reviewOpen, setReviewOpen]     = useState(false);
 
   const isRecording  = snapshot?.state === "recording";
   const isProcessing = snapshot?.state === "processing" || busy;
@@ -298,6 +303,96 @@ export function DashboardView({
   return (
     <ScrollArea className="h-full">
       <div className="p-7 pb-12 max-w-5xl mx-auto">
+
+        {/* ── Pending learning approvals banner ──────── */}
+        {pendingEdits.length > 0 && (
+          <div
+            className="mb-5 rounded-2xl px-4 py-3 flex items-center justify-between gap-3"
+            style={{
+              background: "hsl(var(--chip-lime-fg) / 0.08)",
+              border:     "1px solid hsl(var(--chip-lime-fg) / 0.25)",
+            }}
+          >
+            <div className="flex items-center gap-2.5">
+              <BookOpen size={15} style={{ color: "hsl(var(--chip-lime-fg))" }} />
+              <p className="text-[12px] font-medium" style={{ color: "hsl(var(--chip-lime-fg))" }}>
+                {pendingEdits.length} learning approval{pendingEdits.length > 1 ? "s" : ""} pending
+              </p>
+            </div>
+            <button
+              onClick={() => setReviewOpen((o) => !o)}
+              className="text-[11px] font-semibold px-3 py-1 rounded-lg transition-colors"
+              style={{
+                background: "hsl(var(--chip-lime-fg) / 0.15)",
+                color:      "hsl(var(--chip-lime-fg))",
+              }}
+            >
+              {reviewOpen ? "Close" : "Review"}
+            </button>
+          </div>
+        )}
+
+        {/* ── Pending edits review panel ──────────────── */}
+        {reviewOpen && pendingEdits.length > 0 && (
+          <div
+            className="mb-6 rounded-2xl overflow-hidden"
+            style={{ border: "1px solid hsl(var(--border))" }}
+          >
+            {pendingEdits.map((pe, i) => (
+              <div
+                key={pe.id}
+                className="px-4 py-3 flex flex-col gap-2"
+                style={{
+                  borderBottom: i < pendingEdits.length - 1 ? "1px solid hsl(var(--border))" : undefined,
+                  background: "hsl(var(--surface-2))",
+                }}
+              >
+                <div className="flex flex-col gap-1 text-[11px]">
+                  <div className="flex gap-2 items-start">
+                    <span className="opacity-40 font-semibold w-5 text-right flex-shrink-0">AI</span>
+                    <span
+                      className="leading-snug px-2 py-1 rounded-lg text-muted-foreground line-through flex-1"
+                      style={{ background: "hsl(0 50% 50% / 0.08)" }}
+                    >
+                      {pe.ai_output.length > 80 ? pe.ai_output.slice(0, 80) + "…" : pe.ai_output}
+                    </span>
+                  </div>
+                  <div className="flex gap-2 items-start">
+                    <span className="opacity-40 font-semibold w-5 text-right flex-shrink-0">You</span>
+                    <span
+                      className="leading-snug px-2 py-1 rounded-lg flex-1"
+                      style={{
+                        background: "hsl(var(--chip-lime-fg) / 0.08)",
+                        color:      "hsl(var(--chip-lime-fg))",
+                      }}
+                    >
+                      {pe.user_kept.length > 80 ? pe.user_kept.slice(0, 80) + "…" : pe.user_kept}
+                    </span>
+                  </div>
+                </div>
+                <div className="flex gap-2 justify-end">
+                  <button
+                    onClick={() => { onResolvePending?.(pe.id, "skip"); }}
+                    className="px-3 py-1 rounded-lg text-[11px] font-medium text-muted-foreground transition-colors"
+                    style={{ background: "hsl(var(--surface-4))" }}
+                  >
+                    Skip
+                  </button>
+                  <button
+                    onClick={() => { onResolvePending?.(pe.id, "approve"); }}
+                    className="px-3 py-1 rounded-lg text-[11px] font-semibold transition-colors"
+                    style={{
+                      background: "hsl(var(--primary))",
+                      color:      "hsl(var(--primary-foreground))",
+                    }}
+                  >
+                    Save to learning
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
 
         {/* ── Hero banner ─────────────────────────────── */}
         <HeroBanner onCustomize={() => onNavigate?.("settings")} />

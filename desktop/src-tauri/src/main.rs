@@ -5,6 +5,9 @@ mod backend;
 mod desktop;
 mod dg_stream;  // P5: Deepgram WebSocket live streaming
 
+#[cfg(target_os = "macos")]
+extern crate notify_rust;
+
 use std::sync::{Arc, Mutex};
 
 use tauri::{
@@ -1041,6 +1044,26 @@ fn retry_recording(
     Ok(())
 }
 
+// ── Pending-edit review commands ──────────────────────────────────────────────
+
+#[tauri::command]
+async fn get_pending_edits(
+    backend: State<'_, BackendState>,
+) -> Result<api::PendingEditsResponse, String> {
+    let ep = get_endpoint(&backend)?;
+    api::get_pending_edits(&ep).await
+}
+
+#[tauri::command]
+async fn resolve_pending_edit(
+    backend: State<'_, BackendState>,
+    id:      String,
+    action:  String,
+) -> Result<(), String> {
+    let ep = get_endpoint(&backend)?;
+    api::resolve_pending_edit(&ep, &id, &action).await
+}
+
 // ── Cloud auth commands ───────────────────────────────────────────────────────
 
 /// Cloud URL — read from env, default to the hosted service.
@@ -1325,19 +1348,34 @@ async fn watch_for_edit(
         return;
     }
 
-    // ── Show window + emit to frontend for user confirmation ──────────────────
-    // The toast renders inside the Tauri window, so bring it to the front first.
-    tracing::info!("[edit-watch] emitting edit-detected for {recording_id}");
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.set_focus();
+    // ── 1. Store as pending edit in the backend ────────────────────────────────
+    tracing::info!("[edit-watch] storing pending edit for {recording_id}");
+    let ep_opt = back_arc.lock().ok().and_then(|g| g.clone());
+    if let Some(ref ep) = ep_opt {
+        match api::store_pending_edit(ep, Some(&recording_id), &polished, &user_kept).await {
+            Ok(pending_id) => {
+                tracing::info!("[edit-watch] pending_edit stored: {pending_id}");
+                // ── 2. Send native macOS notification (best-effort) ────────────
+                // If permission is denied, the pending badge on the dashboard
+                // is the fallback reminder for the user.
+                let ai_short   = if polished.len()   > 45 { format!("{}…", &polished[..45])   } else { polished.clone()   };
+                let kept_short = if user_kept.len()  > 45 { format!("{}…", &user_kept[..45])  } else { user_kept.clone()  };
+                let body = format!("\"{ai_short}\"  →  \"{kept_short}\"");
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = notify_rust::Notification::new()
+                        .summary("Said noticed an edit — tap to review")
+                        .body(&body)
+                        .show();
+                }
+            }
+            Err(e) => tracing::warn!("[edit-watch] failed to store pending edit: {e}"),
+        }
     }
-    let _ = app.emit("edit-detected", serde_json::json!({
-        "recording_id": recording_id,
-        "ai_output":    polished,
-        "user_kept":    user_kept,
-    }));
-    // The Tauri command `submit_edit_feedback` is called by the frontend if user confirms.
+
+    // ── 3. Emit to frontend so the dashboard badge refreshes ──────────────────
+    // (window is NOT force-shown — user opens it in their own time)
+    let _ = app.emit("pending-edits-changed", ());
     let _ = back_arc; // keep arc alive until end of scope
 }
 
@@ -1563,6 +1601,9 @@ fn main() {
             disconnect_openai,
             // Retry
             retry_recording,
+            // Pending-edit review
+            get_pending_edits,
+            resolve_pending_edit,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Voice Polish desktop")
