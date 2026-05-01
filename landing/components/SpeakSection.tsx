@@ -1,3 +1,5 @@
+import { TrustLogos } from './TrustLogos';
+
 export function SpeakSection() {
   return (
     <section className="relative w-full">
@@ -23,6 +25,18 @@ export function SpeakSection() {
 
         <div className="mt-16 md:mt-20">
           <MonitorMockup />
+        </div>
+
+        <div className="mt-12 flex flex-wrap items-center justify-between gap-y-6 text-left">
+          <div className="flex items-center gap-3 text-[15px] text-text/85">
+            <span>Hold</span>
+            <kbd className="inline-flex h-9 min-w-[72px] items-center justify-center rounded-[8px] bg-white px-3.5 font-sans text-[13px] font-medium text-text shadow-[0_1px_0_rgba(0,0,0,0.04),0_4px_10px_rgba(41,44,61,0.08)] ring-1 ring-black/[0.06]">
+              Space
+            </kbd>
+            <span>and try yourself</span>
+          </div>
+
+          <TrustLogos />
         </div>
       </div>
     </section>
