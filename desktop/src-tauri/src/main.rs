@@ -315,24 +315,26 @@ fn build_tray_menu(
     ])?;
 
     // ── 4. "Polish my message" submenu ─────────────────────────────────
-    // Fixed English-output presets + optional Custom entry
-    let p_prof     = MenuItem::with_id(app, "tray_polish_professional", "Professional English", true, None::<&str>)?;
-    let p_casual   = MenuItem::with_id(app, "tray_polish_casual",       "Casual",               true, None::<&str>)?;
-    let p_assertive= MenuItem::with_id(app, "tray_polish_assertive",    "Assertive",            true, None::<&str>)?;
-    let p_concise  = MenuItem::with_id(app, "tray_polish_concise",      "Concise",              true, None::<&str>)?;
-    let p_neutral  = MenuItem::with_id(app, "tray_polish_neutral",      "Neutral",              true, None::<&str>)?;
+    // Shortcut hints: Option+1..5 (global hotkeys registered in setup).
+    let p_prof     = MenuItem::with_id(app, "tray_polish_professional", "Professional English  ⌥1", true, None::<&str>)?;
+    let p_casual   = MenuItem::with_id(app, "tray_polish_casual",       "Casual  ⌥2",               true, None::<&str>)?;
+    let p_concise  = MenuItem::with_id(app, "tray_polish_concise",      "Concise  ⌥3",              true, None::<&str>)?;
+    let p_hinglish = MenuItem::with_id(app, "tray_polish_hinglish",     "Hinglish  ⌥4",             true, None::<&str>)?;
+    let p_assertive= MenuItem::with_id(app, "tray_polish_assertive",    "Assertive",                true, None::<&str>)?;
+    let p_neutral  = MenuItem::with_id(app, "tray_polish_neutral",      "Neutral",                  true, None::<&str>)?;
 
     let polish_refs: Vec<Box<dyn tauri::menu::IsMenuItem<tauri::Wry>>> = {
         let mut v: Vec<Box<dyn tauri::menu::IsMenuItem<tauri::Wry>>> = vec![
             Box::new(p_prof),
             Box::new(p_casual),
-            Box::new(p_assertive),
             Box::new(p_concise),
+            Box::new(p_hinglish),
+            Box::new(p_assertive),
             Box::new(p_neutral),
         ];
-        // Add "Custom" only when the user has set a custom prompt in Settings
+        // Add "Custom  ⌥5" only when the user has set a custom prompt in Settings
         if custom_prompt.map(|s| !s.trim().is_empty()).unwrap_or(false) {
-            let p_custom = MenuItem::with_id(app, "tray_polish_custom", "Custom", true, None::<&str>)?;
+            let p_custom = MenuItem::with_id(app, "tray_polish_custom", "Custom  ⌥5", true, None::<&str>)?;
             v.push(Box::new(p_custom));
         }
         v
@@ -1509,6 +1511,21 @@ fn main() {
                             std::thread::spawn(move || do_finish_recording(a, h, b));
                         }),
                     );
+
+                    // ── Option+1..5 tone shortcuts ─────────────────────────────
+                    // Select text in any app, press Option+N to polish with a preset tone.
+                    let app_shortcut = app.handle().clone();
+                    hotkey::register_shortcut_callback(Arc::new(move |n: u8| {
+                        let tone = match n {
+                            1 => "professional",
+                            2 => "casual",
+                            3 => "concise",
+                            4 => "hinglish",
+                            5 => "custom",
+                            _ => return,
+                        };
+                        tray_polish_message(&app_shortcut, tone);
+                    }));
                 }
 
                 Ok(())

@@ -33,10 +33,21 @@ mod imp {
 
         /// kCGEventFlagMaskAlphaShift — set when Caps Lock is physically held
         pub const K_CG_FLAG_CAPS_LOCK: u64 = 0x0001_0000;
+        /// kCGEventFlagMaskShift
+        pub const K_CG_FLAG_SHIFT:     u64 = 0x0002_0000;
+        /// kCGEventFlagMaskControl
+        pub const K_CG_FLAG_CONTROL:   u64 = 0x0004_0000;
         /// kCGEventFlagMaskAlternate — Option key
         pub const K_CG_FLAG_ALT:       u64 = 0x0008_0000;
         /// kCGEventFlagMaskCommand
         pub const K_CG_FLAG_COMMAND:   u64 = 0x0010_0000;
+
+        // macOS virtual key codes for the number row
+        pub const KC_1: i64 = 18;
+        pub const KC_2: i64 = 19;
+        pub const KC_3: i64 = 20;
+        pub const KC_4: i64 = 21;
+        pub const KC_5: i64 = 23;
 
         // macOS virtual key codes for special keys
         pub const KC_BACKSPACE: i64 = 51;
@@ -141,6 +152,46 @@ mod imp {
     /// events timestamped after that instant.
     pub fn key_buffer() -> Arc<Mutex<VecDeque<TimedKeyEvt>>> {
         Arc::clone(key_buf())
+    }
+
+    // ── Option+1..5 tone shortcuts ────────────────────────────────────────────
+
+    static SHORTCUT_CB: OnceLock<Arc<dyn Fn(u8) + Send + Sync>> = OnceLock::new();
+
+    /// Register a callback invoked when the user presses Option+1 through Option+5.
+    /// The callback receives the digit (1–5). Must be called before the tap starts.
+    pub fn register_shortcut_callback(cb: Arc<dyn Fn(u8) + Send + Sync>) {
+        let _ = SHORTCUT_CB.set(cb);
+    }
+
+    /// Called inside a kCGEventKeyDown handler. Returns `true` if the event was
+    /// an Option+1..5 shortcut (caller should return null to suppress the event).
+    unsafe fn check_and_fire_shortcut(event: ffi::CGEventRef) -> bool {
+        let flags = unsafe { ffi::CGEventGetFlags(event) };
+        let alt   = (flags & ffi::K_CG_FLAG_ALT)     != 0;
+        let cmd   = (flags & ffi::K_CG_FLAG_COMMAND)  != 0;
+        let shift = (flags & ffi::K_CG_FLAG_SHIFT)    != 0;
+        let ctrl  = (flags & ffi::K_CG_FLAG_CONTROL)  != 0;
+
+        // Only fire on bare Option (no other modifiers)
+        if !alt || cmd || shift || ctrl { return false; }
+
+        let kc = unsafe { ffi::CGEventGetIntegerValueField(event, ffi::K_CG_KEYBOARD_EVENT_KEYCODE) };
+        let digit: Option<u8> = match kc {
+            18 => Some(1),
+            19 => Some(2),
+            20 => Some(3),
+            21 => Some(4),
+            23 => Some(5),
+            _  => None,
+        };
+
+        if let Some(n) = digit {
+            if let Some(cb) = SHORTCUT_CB.get() { cb(n); }
+            true
+        } else {
+            false
+        }
     }
 
     // ── Input Monitoring permission tracking ──────────────────────────────────
@@ -283,8 +334,10 @@ mod imp {
         unsafe {
             rearm_if_disabled(event_type, TOGGLE_TAP);
 
-            // Feed all key-down events into the ring buffer for edit reconstruction.
             if event_type == ffi::K_CG_EVENT_KEY_DOWN {
+                if check_and_fire_shortcut(event) {
+                    return std::ptr::null_mut(); // suppress Option+N so it doesn't type a character
+                }
                 handle_key_down(event);
                 return event;
             }
@@ -342,8 +395,10 @@ mod imp {
         unsafe {
             rearm_if_disabled(event_type, HOLD_TAP);
 
-            // Feed all key-down events into the ring buffer for edit reconstruction.
             if event_type == ffi::K_CG_EVENT_KEY_DOWN {
+                if check_and_fire_shortcut(event) {
+                    return std::ptr::null_mut(); // suppress Option+N so it doesn't type a character
+                }
                 handle_key_down(event);
                 return event;
             }
