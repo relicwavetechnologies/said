@@ -1,7 +1,7 @@
 export function SpeedSection() {
   return (
     <section className="relative w-full">
-      <div className="mx-auto w-full max-w-[1280px] px-token-md py-token-xl text-center">
+      <div className="mx-auto w-full max-w-[1280px] px-token-md pt-token-xl text-center">
         <h2 className="mx-auto max-w-[20ch] text-[44px] font-normal leading-[1.06] tracking-[-0.02em] text-text sm:text-[52px] md:text-[60px] lg:text-[64px]">
           5x faster than typing and
           <br />
@@ -31,40 +31,52 @@ export function SpeedSection() {
 
 function Comparison() {
   return (
-    <div className="mt-16 grid grid-cols-1 gap-y-10 text-left md:mt-20 md:grid-cols-2 md:gap-x-12">
-      <ComparisonColumn
-        icon={<WaveformIcon />}
-        label="Using Aqua 3.1"
-        wpm="230"
-        side="left"
-      >
-        Make a new React component called TaskDashboard.
-        Add a{' '}
-        <span className="rounded-[4px] bg-accent/15 px-1 text-accent-text/90 [color:#3a8ad9]">
-          useState
-        </span>{' '}
-        hook for selectedTaskId initialized to null, and another for
-        isSidebarOpen set to true.
-        <span
+    <div className="mt-16 md:mt-20">
+      <div className="relative grid grid-cols-1 gap-y-10 pb-16 text-left md:grid-cols-2 md:gap-x-12 md:pb-20">
+        {/* Vertical divider — full height of the comparison block,
+            spans down to where the horizontal rule sits, forming a clean cross. */}
+        <div
           aria-hidden
-          className="pulse-dot ml-2 inline-block h-3 w-3 translate-y-[1px] rounded-full bg-accent align-middle shadow-glow"
+          className="pointer-events-none absolute left-1/2 top-0 bottom-0 hidden w-px -translate-x-1/2 bg-black/10 md:block"
         />
-      </ComparisonColumn>
 
-      <ComparisonColumn
-        icon={<KeyboardIcon />}
-        label="Using Keyboard"
-        wpm="40"
-        side="right"
-      >
-        Make a new React component called TaskDashboard. Add a useState
-        hook for selectedTaskId initialized to null, and another for
-        isSidebarOpen set to true.
-        <span
-          aria-hidden
-          className="ml-0.5 inline-block h-[1.1em] w-[2px] translate-y-[3px] animate-pulse bg-accent align-middle"
-        />
-      </ComparisonColumn>
+        <ComparisonColumn
+          icon={<WaveformIcon />}
+          label="Using Aqua 3.1"
+          wpm="230"
+          side="left"
+        >
+          Make a new React component called TaskDashboard.
+          Add a{' '}
+          <span className="rounded-[4px] bg-accent/15 px-1 [color:#3a8ad9]">
+            useState
+          </span>{' '}
+          hook for selectedTaskId initialized to null, and another for
+          isSidebarOpen set to true.
+          <span
+            aria-hidden
+            className="pulse-dot ml-2 inline-block h-3 w-3 translate-y-[1px] rounded-full bg-accent align-middle shadow-glow"
+          />
+        </ComparisonColumn>
+
+        <ComparisonColumn
+          icon={<KeyboardIcon />}
+          label="Using Keyboard"
+          wpm="40"
+          side="right"
+        >
+          Make a new React component called TaskDashboard. Add a useState
+          hook for selectedTaskId initialized to null, and another for
+          isSidebarOpen set to true.
+          <span
+            aria-hidden
+            className="ml-0.5 inline-block h-[1.1em] w-[2px] translate-y-[3px] animate-pulse bg-accent align-middle"
+          />
+        </ComparisonColumn>
+      </div>
+
+      {/* Horizontal divider — meets the vertical line at its midpoint. */}
+      <div className="border-t border-black/10" />
     </div>
   );
 }
@@ -79,11 +91,7 @@ type ColProps = {
 
 function ComparisonColumn({ icon, label, wpm, side, children }: ColProps) {
   return (
-    <div
-      className={`relative ${
-        side === 'right' ? 'md:pl-12' : 'md:pr-12 md:after:absolute md:after:right-0 md:after:top-2 md:after:h-[calc(100%-1rem)] md:after:w-px md:after:bg-black/10'
-      }`}
-    >
+    <div className={side === 'right' ? 'md:pl-12' : 'md:pr-12'}>
       <div className="flex items-center justify-between border-b border-black/10 pb-4 text-[15px]">
         <div className="flex items-center gap-2 text-muted">
           <span className="text-accent">{icon}</span>

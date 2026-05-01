@@ -29,8 +29,7 @@ export function FeaturesSection() {
   return (
     <section className="relative w-full">
       <div className="mx-auto w-full max-w-[1280px] px-token-md">
-        <div className="border-t border-black/10" />
-        <div className="grid grid-cols-1 gap-x-12 gap-y-14 py-token-xl md:grid-cols-3">
+        <div className="grid grid-cols-1 gap-x-12 gap-y-14 pt-16 pb-token-xl md:grid-cols-3 md:pt-20">
           {FEATURES.map((feature) => (
             <FeatureCard key={feature.title} {...feature} />
           ))}
