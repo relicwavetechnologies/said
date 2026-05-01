@@ -1,0 +1,30 @@
+# Fly.io deployment config for voice-polish-control-plane
+# Deploy: fly deploy --config fly.toml
+# Secrets: fly secrets set DATABASE_URL="postgres://..."
+
+app    = "voice-polish-control-plane"
+primary_region = "iad"   # US East (closest to Neon default)
+
+[build]
+  # Rust binary compiled via Dockerfile
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+
+[http_service]
+  internal_port       = 8080
+  force_https         = true
+  auto_stop_machines  = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type       = "connections"
+    hard_limit = 100
+    soft_limit = 80
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1

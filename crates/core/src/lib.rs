@@ -1,0 +1,152 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use serde::{Deserialize, Serialize};
+
+// ── Gateway constants ─────────────────────────────────────────────────────────
+
+pub const GATEWAY_BASE: &str = "https://gateway.outreachdeal.com";
+pub const VOICE_URL:    &str = "https://gateway.outreachdeal.com/v1/voice/polish";
+
+// ── Mode registry ─────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub struct Mode {
+    pub key:   &'static str,
+    pub label: &'static str,
+    pub model: &'static str,
+    pub icon:  &'static str,
+}
+
+pub const MODES: &[Mode] = &[
+    Mode { key: "fast",  label: "Fast (gpt-5.4-mini)", model: "gpt-5.4-mini", icon: "fast"  },
+    Mode { key: "smart", label: "Smart (gpt-5.4)",     model: "gpt-5.4",      icon: "smart" },
+];
+
+static MODE_INDEX: AtomicUsize = AtomicUsize::new(0);
+
+pub fn current_mode() -> &'static Mode {
+    &MODES[MODE_INDEX.load(Ordering::Relaxed)]
+}
+
+pub fn all_modes() -> &'static [Mode] {
+    MODES
+}
+
+pub fn cycle_mode() -> &'static Mode {
+    let next = (MODE_INDEX.load(Ordering::Relaxed) + 1) % MODES.len();
+    MODE_INDEX.store(next, Ordering::Relaxed);
+    &MODES[next]
+}
+
+pub fn set_mode(key: &str) -> Result<&'static Mode, String> {
+    let index = MODES
+        .iter()
+        .position(|m| m.key == key)
+        .ok_or_else(|| format!("unknown mode: {key}"))?;
+    MODE_INDEX.store(index, Ordering::Relaxed);
+    Ok(&MODES[index])
+}
+
+pub fn mode_label() -> &'static str {
+    current_mode().label
+}
+
+/// Resolve the LLM model string from a mode key or direct model string.
+/// If `key_or_model` matches a mode key, returns that mode's model field.
+/// Otherwise returns the value as-is (allows direct model strings).
+pub fn resolve_model(key_or_model: &str) -> &'static str {
+    MODES.iter()
+        .find(|m| m.key == key_or_model)
+        .map(|m| m.model)
+        .unwrap_or_else(|| {
+            // Try to find by model field
+            MODES.iter()
+                .find(|m| m.model == key_or_model)
+                .map(|m| m.model)
+                .unwrap_or("gpt-5.4")  // safe default
+        })
+}
+
+pub fn api_key() -> String {
+    std::env::var("GATEWAY_API_KEY").unwrap_or_default()
+}
+
+pub fn validate_api_key() {
+    let key = api_key();
+    if key.is_empty() {
+        eprintln!("[config] GATEWAY_API_KEY not set in .env");
+        std::process::exit(1);
+    }
+}
+
+// ── Shared data types ─────────────────────────────────────────────────────────
+
+/// A single persisted recording entry — stored in SQLite in Phase B+.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct HistoryItem {
+    pub timestamp_ms:       u64,
+    pub polished:           String,
+    pub word_count:         u32,
+    pub recording_seconds:  f32,
+    pub model:              String,
+    pub transcribe_ms:      u64,
+    pub polish_ms:          u64,
+}
+
+/// Result of a single polish operation.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ProcessSummary {
+    pub transcript:     String,
+    pub polished:       String,
+    pub model:          String,
+    pub confidence:     f64,
+    pub transcribe_ms:  u64,
+    pub polish_ms:      u64,
+}
+
+/// Full state snapshot sent to the Tauri frontend on every command.
+#[derive(Serialize)]
+pub struct AppSnapshot {
+    pub state:                String,
+    pub platform:             String,
+    pub current_mode:         &'static str,
+    pub current_mode_label:   &'static str,
+    pub current_model:        &'static str,
+    pub auto_paste_supported:      bool,
+    pub accessibility_granted:     bool,
+    pub input_monitoring_granted:  bool,
+    pub modes:                Vec<Mode>,
+    pub last_result:          Option<ProcessSummary>,
+    pub last_error:           Option<String>,
+    pub history:              Vec<HistoryItem>,
+    pub total_words:          u64,
+    pub daily_streak:         u32,
+    pub avg_wpm:              u32,
+}
+
+// ── .env loader ───────────────────────────────────────────────────────────────
+
+/// Load GATEWAY_API_KEY from .env — three fallback locations:
+///   1. Directory of the running executable
+///   2. ~/VoicePolish/.env
+///   3. Current working directory
+pub fn load_env() {
+    // 1. Exe dir
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    if let Some(dir) = &exe_dir {
+        let _ = dotenvy::from_path(dir.join(".env"));
+    }
+    // 2. ~/VoicePolish/.env
+    if std::env::var("GATEWAY_API_KEY").is_err() {
+        if let Ok(home) = std::env::var("HOME") {
+            let fallback = std::path::Path::new(&home)
+                .join("VoicePolish")
+                .join(".env");
+            let _ = dotenvy::from_path(fallback);
+        }
+    }
+    // 3. CWD fallback
+    let _ = dotenvy::dotenv();
+}

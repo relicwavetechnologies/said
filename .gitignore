@@ -1,0 +1,24 @@
+# Secrets
+.env
+
+# Rust
+/target
+**/target/
+
+# Node / frontend dependencies
+desktop/node_modules/
+**/node_modules/
+
+# Frontend build output
+desktop/dist/
+
+# Python (legacy)
+venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Temp audio
+*.wav

@@ -1,0 +1,460 @@
+//! macOS CGEventTap hotkey listener.
+//! Provides two modes:
+//!   - `start_listener`      — fires a callback on every Caps Lock press (toggle mode)
+//!   - `start_hold_listener` — fires `on_press` when Caps Lock is held down, `on_release` when lifted
+
+#[cfg(target_os = "macos")]
+mod imp {
+    use core_foundation::runloop::kCFRunLoopCommonModes;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    mod ffi {
+        use std::ffi::c_void;
+
+        pub type CGEventRef        = *mut c_void;
+        pub type CGEventTapProxy   = *mut c_void;
+        pub type CFMachPortRef     = *mut c_void;
+
+        pub type CGEventTapCallBack = unsafe extern "C" fn(
+            proxy:      CGEventTapProxy,
+            event_type: u32,
+            event:      CGEventRef,
+            user_info:  *mut c_void,
+        ) -> CGEventRef;
+
+        pub const K_CG_KEYBOARD_EVENT_KEYCODE:           u32 = 9;
+        pub const K_CG_EVENT_KEY_DOWN:                   u32 = 10;
+        pub const K_CG_EVENT_LEFT_MOUSE_DOWN:            u32 = 1;
+        pub const K_CG_EVENT_RIGHT_MOUSE_DOWN:           u32 = 3;
+        pub const K_CG_EVENT_FLAGS_CHANGED:              u32 = 12;
+        pub const K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT:    u32 = 0xFFFFFFFE;
+        pub const K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFFFFFF;
+
+        /// kCGEventFlagMaskAlphaShift — set when Caps Lock is physically held
+        pub const K_CG_FLAG_CAPS_LOCK: u64 = 0x0001_0000;
+        /// kCGEventFlagMaskAlternate — Option key
+        pub const K_CG_FLAG_ALT:       u64 = 0x0008_0000;
+        /// kCGEventFlagMaskCommand
+        pub const K_CG_FLAG_COMMAND:   u64 = 0x0010_0000;
+
+        // macOS virtual key codes for special keys
+        pub const KC_BACKSPACE: i64 = 51;
+        pub const KC_DELETE:    i64 = 117;
+        pub const KC_LEFT:      i64 = 123;
+        pub const KC_RIGHT:     i64 = 124;
+        pub const KC_UP:        i64 = 126;
+        pub const KC_DOWN:      i64 = 125;
+        pub const KC_HOME:      i64 = 115;
+        pub const KC_END:       i64 = 119;
+        pub const KC_A:         i64 = 0;   // Cmd+A = select-all
+        pub const KC_X:         i64 = 7;   // Cmd+X = cut
+        pub const KC_Z:         i64 = 6;   // Cmd+Z = undo
+
+        unsafe extern "C" {
+            pub fn CGEventTapCreate(
+                tap:                u32,
+                place:              u32,
+                options:            u32,
+                events_of_interest: u64,
+                callback:           CGEventTapCallBack,
+                user_info:          *mut c_void,
+            ) -> CFMachPortRef;
+
+            pub fn CFMachPortCreateRunLoopSource(
+                allocator: *const c_void,
+                port:      CFMachPortRef,
+                order:     i64,
+            ) -> *mut c_void;
+
+            pub fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+            pub fn CGEventGetFlags(event: CGEventRef) -> u64;
+            pub fn CGEventTapIsEnabled(tap: CFMachPortRef) -> bool;
+            pub fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
+
+            pub fn CFRunLoopAddSource(rl: *mut c_void, source: *mut c_void, mode: *const c_void);
+            pub fn CFRunLoopGetCurrent() -> *mut c_void;
+            pub fn CFRunLoopRun();
+            pub fn CFRelease(cf: *mut c_void);
+
+            /// Read the Unicode character(s) produced by a keyboard event.
+            pub fn CGEventKeyboardGetUnicodeString(
+                event:          CGEventRef,
+                max_string_len: u32,
+                actual_count:   *mut u32,
+                unicode_string: *mut u16,
+            );
+
+            /// macOS 10.15+ — returns true if this process has Input Monitoring TCC permission.
+            /// This is the authoritative API; does NOT create any tap, no false positives.
+            pub fn CGPreflightListenEventAccess() -> bool;
+        }
+    }
+
+    const CAPS_LOCK_KEYCODE: i64  = 57;
+    const DEBOUNCE_MS:       u128 = 300;
+
+    // ── Keystroke buffer (for edit detection in AX-blind apps) ────────────────
+
+    /// A compact, clonable keystroke event routed from the CGEventTap.
+    #[derive(Clone, Debug)]
+    pub enum KeyEvt {
+        Char(char),       // printable character produced by this keypress
+        Backspace,        // delete char before cursor (plain)
+        Delete,           // delete char after cursor (plain)
+        Left,             // move cursor one char left
+        Right,            // move cursor one char right
+        Home,             // jump to line/text start
+        End,              // jump to line/text end
+        WordLeft,         // Option+Left  — jump to previous word start
+        WordRight,        // Option+Right — jump to next word end
+        LineStart,        // Cmd+Left     — jump to line start
+        LineEnd,          // Cmd+Right    — jump to line end
+        WordBackspace,    // Option+Backspace — delete word before cursor
+        LineBackspace,    // Cmd+Backspace    — delete to line start
+        SelectAll,        // Cmd+A
+        Cut,              // Cmd+X — marks reconstruction uncertain
+        Undo,             // Cmd+Z — marks reconstruction uncertain
+        MouseClick,       // mouse repositioned cursor — uncertain
+        Other,            // ignored
+    }
+
+    use std::collections::VecDeque;
+    use std::sync::{Mutex, OnceLock};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    /// Timestamped key event stored in the ring buffer.
+    pub struct TimedKeyEvt {
+        pub when: Instant,
+        pub evt:  KeyEvt,
+    }
+
+    /// Global rolling buffer of the last ~2000 key events.
+    static KEY_BUF: OnceLock<Arc<Mutex<VecDeque<TimedKeyEvt>>>> = OnceLock::new();
+
+    fn key_buf() -> &'static Arc<Mutex<VecDeque<TimedKeyEvt>>> {
+        KEY_BUF.get_or_init(|| Arc::new(Mutex::new(VecDeque::with_capacity(2048))))
+    }
+
+    /// Returns a reference to the global key event buffer.
+    /// `watch_for_edit` notes `Instant::now()` before watching, then drains
+    /// events timestamped after that instant.
+    pub fn key_buffer() -> Arc<Mutex<VecDeque<TimedKeyEvt>>> {
+        Arc::clone(key_buf())
+    }
+
+    // ── Input Monitoring permission tracking ──────────────────────────────────
+
+    /// Set to true when CGEventTapCreate succeeds (Input Monitoring is granted).
+    static TAP_CREATED: AtomicBool = AtomicBool::new(false);
+
+    /// Stored hold-listener callbacks — saved so we can retry after permission grant.
+    static HOLD_CALLBACKS: OnceLock<(Arc<dyn Fn() + Send + Sync>, Arc<dyn Fn() + Send + Sync>)>
+        = OnceLock::new();
+
+    /// Debounce: epoch-ms of last live permission check.
+    static LAST_IM_CHECK_MS: AtomicU64 = AtomicU64::new(0);
+
+    /// Returns true if Input Monitoring TCC permission is granted.
+    ///
+    /// Uses `CGPreflightListenEventAccess()` — the authoritative macOS 10.15+ API.
+    /// Never creates a tap, so it has zero false-positives even on macOS versions
+    /// where `CGEventTapCreate` would succeed without real permission.
+    ///
+    /// Fast path: once our real tap has been created (TAP_CREATED flag), skip the
+    /// syscall entirely — the permission can only be revoked with an app restart.
+    /// Slow path: calls the API at most every 2 s (debounce).  When permission
+    /// transitions from denied → granted after launch, automatically restarts the
+    /// hold listener using the stored callbacks.
+    pub fn is_input_monitoring_granted() -> bool {
+        // Fast path — tap is already running, permission can't be revoked at runtime.
+        if TAP_CREATED.load(Ordering::Relaxed) { return true; }
+
+        // Debounce: authoritative check at most every 2 seconds.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let last = LAST_IM_CHECK_MS.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < 2_000 { return false; }
+        LAST_IM_CHECK_MS.store(now_ms, Ordering::Relaxed);
+
+        // CGPreflightListenEventAccess() is the correct TCC API — no tap created,
+        // no false positives, works on macOS 10.15+.
+        let granted = unsafe { ffi::CGPreflightListenEventAccess() };
+        if !granted { return false; }
+
+        // Permission was just granted (transition: denied → granted after launch).
+        println!("[hotkey] Input Monitoring newly granted — restarting hold listener");
+
+        // Restart the hold listener with the saved callbacks.
+        if let Some((on_press, on_release)) = HOLD_CALLBACKS.get() {
+            let p = Arc::clone(on_press);
+            let r = Arc::clone(on_release);
+            std::thread::spawn(move || unsafe {
+                HOLD_STATE = Some(HoldState { on_press: p, on_release: r, is_down: false });
+                run_tap(hold_tap_callback, &raw mut HOLD_TAP);
+            });
+        }
+        true
+    }
+
+    /// Push a key event into the ring buffer (called from the CGEventTap callback).
+    fn push_key(evt: KeyEvt) {
+        let buf = key_buf();
+        if let Ok(mut g) = buf.lock() {
+            if g.len() >= 2048 { g.pop_front(); }
+            g.push_back(TimedKeyEvt { when: Instant::now(), evt });
+        }
+    }
+
+    /// Classify a kCGEventKeyDown event and push to the key buffer.
+    unsafe fn handle_key_down(event: ffi::CGEventRef) {
+        let keycode = unsafe { ffi::CGEventGetIntegerValueField(event, ffi::K_CG_KEYBOARD_EVENT_KEYCODE) };
+        let flags   = unsafe { ffi::CGEventGetFlags(event) };
+        let cmd     = (flags & ffi::K_CG_FLAG_COMMAND) != 0;
+        let alt     = (flags & ffi::K_CG_FLAG_ALT)     != 0;
+
+        let evt = if cmd && alt {
+            // Cmd+Option combos — treat as uncertain / ignore
+            KeyEvt::Other
+        } else if cmd {
+            match keycode {
+                ffi::KC_A         => KeyEvt::SelectAll,
+                ffi::KC_X         => KeyEvt::Cut,
+                ffi::KC_Z         => KeyEvt::Undo,
+                ffi::KC_LEFT      => KeyEvt::LineStart,
+                ffi::KC_RIGHT     => KeyEvt::LineEnd,
+                ffi::KC_UP        => KeyEvt::Home,      // Cmd+Up → document start
+                ffi::KC_DOWN      => KeyEvt::End,       // Cmd+Down → document end
+                ffi::KC_BACKSPACE => KeyEvt::LineBackspace,
+                _                 => KeyEvt::Other,
+            }
+        } else if alt {
+            match keycode {
+                ffi::KC_LEFT      => KeyEvt::WordLeft,
+                ffi::KC_RIGHT     => KeyEvt::WordRight,
+                ffi::KC_BACKSPACE => KeyEvt::WordBackspace,
+                _                 => KeyEvt::Other,
+            }
+        } else {
+            match keycode {
+                ffi::KC_BACKSPACE => KeyEvt::Backspace,
+                ffi::KC_DELETE    => KeyEvt::Delete,
+                ffi::KC_LEFT      => KeyEvt::Left,
+                ffi::KC_RIGHT     => KeyEvt::Right,
+                ffi::KC_UP        => KeyEvt::Home,
+                ffi::KC_DOWN      => KeyEvt::End,
+                ffi::KC_HOME      => KeyEvt::Home,
+                ffi::KC_END       => KeyEvt::End,
+                _ => {
+                    // Read the Unicode character produced by this keypress.
+                    let mut buf = [0u16; 4];
+                    let mut n: u32 = 0;
+                    unsafe { ffi::CGEventKeyboardGetUnicodeString(event, 4, &mut n, buf.as_mut_ptr()) };
+                    let s = String::from_utf16_lossy(&buf[..n as usize]);
+                    let mut chars = s.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(c), None) if !c.is_control() => KeyEvt::Char(c),
+                        _ => KeyEvt::Other,
+                    }
+                }
+            }
+        };
+        push_key(evt);
+    }
+
+    // ── Toggle listener ───────────────────────────────────────────────────────
+
+    struct ToggleState {
+        last_fire: Instant,
+        callback:  Arc<dyn Fn() + Send + Sync>,
+    }
+
+    static mut TOGGLE_STATE: Option<ToggleState>  = None;
+    static mut TOGGLE_TAP:   ffi::CFMachPortRef   = std::ptr::null_mut();
+
+    unsafe extern "C" fn toggle_tap_callback(
+        _proxy:     ffi::CGEventTapProxy,
+        event_type: u32,
+        event:      ffi::CGEventRef,
+        _user_info: *mut std::ffi::c_void,
+    ) -> ffi::CGEventRef {
+        unsafe {
+            rearm_if_disabled(event_type, TOGGLE_TAP);
+
+            // Feed all key-down events into the ring buffer for edit reconstruction.
+            if event_type == ffi::K_CG_EVENT_KEY_DOWN {
+                handle_key_down(event);
+                return event;
+            }
+            if event_type == ffi::K_CG_EVENT_LEFT_MOUSE_DOWN
+                || event_type == ffi::K_CG_EVENT_RIGHT_MOUSE_DOWN
+            {
+                push_key(KeyEvt::MouseClick);
+                return event;
+            }
+
+            if event_type != ffi::K_CG_EVENT_FLAGS_CHANGED { return event; }
+            let keycode = ffi::CGEventGetIntegerValueField(event, ffi::K_CG_KEYBOARD_EVENT_KEYCODE);
+            if keycode == CAPS_LOCK_KEYCODE {
+                if let Some(ref mut s) = TOGGLE_STATE {
+                    if s.last_fire.elapsed().as_millis() > DEBOUNCE_MS {
+                        s.last_fire = Instant::now();
+                        println!("[hotkey] Caps Lock → toggle");
+                        (s.callback)();
+                    }
+                }
+            }
+            event
+        }
+    }
+
+    /// Toggle-on-every-press.
+    pub fn start_listener(callback: Arc<dyn Fn() + Send + Sync>) {
+        std::thread::spawn(move || {
+            let past = Instant::now() - std::time::Duration::from_secs(10);
+            // SAFETY: called once from a dedicated thread; no concurrent access
+            unsafe {
+                TOGGLE_STATE = Some(ToggleState { last_fire: past, callback });
+                run_tap(toggle_tap_callback, &raw mut TOGGLE_TAP);
+            }
+        });
+    }
+
+    // ── Hold-to-record listener ───────────────────────────────────────────────
+
+    struct HoldState {
+        on_press:   Arc<dyn Fn() + Send + Sync>,
+        on_release: Arc<dyn Fn() + Send + Sync>,
+        is_down:    bool,
+    }
+
+    static mut HOLD_STATE: Option<HoldState>  = None;
+    static mut HOLD_TAP:   ffi::CFMachPortRef = std::ptr::null_mut();
+
+    unsafe extern "C" fn hold_tap_callback(
+        _proxy:     ffi::CGEventTapProxy,
+        event_type: u32,
+        event:      ffi::CGEventRef,
+        _user_info: *mut std::ffi::c_void,
+    ) -> ffi::CGEventRef {
+        unsafe {
+            rearm_if_disabled(event_type, HOLD_TAP);
+
+            // Feed all key-down events into the ring buffer for edit reconstruction.
+            if event_type == ffi::K_CG_EVENT_KEY_DOWN {
+                handle_key_down(event);
+                return event;
+            }
+            if event_type == ffi::K_CG_EVENT_LEFT_MOUSE_DOWN
+                || event_type == ffi::K_CG_EVENT_RIGHT_MOUSE_DOWN
+            {
+                push_key(KeyEvt::MouseClick);
+                return event;
+            }
+
+            if event_type != ffi::K_CG_EVENT_FLAGS_CHANGED { return event; }
+
+            let keycode = ffi::CGEventGetIntegerValueField(event, ffi::K_CG_KEYBOARD_EVENT_KEYCODE);
+            let caps_on = (ffi::CGEventGetFlags(event) & ffi::K_CG_FLAG_CAPS_LOCK) != 0;
+
+            if keycode == CAPS_LOCK_KEYCODE {
+                if let Some(ref mut s) = HOLD_STATE {
+                    if caps_on && !s.is_down {
+                        s.is_down = true;
+                        println!("[hotkey] Caps Lock held → start recording");
+                        (s.on_press)();
+                    } else if !caps_on && s.is_down {
+                        s.is_down = false;
+                        println!("[hotkey] Caps Lock released → process");
+                        (s.on_release)();
+                    }
+                }
+            }
+            event
+        }
+    }
+
+    /// Hold-to-record: `on_press` when key goes down, `on_release` when lifted.
+    /// Both callbacks run on a background CFRunLoop thread — do blocking work in spawned threads.
+    pub fn start_hold_listener(
+        on_press:   Arc<dyn Fn() + Send + Sync>,
+        on_release: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        // Save callbacks so we can restart the listener if permission is granted later.
+        let _ = HOLD_CALLBACKS.set((Arc::clone(&on_press), Arc::clone(&on_release)));
+
+        std::thread::spawn(move || {
+            // SAFETY: called once from a dedicated thread; no concurrent access
+            unsafe {
+                HOLD_STATE = Some(HoldState { on_press, on_release, is_down: false });
+                run_tap(hold_tap_callback, &raw mut HOLD_TAP);
+            }
+        });
+    }
+
+    // ── Shared tap helpers ────────────────────────────────────────────────────
+
+    unsafe fn rearm_if_disabled(event_type: u32, tap: ffi::CFMachPortRef) {
+        if event_type == ffi::K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT
+            || event_type == ffi::K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT
+        {
+            if !tap.is_null() {
+                // SAFETY: tap is a valid CFMachPortRef checked above
+                unsafe { ffi::CGEventTapEnable(tap, true) };
+                eprintln!("[hotkey] tap re-enabled after macOS disabled it");
+            }
+        }
+    }
+
+    unsafe fn run_tap(
+        callback: ffi::CGEventTapCallBack,
+        tap_ptr:  *mut ffi::CFMachPortRef,
+    ) {
+        let mask: u64 = (1u64 << ffi::K_CG_EVENT_FLAGS_CHANGED)
+            | (1u64 << ffi::K_CG_EVENT_KEY_DOWN)
+            | (1u64 << ffi::K_CG_EVENT_LEFT_MOUSE_DOWN)
+            | (1u64 << ffi::K_CG_EVENT_RIGHT_MOUSE_DOWN);
+        // SAFETY: CGEventTapCreate is called with valid arguments; null user_info is allowed
+        let tap = unsafe { ffi::CGEventTapCreate(0, 0, 0, mask, callback, std::ptr::null_mut()) };
+
+        if tap.is_null() {
+            eprintln!("[hotkey] CGEventTapCreate failed (Input Monitoring not granted?)");
+            eprintln!("         System Settings → Privacy & Security → Input Monitoring");
+            return;
+        }
+
+        // Record that Input Monitoring permission was granted (tap created OK).
+        TAP_CREATED.store(true, Ordering::Relaxed);
+
+        // SAFETY: tap_ptr is a valid mutable pointer owned by the caller's static
+        unsafe { *tap_ptr = tap };
+
+        // SAFETY: tap is a valid non-null CFMachPortRef
+        if unsafe { !ffi::CGEventTapIsEnabled(tap) } {
+            eprintln!("[hotkey] tap disabled — grant Input Monitoring permission, then restart");
+        } else {
+            println!("[hotkey] CGEventTap active — listening for Caps Lock");
+        }
+
+        // SAFETY: tap is valid; null allocator uses default CF allocator
+        let source = unsafe { ffi::CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0) };
+        if source.is_null() { eprintln!("[hotkey] RunLoop source creation failed"); return; }
+
+        unsafe {
+            ffi::CFRunLoopAddSource(
+                ffi::CFRunLoopGetCurrent(),
+                source,
+                kCFRunLoopCommonModes as *const _ as *const std::ffi::c_void,
+            );
+            ffi::CFRunLoopRun();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub use imp::*;
+
+#[cfg(not(target_os = "macos"))]
+pub fn is_input_monitoring_granted() -> bool { false }

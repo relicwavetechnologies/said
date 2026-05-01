@@ -1,0 +1,613 @@
+//! Async HTTP client for the local polish-backend daemon.
+//!
+//! All functions take a `&BackendEndpoint` (url + secret).
+//! They never interact with the child process — only the BackendState owns that.
+
+use futures::StreamExt;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tracing::{debug, warn};
+
+use crate::backend::BackendEndpoint;
+
+// ── Shared types ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Preferences {
+    pub user_id:            String,
+    pub selected_model:     String,
+    pub tone_preset:        String,
+    pub custom_prompt:      Option<String>,
+    pub language:           String,
+    #[serde(default)]
+    pub output_language:    String,
+    pub auto_paste:         bool,
+    pub edit_capture:       bool,
+    pub polish_text_hotkey: String,
+    // API keys (stored in SQLite; None if not set yet)
+    #[serde(default)]
+    pub deepgram_api_key:   Option<String>,
+    #[serde(default)]
+    pub gemini_api_key:     Option<String>,
+    #[serde(default)]
+    pub gateway_api_key:    Option<String>,
+    /// LLM routing: "gateway" | "gemini_direct"
+    #[serde(default = "default_llm_provider")]
+    pub llm_provider:       String,
+}
+
+fn default_llm_provider() -> String { "gateway".to_string() }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PrefsUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_model:     Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tone_preset:        Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_prompt:      Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language:           Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_language:    Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_paste:         Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edit_capture:       Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub polish_text_hotkey: Option<String>,
+    // API keys — Some(value) = set; None = don't touch (field omitted from JSON)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_api_key:    Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deepgram_api_key:   Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gemini_api_key:     Option<String>,
+    /// LLM routing: "gateway" | "gemini_direct"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_provider:       Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Recording {
+    pub id:                String,
+    pub timestamp_ms:      i64,
+    pub transcript:        String,
+    pub polished:          String,
+    pub final_text:        Option<String>,
+    pub word_count:        i64,
+    pub recording_seconds: f64,
+    pub model_used:        String,
+    pub confidence:        Option<f64>,
+    pub transcribe_ms:     Option<i64>,
+    pub embed_ms:          Option<i64>,
+    pub polish_ms:         Option<i64>,
+    pub target_app:        Option<String>,
+    pub edit_count:        i64,
+    pub source:            String,
+}
+
+/// Result of a completed polish operation (from the `done` SSE event).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolishDone {
+    pub recording_id:  String,
+    pub polished:      String,
+    pub model_used:    String,
+    pub confidence:    Option<f64>,
+    pub examples_used: u32,
+    pub latency_ms:    PolishLatency,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PolishLatency {
+    pub transcribe: i64,
+    pub embed:      i64,
+    pub retrieve:   i64,
+    pub polish:     i64,
+    pub total:      i64,
+}
+
+// ── SSE event enum ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum PolishEvent {
+    Status { phase: String, transcript: Option<String> },
+    Token  { token: String },
+    Done   (PolishDone),
+    Error  { message: String },
+}
+
+// ── Voice polish ──────────────────────────────────────────────────────────────
+
+/// Stream polish events for a WAV recording. Calls `on_event` as events arrive.
+///
+/// `pre_transcript` — if the caller already obtained a transcript via Deepgram
+/// WebSocket streaming (P5), pass it here so the backend can skip its own STT call.
+pub async fn stream_voice_polish<F>(
+    ep:             &BackendEndpoint,
+    wav_data:       Vec<u8>,
+    target_app:     Option<String>,
+    pre_transcript: Option<String>,
+    on_event:       F,
+) -> Result<PolishDone, String>
+where
+    F: FnMut(PolishEvent),
+{
+    let url    = format!("{}/v1/voice/polish", ep.url);
+    let client = Client::new();
+
+    let mut form = reqwest::multipart::Form::new()
+        .part(
+            "audio",
+            reqwest::multipart::Part::bytes(wav_data)
+                .file_name("recording.wav")
+                .mime_str("audio/wav")
+                .map_err(|e| format!("mime error: {e}"))?,
+        );
+    if let Some(app) = target_app {
+        form = form.text("target_app", app);
+    }
+    // P5: forward pre-transcribed text so backend can skip Deepgram HTTP call
+    if let Some(transcript) = pre_transcript {
+        form = form.text("pre_transcript", transcript);
+    }
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", ep.bearer())
+        .header("Accept", "text/event-stream")
+        .multipart(form)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| format!("voice polish request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body   = resp.text().await.unwrap_or_default();
+        return Err(format!("voice/polish error {status}: {}", &body[..body.len().min(300)]));
+    }
+
+    consume_sse(resp.bytes_stream(), on_event).await
+}
+
+/// Stream polish events for plain text.
+#[allow(dead_code)]
+pub async fn stream_text_polish<F>(
+    ep:            &BackendEndpoint,
+    text:          String,
+    target_app:    Option<String>,
+    tone_override: Option<String>,
+    on_event:      F,
+) -> Result<PolishDone, String>
+where
+    F: FnMut(PolishEvent),
+{
+    let url    = format!("{}/v1/text/polish", ep.url);
+    let client = Client::new();
+    let body   = serde_json::json!({
+        "text":          text,
+        "target_app":    target_app,
+        "tone_override": tone_override,
+    });
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", ep.bearer())
+        .header("Accept", "text/event-stream")
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| format!("text polish request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body   = resp.text().await.unwrap_or_default();
+        return Err(format!("text/polish error {status}: {}", &body[..body.len().min(300)]));
+    }
+
+    consume_sse(resp.bytes_stream(), on_event).await
+}
+
+// ── SSE parser ────────────────────────────────────────────────────────────────
+
+async fn consume_sse<S, F>(mut stream: S, mut on_event: F) -> Result<PolishDone, String>
+where
+    S: StreamExt<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+    F: FnMut(PolishEvent),
+{
+    let mut buf        = String::new();
+    let mut done_event: Option<PolishDone> = None;
+    // Track the most recently seen `event:` line so we can dispatch correctly
+    let mut event_name = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("stream error: {e}"))?;
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+
+        // Process complete SSE lines
+        while let Some(nl) = buf.find('\n') {
+            let line = buf[..nl].trim().to_string();
+            buf = buf[nl + 1..].to_string();
+
+            if line.is_empty() {
+                event_name.clear();
+                continue;
+            }
+
+            if let Some(name) = line.strip_prefix("event: ") {
+                event_name = name.trim().to_string();
+                continue;
+            }
+
+            let Some(data) = line.strip_prefix("data: ") else { continue };
+            let data = data.trim();
+            if data == "[DONE]" { continue; }
+
+            parse_and_dispatch(data, &event_name, &mut on_event, &mut done_event);
+        }
+    }
+
+    done_event.ok_or_else(|| "SSE stream ended without a `done` event".into())
+}
+
+fn parse_and_dispatch(
+    data:        &str,
+    event_name:  &str,
+    on_event:    &mut impl FnMut(PolishEvent),
+    done_event:  &mut Option<PolishDone>,
+) {
+    let Ok(val) = serde_json::from_str::<Value>(data) else {
+        warn!("[api] unparseable SSE data: {data:?}");
+        return;
+    };
+
+    // Prefer explicit event name; fall back to key-sniffing for resilience
+    match event_name {
+        "token" => {
+            if let Some(token) = val.get("token").and_then(Value::as_str) {
+                debug!("[api] token: {token:?}");
+                on_event(PolishEvent::Token { token: token.to_string() });
+            }
+        }
+        "status" => {
+            if let Some(phase) = val.get("phase").and_then(Value::as_str) {
+                let transcript = val.get("transcript")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                on_event(PolishEvent::Status { phase: phase.to_string(), transcript });
+            }
+        }
+        "done" => {
+            if let Some(done) = parse_done(&val) {
+                on_event(PolishEvent::Done(done.clone()));
+                *done_event = Some(done);
+            }
+        }
+        "error" => {
+            if let Some(msg) = val.get("message").and_then(Value::as_str) {
+                on_event(PolishEvent::Error { message: msg.to_string() });
+            }
+        }
+        // Key-sniff fallback (handles backends that omit the `event:` line)
+        _ => {
+            if let Some(token) = val.get("token").and_then(Value::as_str) {
+                on_event(PolishEvent::Token { token: token.to_string() });
+            } else if let Some(phase) = val.get("phase").and_then(Value::as_str) {
+                let transcript = val.get("transcript")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                on_event(PolishEvent::Status { phase: phase.to_string(), transcript });
+            } else if val.get("recording_id").is_some() {
+                if let Some(done) = parse_done(&val) {
+                    on_event(PolishEvent::Done(done.clone()));
+                    *done_event = Some(done);
+                }
+            } else if let Some(msg) = val.get("message").and_then(Value::as_str) {
+                on_event(PolishEvent::Error { message: msg.to_string() });
+            }
+        }
+    }
+}
+
+fn parse_done(val: &Value) -> Option<PolishDone> {
+    let recording_id = val["recording_id"].as_str()?.to_string();
+    let polished     = val["polished"].as_str().unwrap_or("").to_string();
+    let model_used   = val["model_used"].as_str().unwrap_or("").to_string();
+    let confidence   = val["confidence"].as_f64();
+    let examples     = val["examples_used"].as_u64().unwrap_or(0) as u32;
+    let lat          = val.get("latency_ms").cloned().unwrap_or_default();
+    Some(PolishDone {
+        recording_id,
+        polished,
+        model_used,
+        confidence,
+        examples_used: examples,
+        latency_ms: PolishLatency {
+            transcribe: lat["transcribe"].as_i64().unwrap_or(0),
+            embed:      lat["embed"].as_i64().unwrap_or(0),
+            retrieve:   lat["retrieve"].as_i64().unwrap_or(0),
+            polish:     lat["polish"].as_i64().unwrap_or(0),
+            total:      lat["total"].as_i64().unwrap_or(0),
+        },
+    })
+}
+
+// ── Preferences ───────────────────────────────────────────────────────────────
+
+pub async fn get_preferences(ep: &BackendEndpoint) -> Result<Preferences, String> {
+    let url    = format!("{}/v1/preferences", ep.url);
+    Client::new()
+        .get(&url)
+        .header("Authorization", ep.bearer())
+        .send()
+        .await
+        .map_err(|e| format!("get prefs failed: {e}"))?
+        .json::<Preferences>()
+        .await
+        .map_err(|e| format!("parse prefs failed: {e}"))
+}
+
+pub async fn patch_preferences(
+    ep:     &BackendEndpoint,
+    update: PrefsUpdate,
+) -> Result<Preferences, String> {
+    let url  = format!("{}/v1/preferences", ep.url);
+    let body = serde_json::to_string(&update).unwrap_or_else(|e| format!("<serialize error: {e}>"));
+    tracing::info!("[patch_prefs] → PATCH {url}  body={body}");
+    let resp = Client::new()
+        .patch(&url)
+        .header("Authorization", ep.bearer())
+        .json(&update)
+        .send()
+        .await
+        .map_err(|e| format!("patch prefs failed: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    tracing::info!("[patch_prefs] ← {status}  body={text}");
+    serde_json::from_str::<Preferences>(&text)
+        .map_err(|e| format!("parse prefs failed: {e} — raw: {}", &text[..text.len().min(200)]))
+}
+
+// ── History ───────────────────────────────────────────────────────────────────
+
+pub async fn get_history(ep: &BackendEndpoint, limit: i64) -> Result<Vec<Recording>, String> {
+    let url = format!("{}/v1/history?limit={limit}", ep.url);
+    Client::new()
+        .get(&url)
+        .header("Authorization", ep.bearer())
+        .send()
+        .await
+        .map_err(|e| format!("get history failed: {e}"))?
+        .json::<Vec<Recording>>()
+        .await
+        .map_err(|e| format!("parse history failed: {e}"))
+}
+
+// ── Cloud auth (calls the cloud control plane directly) ───────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudAccount {
+    pub id:           String,
+    pub email:        String,
+    pub license_tier: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudAuthResponse {
+    pub token:   String,
+    pub account: CloudAccount,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudStatus {
+    pub connected:    bool,
+    pub license_tier: String,
+    pub email:        Option<String>,
+}
+
+/// POST /v1/auth/signup on the cloud control plane.
+pub async fn cloud_signup(
+    cloud_url: &str,
+    email:     &str,
+    password:  &str,
+) -> Result<CloudAuthResponse, String> {
+    let url  = format!("{}/v1/auth/signup", cloud_url.trim_end_matches('/'));
+    let body = serde_json::json!({ "email": email, "password": password });
+    let resp = Client::new()
+        .post(&url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("cloud signup failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let msg = resp.text().await.unwrap_or_default();
+        return Err(format!("signup error: {}", extract_error(&msg)));
+    }
+    resp.json::<CloudAuthResponse>()
+        .await
+        .map_err(|e| format!("parse signup response: {e}"))
+}
+
+/// POST /v1/auth/login on the cloud control plane.
+pub async fn cloud_login(
+    cloud_url: &str,
+    email:     &str,
+    password:  &str,
+) -> Result<CloudAuthResponse, String> {
+    let url  = format!("{}/v1/auth/login", cloud_url.trim_end_matches('/'));
+    let body = serde_json::json!({ "email": email, "password": password });
+    let resp = Client::new()
+        .post(&url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("cloud login failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let msg = resp.text().await.unwrap_or_default();
+        return Err(format!("login error: {}", extract_error(&msg)));
+    }
+    resp.json::<CloudAuthResponse>()
+        .await
+        .map_err(|e| format!("parse login response: {e}"))
+}
+
+/// GET /v1/license/check on the cloud control plane.
+#[allow(dead_code)]
+pub async fn cloud_license_check(
+    cloud_url: &str,
+    token:     &str,
+) -> Result<serde_json::Value, String> {
+    let url = format!("{}/v1/license/check", cloud_url.trim_end_matches('/'));
+    Client::new()
+        .get(&url)
+        .bearer_auth(token)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("license check failed: {e}"))?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("parse license response: {e}"))
+}
+
+/// PUT /v1/cloud/token — persist cloud token in the local backend's SQLite.
+pub async fn store_cloud_token(
+    ep:    &BackendEndpoint,
+    token: &str,
+    tier:  &str,
+) -> Result<(), String> {
+    let url  = format!("{}/v1/cloud/token", ep.url);
+    let body = serde_json::json!({ "token": token, "license_tier": tier });
+    let status = Client::new()
+        .put(&url)
+        .header("Authorization", ep.bearer())
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| format!("store token failed: {e}"))?
+        .status();
+    if status.is_success() || status.as_u16() == 204 { Ok(()) } else {
+        Err(format!("store token error: {status}"))
+    }
+}
+
+/// DELETE /v1/cloud/token — clear cloud token from local backend.
+pub async fn clear_cloud_token(ep: &BackendEndpoint) -> Result<(), String> {
+    let url = format!("{}/v1/cloud/token", ep.url);
+    let status = Client::new()
+        .delete(&url)
+        .header("Authorization", ep.bearer())
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| format!("clear token failed: {e}"))?
+        .status();
+    if status.is_success() || status.as_u16() == 204 { Ok(()) } else {
+        Err(format!("clear token error: {status}"))
+    }
+}
+
+/// GET /v1/cloud/status — read current cloud connection status from local backend.
+pub async fn get_cloud_status(ep: &BackendEndpoint) -> Result<CloudStatus, String> {
+    let url = format!("{}/v1/cloud/status", ep.url);
+    Client::new()
+        .get(&url)
+        .header("Authorization", ep.bearer())
+        .send()
+        .await
+        .map_err(|e| format!("cloud status failed: {e}"))?
+        .json::<CloudStatus>()
+        .await
+        .map_err(|e| format!("parse cloud status: {e}"))
+}
+
+// ── OpenAI OAuth ──────────────────────────────────────────────────────────────
+
+pub async fn get_openai_status(ep: &BackendEndpoint) -> Result<serde_json::Value, String> {
+    let url = format!("{}/v1/openai-oauth/status", ep.url);
+    Client::new()
+        .get(&url)
+        .header("Authorization", ep.bearer())
+        .send()
+        .await
+        .map_err(|e| format!("openai status failed: {e}"))?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("parse openai status: {e}"))
+}
+
+pub async fn initiate_openai_oauth(ep: &BackendEndpoint) -> Result<serde_json::Value, String> {
+    let url = format!("{}/v1/openai-oauth/initiate", ep.url);
+    Client::new()
+        .post(&url)
+        .header("Authorization", ep.bearer())
+        .header("Content-Length", "0")
+        .send()
+        .await
+        .map_err(|e| format!("openai initiate failed: {e}"))?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("parse openai initiate: {e}"))
+}
+
+pub async fn disconnect_openai(ep: &BackendEndpoint) -> Result<(), String> {
+    let url = format!("{}/v1/openai-oauth/disconnect", ep.url);
+    let status = Client::new()
+        .delete(&url)
+        .header("Authorization", ep.bearer())
+        .send()
+        .await
+        .map_err(|e| format!("openai disconnect failed: {e}"))?
+        .status();
+    if status.is_success() || status.as_u16() == 204 {
+        Ok(())
+    } else {
+        Err(format!("openai disconnect error: {status}"))
+    }
+}
+
+fn extract_error(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["error"].as_str().map(str::to_string))
+        .unwrap_or_else(|| body[..body.len().min(200)].to_string())
+}
+
+// ── Edit feedback ─────────────────────────────────────────────────────────────
+
+pub async fn submit_feedback(
+    ep:           &BackendEndpoint,
+    recording_id: &str,
+    user_kept:    &str,
+    target_app:   Option<&str>,
+) -> Result<(), String> {
+    let url  = format!("{}/v1/edit-feedback", ep.url);
+    let body = serde_json::json!({
+        "recording_id": recording_id,
+        "user_kept":    user_kept,
+        "target_app":   target_app,
+    });
+
+    let status = Client::new()
+        .post(&url)
+        .header("Authorization", ep.bearer())
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("submit feedback failed: {e}"))?
+        .status();
+
+    if status.is_success() || status.as_u16() == 204 {
+        Ok(())
+    } else {
+        Err(format!("edit-feedback error: {status}"))
+    }
+}

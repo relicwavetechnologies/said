@@ -1,0 +1,29 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/recorder",
+    "crates/paster",
+    "crates/hotkey",
+    "crates/backend",
+    "desktop/src-tauri",
+]
+# control-plane excluded: it deploys to Fly.io and uses sqlx-postgres which
+# conflicts with rusqlite's libsqlite3-sys linkage in the same resolver graph.
+# Build it standalone: `cd crates/control-plane && cargo build`
+exclude = ["crates/control-plane"]
+resolver = "2"
+
+# Shared dependency versions across the workspace
+[workspace.dependencies]
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+uuid        = { version = "1", features = ["v4"] }
+tokio       = { version = "1", features = ["full"] }
+reqwest     = { version = "0.12", features = ["json", "multipart", "stream"] }
+tracing     = "0.1"
+dotenvy     = "0.15"
+
+[profile.release]
+opt-level = "z"
+lto       = true
+strip     = true

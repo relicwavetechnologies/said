@@ -1,0 +1,335 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   THEME VARIABLES
+   --surface-1 (deepest, sidebar/page) → --surface-2 (mat) → --surface-3 (tile)
+   In dark mode, ascending lightness as you elevate.
+   In light mode, descending grayness (mat is off-white, tiles are pure white).
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+@layer base {
+  /* ── DARK (default) ──────────────────────────────────────────────────── */
+  :root {
+    --background:           240 6% 4%;
+    --foreground:           0 0% 98%;
+    --card:                 240 5% 10%;
+    --card-foreground:      0 0% 98%;
+    --popover:              240 5% 12%;
+    --popover-foreground:   0 0% 98%;
+
+    --primary:              73 80% 67%;       /* lime #cdf065 */
+    --primary-foreground:   240 6% 4%;
+
+    --secondary:            240 4% 13%;
+    --secondary-foreground: 0 0% 90%;
+    --muted:                240 4% 11%;
+    --muted-foreground:     240 5% 60%;
+
+    --accent:               73 80% 67%;
+    --accent-foreground:    240 6% 4%;
+
+    --destructive:          0 75% 60%;
+    --destructive-foreground: 0 0% 98%;
+
+    --border:               240 4% 14%;
+    --input:                240 4% 14%;
+    --ring:                 73 80% 67%;
+    --radius:               0.875rem;
+
+    --recording:            0 80% 62%;
+
+    /* ── Surface hierarchy (semantic) ───────────────────────────────── */
+    --surface-1:            240 6% 4%;        /* sidebar / page / topbar  */
+    --surface-2:            240 5% 8%;        /* the mat                  */
+    --surface-3:            240 5% 10%;       /* tiles / cards            */
+    --surface-4:            240 5% 13%;       /* chips / icon backplates  */
+    --surface-hover:        240 5% 13%;       /* row hover                */
+
+    /* ── Pill active (inverted neutral) ─────────────────────────────── */
+    --pill-active-bg:       0 0% 96%;
+    --pill-active-fg:       240 6% 5%;
+
+    /* ── Chip / accent backgrounds + text (legible on dark) ─────────── */
+    --chip-lime-bg:         73 80% 67% / 0.12;
+    --chip-lime-fg:         73 80% 75%;
+    --chip-blue-bg:         217 90% 60% / 0.12;
+    --chip-blue-fg:         217 90% 75%;
+    --chip-amber-bg:        38 90% 60% / 0.12;
+    --chip-amber-fg:        38 90% 75%;
+    --chip-red-bg:          0 75% 60% / 0.12;
+    --chip-red-fg:          0 75% 75%;
+
+    --heat-0:               240 5% 13%;
+    --shadow-tile:          0 0 0 0 transparent;
+
+    --sidebar-width:        232px;
+    --topbar-height:        56px;
+  }
+
+  /* ── LIGHT ─────────────────────────────────────────────────────────── */
+  [data-theme="light"] {
+    --background:           30 8% 88%;        /* warm gray floor (sidebar/topbar) */
+    --foreground:           73 18% 12%;       /* warm deep olive text  */
+    --card:                 0 0% 100%;
+    --card-foreground:      73 18% 12%;
+    --popover:              0 0% 100%;
+    --popover-foreground:   73 18% 12%;
+
+    --primary:              73 78% 52%;       /* slightly deeper lime for white */
+    --primary-foreground:   240 8% 8%;
+
+    --secondary:            30 6% 90%;
+    --secondary-foreground: 240 8% 18%;
+    --muted:                30 6% 92%;
+    --muted-foreground:     240 5% 42%;
+
+    --accent:               73 78% 52%;
+    --accent-foreground:    240 8% 8%;
+
+    --destructive:          0 75% 50%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border:               30 6% 86%;
+    --input:                30 6% 86%;
+    --ring:                 73 78% 52%;
+
+    --recording:            0 80% 55%;
+
+    /* ── Surface hierarchy (light) ─────────────────────────────────── */
+    --surface-1:            30 8% 88%;        /* sidebar / page bg (warm gray) */
+    --surface-2:            0 0% 100%;        /* mat (pure white)              */
+    --surface-3:            0 0% 100%;        /* tile (pure white + shadow)    */
+    --surface-4:            30 6% 92%;        /* chip / icon backplate         */
+    --surface-hover:        30 6% 92%;        /* hover (sits between floor & white) */
+
+    /* Pill active = deep olive (same hue as lime, dark + desat) */
+    --pill-active-bg:       73 22% 24%;
+    --pill-active-fg:       73 30% 96%;
+
+    /* Chip colors (legible on white) */
+    --chip-lime-bg:         73 78% 50% / 0.18;
+    --chip-lime-fg:         73 70% 25%;
+    --chip-blue-bg:         217 80% 55% / 0.15;
+    --chip-blue-fg:         217 75% 35%;
+    --chip-amber-bg:        38 90% 50% / 0.20;
+    --chip-amber-fg:        28 80% 28%;
+    --chip-red-bg:          0 75% 50% / 0.15;
+    --chip-red-fg:          0 75% 38%;
+
+    --heat-0:               30 6% 90%;
+    --shadow-tile:          0 1px 0 hsl(240 8% 12% / 0.04), 0 1px 2px hsl(240 8% 12% / 0.04);
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  html, body {
+    height: 100%;
+    background: hsl(var(--background));
+    color: hsl(var(--foreground));
+    transition: background-color 0.2s ease, color 0.2s ease;
+  }
+
+  body {
+    font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
+                 "Helvetica Neue", sans-serif;
+    font-feature-settings: "cv11", "ss01", "rlig" 1, "calt" 1;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    letter-spacing: -0.005em;
+    overflow: hidden;
+    user-select: none;
+  }
+
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+  }
+
+  .font-mono {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  ::-webkit-scrollbar              { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track        { background: transparent; }
+  ::-webkit-scrollbar-thumb        { background: hsl(var(--surface-4)); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover  { background: hsl(var(--muted-foreground) / 0.4); }
+  *                                { scrollbar-width: thin; scrollbar-color: hsl(var(--surface-4)) transparent; }
+
+  ::selection {
+    background: hsl(var(--primary) / 0.3);
+    color: hsl(var(--foreground));
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   COMPONENT PATTERNS
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+@layer components {
+
+  .drag-region  { -webkit-app-region: drag; }
+  .no-drag      { -webkit-app-region: no-drag; }
+
+  /* ── Tile (card surface) ──────────────────────────────────────────── */
+  .tile {
+    background: hsl(var(--surface-3));
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-tile);
+  }
+
+  /* ── Sidebar nav item ──────────────────────────────────────────────── */
+  .nav-item {
+    @apply flex items-center gap-2.5 w-full px-3 py-2 rounded-lg text-[13px] font-medium
+           transition-colors duration-100 text-left;
+    color: hsl(var(--muted-foreground));
+    cursor: pointer;
+  }
+  .nav-item:hover {
+    background: hsl(var(--surface-hover));
+    color: hsl(var(--foreground));
+  }
+  .nav-item.active {
+    background: hsl(var(--surface-hover));
+    color: hsl(var(--foreground));
+    font-weight: 600;
+  }
+  .nav-item.disabled {
+    @apply opacity-30 cursor-not-allowed pointer-events-none;
+  }
+
+  /* ── Buttons ─────────────────────────────────────────────────────── */
+  .btn-primary {
+    background: hsl(var(--primary));
+    color: hsl(var(--primary-foreground));
+    @apply inline-flex items-center gap-2 px-4 py-2 rounded-full text-[13px] font-semibold
+           transition-all duration-100;
+  }
+  .btn-primary:hover  { filter: brightness(1.06); }
+  .btn-primary:active { filter: brightness(0.94); }
+  .btn-primary:disabled {
+    background: hsl(var(--surface-4));
+    color: hsl(var(--muted-foreground));
+    cursor: not-allowed;
+  }
+
+  .btn-ghost {
+    @apply inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-[12px] font-medium
+           transition-colors duration-100;
+    color: hsl(var(--muted-foreground));
+    background: hsl(var(--surface-4));
+  }
+  .btn-ghost:hover {
+    color: hsl(var(--foreground));
+    background: hsl(var(--surface-hover));
+  }
+
+  /* ── Filter pills ─────────────────────────────────────────────────── */
+  .pill {
+    @apply inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-[12px] font-medium
+           transition-all duration-100 cursor-pointer whitespace-nowrap;
+    color: hsl(var(--muted-foreground));
+    background: hsl(var(--surface-4));
+  }
+  .pill:hover {
+    color: hsl(var(--foreground));
+    background: hsl(var(--surface-hover));
+  }
+  .pill.active {
+    background: hsl(var(--pill-active-bg));
+    color: hsl(var(--pill-active-fg));
+    font-weight: 600;
+  }
+
+  /* ── Chips ─────────────────────────────────────────────────────────── */
+  .chip {
+    @apply inline-flex items-center gap-1 text-[10.5px] font-semibold px-2 py-0.5 rounded-md
+           tabular-nums tracking-wide;
+    color: hsl(var(--muted-foreground));
+    background: hsl(var(--surface-4));
+  }
+  .chip-lime  { color: hsl(var(--chip-lime-fg));  background: hsl(var(--chip-lime-bg));  }
+  .chip-blue  { color: hsl(var(--chip-blue-fg));  background: hsl(var(--chip-blue-bg));  }
+  .chip-amber { color: hsl(var(--chip-amber-fg)); background: hsl(var(--chip-amber-bg)); }
+  .chip-red   { color: hsl(var(--chip-red-fg));   background: hsl(var(--chip-red-bg));   }
+
+  /* ── Numbered badge ──────────────────────────────────────────────── */
+  .num-badge {
+    @apply flex items-center justify-center w-7 h-7 rounded-full text-[11px] font-semibold
+           tabular-nums flex-shrink-0;
+    color: hsl(var(--muted-foreground));
+    background: hsl(var(--surface-4));
+  }
+
+  /* ── Status badges ───────────────────────────────────────────────── */
+  .badge {
+    @apply inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-md
+           tabular-nums;
+  }
+  .badge-done    { @apply badge chip-lime;  }
+  .badge-prog    { @apply badge chip-blue;  }
+  .badge-urgent  { @apply badge chip-red;   }
+  .badge-medium  { @apply badge chip-amber; }
+  .badge-model   { @apply badge chip;       }
+
+  /* ── Recording orb pulse ─────────────────────────────────────────── */
+  .orb-recording { animation: pulse-orb 1.4s ease-in-out infinite; }
+
+  /* ── Heatmap cells ───────────────────────────────────────────────── */
+  .heat-0       { background: hsl(var(--heat-0)); }
+  .heat-1       { background: hsl(73 60% 50%); }
+  .heat-2       { background: hsl(73 70% 60%); }
+  .heat-3       { background: hsl(73 75% 65%); }
+  .heat-4       { background: hsl(73 80% 67%); }
+  .heat-current {
+    background: hsl(73 80% 67% / 0.18);
+    box-shadow: inset 0 0 0 1.5px hsl(var(--primary));
+  }
+
+  /* ── Input fields ────────────────────────────────────────────────── */
+  .input {
+    @apply w-full text-sm rounded-lg px-3 py-2.5 transition-colors;
+    background: hsl(var(--surface-4));
+    color: hsl(var(--foreground));
+    border: 1px solid transparent;
+  }
+  .input::placeholder { color: hsl(var(--muted-foreground) / 0.7); }
+  .input:focus {
+    outline: none;
+    background: hsl(var(--surface-hover));
+    border-color: hsl(var(--primary) / 0.5);
+  }
+
+  /* ── Section heading label ──────────────────────────────────────── */
+  .section-label {
+    @apply text-[10px] font-bold uppercase tracking-[0.14em];
+    color: hsl(var(--muted-foreground) / 0.85);
+  }
+
+  /* ── Live token blinking caret ──────────────────────────────────── */
+  .caret-blink {
+    display: inline-block;
+    width: 2px;
+    height: 1em;
+    background: hsl(var(--primary));
+    margin-left: 2px;
+    vertical-align: text-bottom;
+    animation: caret 0.9s steps(1) infinite;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ANIMATIONS
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+@keyframes pulse-orb {
+  0%, 100% { opacity: 1;   transform: scale(1);    }
+  50%      { opacity: 0.6; transform: scale(1.12); }
+}
+
+@keyframes caret {
+  50% { opacity: 0; }
+}

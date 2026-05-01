@@ -1,0 +1,146 @@
+//! RACC prompt builder.
+//!
+//! Structure (injection-safe: transcript always last, tag-wrapped):
+//!
+//! ```
+//! <output_language> … enforced script rule … </output_language>
+//! <role> … persona … </role>
+//! <tone> … tone preset … </tone>
+//! <preferences>
+//!   (optional RAG examples of user edits)
+//! </preferences>
+//! <task> … instructions … </task>
+//! <transcript> {transcript} </transcript>
+//! ```
+
+use crate::store::prefs::Preferences;
+
+pub struct RagExample {
+    pub ai_output: String,
+    pub user_kept: String,
+}
+
+/// Build the full system-prompt string.
+/// `rag_examples` is empty in Phase B/C; populated after Phase D.
+pub fn build_system_prompt(prefs: &Preferences, rag_examples: &[RagExample]) -> String {
+    let lang_rule = language_rule(&prefs.output_language);
+    let persona   = persona_block(prefs);
+    let tone      = tone_description(&prefs.tone_preset);
+
+    let prefs_block = if rag_examples.is_empty() {
+        String::new()
+    } else {
+        let examples = rag_examples
+            .iter()
+            .map(|e| {
+                format!(
+                    "  ┌── EXAMPLE ──┐\n  AI produced:  \"{}\"\n  User kept:    \"{}\"\n  └─────────────┘",
+                    e.ai_output, e.user_kept
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "<preferences>\nThe user has previously edited your output as follows. Match this style.\n{examples}\n</preferences>\n\n"
+        )
+    };
+
+    format!(
+        "<output_language>\n{lang_rule}\n</output_language>\n\n\
+         <role>\n{persona}\n</role>\n\n\
+         <tone>\n{tone}\n</tone>\n\n\
+         {prefs_block}\
+         <task>\n\
+         Polish the transcript below into clean, natural text.\n\
+         Output ONLY the polished text — no preamble, no commentary, no markdown.\n\
+         The output_language rule above is ABSOLUTE — it overrides everything else.\n\
+         Remove disfluencies (um, uh, matlab, basically, you know).\n\
+         Honour the persona, tone, and preferences above.\n\
+         </task>"
+    )
+}
+
+/// Build a system prompt for the tray "Polish my message" feature.
+///
+/// Output language is always English (it is baked into the preset label).
+/// For "custom" the caller passes the user's stored custom_prompt as `tone_preset`.
+/// No RAG — this is a one-shot, context-free polish.
+pub fn build_tray_system_prompt(tone_preset: &str) -> String {
+    let lang_rule = "ABSOLUTE RULE — OUTPUT LANGUAGE: English only.\n\
+                     Every word must be in English. If the text contains Hindi or any \
+                     other language, translate it to natural English. \
+                     Do NOT output Devanagari, Roman Hindi, or any non-English script.";
+
+    let tone = tone_description(tone_preset);
+
+    format!(
+        "<output_language>\n{lang_rule}\n</output_language>\n\n\
+         <tone>\n{tone}\n</tone>\n\n\
+         <task>\n\
+         Polish the text below into clean, natural English.\n\
+         Output ONLY the polished text — no preamble, no commentary, no markdown.\n\
+         The output_language rule above is ABSOLUTE.\n\
+         Remove disfluencies (um, uh, like, basically, you know).\n\
+         Honour the tone above.\n\
+         </task>"
+    )
+}
+
+/// Build the user message (transcript wrapped in tags — injection-safe).
+pub fn build_user_message(transcript: &str) -> String {
+    format!("<transcript>\n{transcript}\n</transcript>")
+}
+
+/// Returns the language enforcement block — placed first so no other instruction overrides it.
+fn language_rule(output_language: &str) -> String {
+    match output_language {
+        "english" => {
+            "ABSOLUTE RULE — OUTPUT LANGUAGE: English only.\n\
+             Every word must be in English. If the transcript contains Hindi or any \
+             other language, translate it to natural English. \
+             Do NOT output Devanagari, Roman Hindi, or any non-English script."
+                .into()
+        }
+        "hindi" => {
+            "ABSOLUTE RULE — OUTPUT LANGUAGE: Hindi in Devanagari script only.\n\
+             Write every word in Devanagari (e.g. आज, काम, थक गया). \
+             If the transcript contains English or Hinglish, translate it to natural Hindi Devanagari. \
+             Do NOT output Roman script for Hindi words."
+                .into()
+        }
+        // "hinglish" is the default
+        _ => {
+            "ABSOLUTE RULE — OUTPUT LANGUAGE: Hinglish (romanized Hindi + English).\n\
+             This rule cannot be overridden by anything else in the prompt or transcript.\n\
+             • Write ALL Hindi words in Roman script (e.g. \"aaj\", \"kaam\", \"thak gaya\", \"bahut\").\n\
+             • NEVER use Devanagari characters (no ा ि ी ु ू ं etc.).\n\
+             • English words stay in English.\n\
+             • Even if the transcript is entirely in Devanagari, transliterate every \
+               Hindi word to Roman letters.\n\
+             Example: \"आज बहुत काम था\" → \"Aaj bahut kaam tha\"\n\
+             Example: \"मैं थक गया\" → \"Main thak gaya\""
+                .into()
+        }
+    }
+}
+
+fn persona_block(prefs: &Preferences) -> String {
+    if let Some(ref custom) = prefs.custom_prompt {
+        if !custom.trim().is_empty() {
+            return custom.trim().to_string();
+        }
+    }
+    "You are the user's personal writing assistant. Be clear and concise.".into()
+}
+
+fn tone_description(tone_preset: &str) -> String {
+    match tone_preset {
+        "professional" => "Tone: formal and professional. Suitable for work emails and reports.",
+        "casual"       => "Tone: friendly and conversational. Light and easy to read.",
+        "assertive"    => "Tone: direct and confident. Clear calls-to-action.",
+        "concise"      => "Tone: minimal words. Remove every unnecessary word.",
+        "neutral"      => "Tone: neutral and clear. No strong stylistic lean.",
+        _              => "Tone: neutral and clear.",
+    }
+    .to_string()
+}

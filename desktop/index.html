@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Said — Voice Polish Studio</title>
+
+    <!-- Inter + JetBrains Mono — refined typography -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+
+    <!-- Theme bootstrap (no flash) — runs synchronously before React mounts -->
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem('vp-theme');
+          if (t === 'light' || t === 'dark') {
+            document.documentElement.dataset.theme = t;
+          } else {
+            document.documentElement.dataset.theme = 'dark';
+          }
+        } catch (_) { document.documentElement.dataset.theme = 'dark'; }
+      })();
+    </script>
+
+    <script type="module" src="/src/main.tsx"></script>
+  </head>
+  <body>
+    <div id="app"></div>
+  </body>
+</html>

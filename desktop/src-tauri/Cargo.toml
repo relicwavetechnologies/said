@@ -1,0 +1,46 @@
+[package]
+name    = "voice-polish-desktop"
+version = "0.1.0"
+edition = "2024"
+
+[build-dependencies]
+tauri-build = { version = "2.0.0", features = [] }
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+dotenvy    = { workspace = true }
+tauri      = { version = "2.0.0", features = ["tray-icon", "image-png"] }
+uuid       = { workspace = true }
+tokio      = { workspace = true }
+
+# Async HTTP for backend SSE consumption (Phase E)
+reqwest  = { workspace = true, features = ["blocking"] }
+futures  = "0.3"
+bytes    = "1"
+tracing  = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# WebSocket client for Deepgram live streaming (P5)
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+
+# Open URLs in the system default browser (for OpenAI OAuth)
+open = "5"
+
+# Workspace crates
+voice-polish-core     = { path = "../../crates/core" }
+voice-polish-paster   = { path = "../../crates/paster" }
+voice-polish-recorder = { path = "../../crates/recorder" }
+
+# Recording (still needed; cpal uses its own thread model)
+cpal  = "0.15"
+hound = "3.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+voice-polish-hotkey = { path = "../../crates/hotkey" }
+cocoa           = "0.26"
+objc            = "0.2"
+core-graphics   = "0.24"
+core-foundation = "0.10"
+dispatch        = "0.2"
+libc            = "0.2"

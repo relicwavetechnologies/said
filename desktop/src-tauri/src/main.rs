@@ -1,0 +1,1501 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod api;
+mod backend;
+mod desktop;
+mod dg_stream;  // P5: Deepgram WebSocket live streaming
+
+use std::sync::{Arc, Mutex};
+
+use tauri::{
+    menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
+    tray::TrayIconBuilder,
+    Emitter, Manager, State,
+};
+
+use backend::BackendEndpoint;
+use desktop::DesktopApp;
+use voice_polish_core::{AppSnapshot, ProcessSummary};
+use voice_polish_paster as paster;
+
+#[cfg(target_os = "macos")]
+use voice_polish_hotkey as hotkey;
+
+// ── Keystroke reconstruction (edit detection for AX-blind apps) ──────────────
+//
+// The existing CGEventTap in the hotkey crate is extended to also capture
+// kCGEventKeyDown events into a rolling buffer.  watch_for_edit notes
+// Instant::now() before watching, then replays all buffered keystrokes
+// timestamped AFTER that instant against the known pasted text.
+//
+// This is the same technique Wispr Flow uses — no second CGEventTap needed.
+
+/// Apply buffered keystrokes to reconstruct the final text in an AX-blind app.
+///
+/// `initial` is the text we pasted.  Events are filtered to those that arrived
+/// after `since`.  Returns `None` only if reconstruction is truly unreliable
+/// (Cmd+Z, Cmd+X).  Mouse clicks are handled by trying every possible cursor
+/// position and picking the candidate that preserves the most surrounding text
+/// (i.e., the smallest local edit).
+#[cfg(target_os = "macos")]
+fn reconstruct_from_keystrokes(
+    initial: &str,
+    since:   std::time::Instant,
+) -> Option<String> {
+    use hotkey::KeyEvt;
+
+    let buf   = hotkey::key_buffer();
+    let guard = buf.lock().ok()?;
+
+    let events: Vec<KeyEvt> = guard.iter()
+        .filter(|t| t.when >= since)
+        .map(|t| t.evt.clone())
+        .collect();
+
+    if events.is_empty() { return None; }
+
+    let clicks = events.iter().filter(|e| matches!(e, KeyEvt::MouseClick)).count();
+    let chars  = events.iter().filter(|e| matches!(e, KeyEvt::Char(_))).count();
+    let bksp   = events.iter().filter(|e| matches!(e, KeyEvt::Backspace)).count();
+    tracing::debug!(
+        "[keystroke] replaying {} events ({chars} chars, {bksp} backspaces, {clicks} clicks) against {} char initial",
+        events.len(), initial.len(),
+    );
+
+    let text: Vec<char> = initial.chars().collect();
+    let cursor = text.len(); // cursor starts at end after paste
+
+    replay_events(initial, &text, cursor, &events, false, 0)
+}
+
+/// Replay a sequence of key events starting from `text` with `cursor`.
+///
+/// When a `MouseClick` is encountered the cursor position becomes unknown.
+/// We try every possible position (0..=text.len()), recurse on the remaining
+/// events, and pick the candidate whose result is closest to `original` —
+/// measured by longest preserved prefix + suffix (smallest contiguous edit).
+///
+/// `depth` limits recursion for multiple successive mouse clicks (cap at 3).
+#[cfg(target_os = "macos")]
+fn replay_events(
+    original: &str,
+    text:     &[char],
+    cursor:   usize,
+    events:   &[hotkey::KeyEvt],
+    all_sel:  bool,
+    depth:    u8,
+) -> Option<String> {
+    use hotkey::KeyEvt;
+
+    let mut text         = text.to_vec();
+    let mut cursor       = cursor;
+    let mut all_selected = all_sel;
+
+    for (i, evt) in events.iter().enumerate() {
+        match evt {
+            KeyEvt::Char(c) => {
+                if all_selected { text.clear(); cursor = 0; all_selected = false; }
+                text.insert(cursor, *c);
+                cursor += 1;
+            }
+            KeyEvt::Backspace => {
+                all_selected = false;
+                if cursor > 0 { cursor -= 1; text.remove(cursor); }
+            }
+            KeyEvt::Delete => {
+                all_selected = false;
+                if cursor < text.len() { text.remove(cursor); }
+            }
+            KeyEvt::Left  => { all_selected = false; if cursor > 0          { cursor -= 1; } }
+            KeyEvt::Right => { all_selected = false; if cursor < text.len() { cursor += 1; } }
+            KeyEvt::Home  => { all_selected = false; cursor = 0; }
+            KeyEvt::End   => { all_selected = false; cursor = text.len(); }
+            // Option+arrows: word-granularity movement
+            KeyEvt::WordLeft  => { all_selected = false; cursor = word_start_before(&text, cursor); }
+            KeyEvt::WordRight => { all_selected = false; cursor = word_end_after(&text, cursor); }
+            // Cmd+arrows: line-granularity movement
+            KeyEvt::LineStart => { all_selected = false; cursor = line_start_before(&text, cursor); }
+            KeyEvt::LineEnd   => { all_selected = false; cursor = line_end_after(&text, cursor); }
+            // Option+Backspace / Cmd+Backspace: multi-char deletes
+            KeyEvt::WordBackspace => {
+                all_selected = false;
+                delete_word_before(&mut text, &mut cursor);
+            }
+            KeyEvt::LineBackspace => {
+                all_selected = false;
+                delete_line_before(&mut text, &mut cursor);
+            }
+            KeyEvt::SelectAll => { all_selected = true; }
+            KeyEvt::MouseClick => {
+                if depth >= 3 { return None; } // too many nested clicks — give up
+                all_selected = false;
+
+                let remaining = &events[i + 1..];
+                let mut best:       Option<String> = None;
+                let mut best_score: usize          = 0;
+
+                for p in 0..=text.len() {
+                    if let Some(candidate) = replay_events(
+                        original, &text, p, remaining, false, depth + 1,
+                    ) {
+                        let score = preserved_text_score(original, &candidate);
+                        if best.is_none() || score > best_score {
+                            best_score = score;
+                            best       = Some(candidate);
+                        }
+                    }
+                }
+
+                if depth == 0 {
+                    tracing::debug!(
+                        "[keystroke] MouseClick at event {i}, tried {} positions, best score={best_score}",
+                        text.len() + 1,
+                    );
+                }
+
+                return best;
+            }
+            KeyEvt::Cut | KeyEvt::Undo => return None,
+            KeyEvt::Other => {}
+        }
+    }
+
+    Some(text.iter().collect())
+}
+
+// ── Text cursor movement helpers (approximate macOS semantics) ────────────────
+
+/// Option+Left: move cursor to the start of the previous word.
+/// A "word" is a maximal sequence of alphanumeric+apostrophe characters.
+/// macOS also skips punctuation clusters first, matching `moveWordBackward:`.
+#[cfg(target_os = "macos")]
+fn word_start_before(text: &[char], pos: usize) -> usize {
+    let mut i = pos;
+    // 1. Skip non-word chars (spaces, punctuation) immediately before cursor
+    while i > 0 && !text[i - 1].is_alphanumeric() && text[i - 1] != '\'' { i -= 1; }
+    // 2. Skip the word chars
+    while i > 0 && (text[i - 1].is_alphanumeric() || text[i - 1] == '\'') { i -= 1; }
+    i
+}
+
+/// Option+Right: move cursor to the end of the next word.
+#[cfg(target_os = "macos")]
+fn word_end_after(text: &[char], pos: usize) -> usize {
+    let mut i = pos;
+    // 1. Skip non-word chars immediately after cursor
+    while i < text.len() && !text[i].is_alphanumeric() && text[i] != '\'' { i += 1; }
+    // 2. Skip the word chars
+    while i < text.len() && (text[i].is_alphanumeric() || text[i] == '\'') { i += 1; }
+    i
+}
+
+/// Cmd+Left / Home: move cursor to the start of the current line.
+#[cfg(target_os = "macos")]
+fn line_start_before(text: &[char], pos: usize) -> usize {
+    let mut i = pos;
+    while i > 0 && text[i - 1] != '\n' { i -= 1; }
+    i
+}
+
+/// Cmd+Right / End: move cursor to the end of the current line.
+#[cfg(target_os = "macos")]
+fn line_end_after(text: &[char], pos: usize) -> usize {
+    let mut i = pos;
+    while i < text.len() && text[i] != '\n' { i += 1; }
+    i
+}
+
+/// Option+Backspace: delete from cursor back to the start of the previous word.
+#[cfg(target_os = "macos")]
+fn delete_word_before(text: &mut Vec<char>, cursor: &mut usize) {
+    let target = word_start_before(text, *cursor);
+    text.drain(target..*cursor);
+    *cursor = target;
+}
+
+/// Cmd+Backspace: delete from cursor back to the start of the current line.
+#[cfg(target_os = "macos")]
+fn delete_line_before(text: &mut Vec<char>, cursor: &mut usize) {
+    let target = line_start_before(text, *cursor);
+    text.drain(target..*cursor);
+    *cursor = target;
+}
+
+/// How much of `original` is preserved in `candidate` at the start and end.
+/// Higher = smaller contiguous edit = more likely the correct reconstruction.
+#[cfg(target_os = "macos")]
+fn preserved_text_score(original: &str, candidate: &str) -> usize {
+    let orig: Vec<char> = original.chars().collect();
+    let cand: Vec<char> = candidate.chars().collect();
+
+    // Longest common prefix
+    let prefix = orig.iter().zip(cand.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    // Longest common suffix (not overlapping with the prefix)
+    let max_suffix = orig.len().saturating_sub(prefix)
+        .min(cand.len().saturating_sub(prefix));
+    let suffix = orig.iter().rev().zip(cand.iter().rev())
+        .take(max_suffix)
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    prefix + suffix
+}
+
+// ── Managed state ─────────────────────────────────────────────────────────────
+
+/// Holds the local recording state machine.
+struct SharedApp(Arc<Mutex<DesktopApp>>);
+
+/// Holds the backend endpoint (url + secret). None until daemon starts.
+struct BackendState(Arc<Mutex<Option<BackendEndpoint>>>);
+
+/// P5: Holds the oneshot receiver that delivers the pre-transcript from the
+/// Deepgram WebSocket streaming task.  Replaced on every new recording.
+struct StreamingState(Mutex<Option<tokio::sync::oneshot::Receiver<String>>>);
+
+/// Lightweight cache of tray-relevant prefs so `sync_tray` never needs async.
+/// Updated whenever patch_preferences or tray_set_model changes the model.
+struct TrayCache(Mutex<TrayCacheInner>);
+struct TrayCacheInner {
+    selected_model: String,       // "smart" | "mini"
+    custom_prompt:  Option<String>,
+}
+impl Default for TrayCacheInner {
+    fn default() -> Self {
+        Self { selected_model: "smart".into(), custom_prompt: None }
+    }
+}
+
+// ── Tray helpers ──────────────────────────────────────────────────────────────
+
+/// Short status text that appears next to the brand icon in the menu bar.
+/// Empty when idle (icon alone).
+fn tray_title(state: &str) -> &'static str {
+    match state {
+        "recording"  => " ● REC",
+        "processing" => " …",
+        _            => "",
+    }
+}
+
+/// Build the dynamic tray menu.
+/// Re-run on every state change so recording label and model checkmarks stay in sync.
+///
+/// `selected_model` — "smart" | "mini"; loaded from SQLite prefs.
+fn build_tray_menu(
+    app:            &tauri::AppHandle,
+    snap:           &AppSnapshot,
+    selected_model: &str,
+    custom_prompt:  Option<&str>,
+) -> Result<Menu<tauri::Wry>, tauri::Error> {
+
+    // ── 1. Toggle recording (state-aware label + enabled) ──────────────
+    let toggle_label = match snap.state.as_str() {
+        "recording"  => "Stop recording",
+        "processing" => "Processing…",
+        _            => "Start recording",
+    };
+    let toggle_enabled = snap.state.as_str() != "processing";
+    let toggle = MenuItem::with_id(
+        app, "tray_toggle", toggle_label, toggle_enabled, None::<&str>,
+    )?;
+
+    // ── 2. Model submenu — GPT-5.4 / GPT-5.4 Mini ──────────────────────
+    let smart_label = if selected_model == "smart" { "✓  Smart  (gpt-5.4)" } else { "    Smart  (gpt-5.4)" };
+    let mini_label  = if selected_model == "mini"  { "✓  Fast   (gpt-5.4-mini)" } else { "    Fast   (gpt-5.4-mini)" };
+    let model_smart = MenuItem::with_id(app, "tray_model_smart", smart_label, true, None::<&str>)?;
+    let model_mini  = MenuItem::with_id(app, "tray_model_mini",  mini_label,  true, None::<&str>)?;
+    let model_submenu = Submenu::with_items(app, "Model", true, &[
+        &model_smart as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
+        &model_mini,
+    ])?;
+
+    // ── 3. "Polish my message" submenu ─────────────────────────────────
+    // Fixed English-output presets + optional Custom entry
+    let p_prof     = MenuItem::with_id(app, "tray_polish_professional", "Professional English", true, None::<&str>)?;
+    let p_casual   = MenuItem::with_id(app, "tray_polish_casual",       "Casual",               true, None::<&str>)?;
+    let p_assertive= MenuItem::with_id(app, "tray_polish_assertive",    "Assertive",            true, None::<&str>)?;
+    let p_concise  = MenuItem::with_id(app, "tray_polish_concise",      "Concise",              true, None::<&str>)?;
+    let p_neutral  = MenuItem::with_id(app, "tray_polish_neutral",      "Neutral",              true, None::<&str>)?;
+
+    let polish_refs: Vec<Box<dyn tauri::menu::IsMenuItem<tauri::Wry>>> = {
+        let mut v: Vec<Box<dyn tauri::menu::IsMenuItem<tauri::Wry>>> = vec![
+            Box::new(p_prof),
+            Box::new(p_casual),
+            Box::new(p_assertive),
+            Box::new(p_concise),
+            Box::new(p_neutral),
+        ];
+        // Add "Custom" only when the user has set a custom prompt in Settings
+        if custom_prompt.map(|s| !s.trim().is_empty()).unwrap_or(false) {
+            let p_custom = MenuItem::with_id(app, "tray_polish_custom", "Custom", true, None::<&str>)?;
+            v.push(Box::new(p_custom));
+        }
+        v
+    };
+    let polish_item_refs: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> =
+        polish_refs.iter().map(|b| b.as_ref()).collect();
+    let polish_submenu = Submenu::with_items(app, "Polish my message", true, &polish_item_refs)?;
+
+    // ── 4. Window actions + quit ────────────────────────────────────────
+    let show_item      = MenuItem::with_id(app, "show",       "Open Said",          true, None::<&str>)?;
+    let settings_item  = MenuItem::with_id(app, "settings",  "Settings…",          true, None::<&str>)?;
+    let reconnect_item = MenuItem::with_id(app, "reconnect", "Reconnect OpenAI…",  true, None::<&str>)?;
+    let quit_item      = MenuItem::with_id(app, "quit",      "Quit Said",          true, None::<&str>)?;
+
+    let sep1 = PredefinedMenuItem::separator(app)?;
+    let sep2 = PredefinedMenuItem::separator(app)?;
+    let sep3 = PredefinedMenuItem::separator(app)?;
+    let sep4 = PredefinedMenuItem::separator(app)?;
+    let sep5 = PredefinedMenuItem::separator(app)?;
+
+    Menu::with_items(app, &[
+        &toggle           as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
+        &sep1,
+        &model_submenu,
+        &sep2,
+        &polish_submenu,
+        &sep3,
+        &show_item,
+        &settings_item,
+        &reconnect_item,
+        &sep4,
+        &quit_item,
+    ])
+}
+
+/// Re-render the tray icon title + menu from the cached prefs (no async needed).
+fn sync_tray(handle: &tauri::AppHandle, snap: &AppSnapshot) {
+    if let Some(tray) = handle.tray_by_id("said") {
+        let _ = tray.set_title(Some(tray_title(&snap.state)));
+
+        // Read from in-process cache — never blocks on async or HTTP
+        let cache   = handle.state::<TrayCache>();
+        let inner   = cache.0.lock().unwrap_or_else(|p| p.into_inner());
+        let model   = inner.selected_model.clone();
+        let custom  = inner.custom_prompt.clone();
+        drop(inner);
+
+        if let Ok(menu) = build_tray_menu(handle, snap, &model, custom.as_deref()) {
+            let _ = tray.set_menu(Some(menu));
+        }
+    }
+}
+
+// ── Tray action helpers ───────────────────────────────────────────────────────
+
+/// Trigger recording from a tray menu click.
+/// Mirrors the `toggle_recording` Tauri command's logic.
+fn tray_toggle_recording(app: &tauri::AppHandle) {
+    let shared_state  = app.state::<SharedApp>();
+    let backend_state = app.state::<BackendState>();
+
+    let current = match shared_state.0.lock() {
+        Ok(g) => g.state,
+        Err(_) => return,
+    };
+
+    match current {
+        desktop::AppState::Idle => {
+            do_start_recording(&shared_state.0, app);
+        }
+        desktop::AppState::Recording => {
+            do_finish_recording(
+                Arc::clone(&shared_state.0),
+                app.clone(),
+                Arc::clone(&backend_state.0),
+            );
+        }
+        desktop::AppState::Processing => {} // ignore — already in flight
+    }
+}
+
+/// Switch active model from a tray menu click.
+fn tray_set_model(app: &tauri::AppHandle, key: &str) {
+    let shared  = app.state::<SharedApp>();
+    let backend = app.state::<BackendState>();
+
+    // Update the tray cache immediately — sync_tray reads from here
+    if let Ok(mut cache) = app.state::<TrayCache>().0.lock() {
+        cache.selected_model = key.to_string();
+    }
+
+    let snap = match shared.0.lock() {
+        Ok(mut d) => d.set_mode(key).ok(),
+        Err(_) => None,
+    };
+    if let Some(snap) = snap {
+        sync_tray(app, &snap);
+        let _ = app.emit("app-state", &snap);
+    }
+
+    // Persist to backend SQLite (fire-and-forget)
+    let back_arc = Arc::clone(&backend.0);
+    let key_owned = key.to_string();
+    tauri::async_runtime::spawn(async move {
+        let ep = {
+            let lock = match back_arc.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            match lock.clone() {
+                Some(e) => e,
+                None    => return,
+            }
+        };
+        let _ = api::patch_preferences(
+            &ep,
+            api::PrefsUpdate { selected_model: Some(key_owned), ..Default::default() },
+        ).await;
+    });
+}
+
+/// Polish the currently selected text using the given tone preset.
+///
+/// Flow: read selection → POST /v1/text/polish (SSE) with tone_override → paste result.
+fn tray_polish_message(app: &tauri::AppHandle, tone: &str) {
+    let backend = app.state::<BackendState>();
+    let ep_opt  = backend.0.lock().ok().and_then(|g| g.clone());
+    let ep = match ep_opt {
+        Some(e) => e,
+        None => {
+            tracing::warn!("[tray_polish] backend not ready");
+            return;
+        }
+    };
+
+    // Grab selection before spawning — must happen on the main thread
+    // so the focused window hasn't changed.
+    let selected = paster::read_selected_text();
+    let text = match selected {
+        Some(t) if !t.trim().is_empty() => t,
+        _ => {
+            tracing::warn!("[tray_polish] no text selected");
+            return;
+        }
+    };
+
+    let tone_owned = tone.to_string();
+    let app_clone  = app.clone();
+
+    tauri::async_runtime::spawn(async move {
+        tracing::info!("[tray_polish] polishing {} chars with tone={}", text.len(), tone_owned);
+
+        let result = api::stream_text_polish(
+            &ep,
+            text,
+            None,
+            Some(tone_owned),
+            |_event| {}, // fire-and-forget on events; we paste the final result
+        ).await;
+
+        match result {
+            Ok(done) if !done.polished.is_empty() => {
+                tracing::info!("[tray_polish] done — {} words", done.polished.split_whitespace().count());
+                // Emit tokens to the UI for live preview if the window is visible
+                let _ = app_clone.emit("voice-done", &done);
+                // Paste the polished text (replaces selection)
+                if let Err(e) = paster::paste(&done.polished) {
+                    tracing::warn!("[tray_polish] paste failed: {e}");
+                }
+            }
+            Ok(_) => tracing::warn!("[tray_polish] empty result from backend"),
+            Err(e) => tracing::warn!("[tray_polish] backend error: {e}"),
+        }
+    });
+}
+
+/// Show the main window and emit a hint to switch to the settings view.
+fn tray_open_settings(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+    let _ = app.emit("nav-settings", ());
+}
+
+/// Initiate OpenAI OAuth from the tray menu — opens the system browser and
+/// emits an event so the frontend can start polling for the connected state.
+fn tray_reconnect_openai(app: &tauri::AppHandle) {
+    let backend = app.state::<BackendState>();
+    let ep_opt  = backend.0.lock().ok().and_then(|g| g.clone());
+    let ep = match ep_opt {
+        Some(e) => e,
+        None => {
+            tracing::warn!("[tray_reconnect] backend not ready");
+            return;
+        }
+    };
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn(async move {
+        match api::initiate_openai_oauth(&ep).await {
+            Ok(result) => {
+                if let Some(url) = result.get("auth_url").and_then(|v| v.as_str()) {
+                    let _ = open::that(url);
+                }
+                // Tell the frontend to start polling — it will show the reconnect
+                // state in the Settings view and update openAIConnected once done.
+                let _ = app_clone.emit("openai-reconnect-initiated", ());
+            }
+            Err(e) => tracing::warn!("[tray_reconnect] failed to initiate OAuth: {e}"),
+        }
+    });
+}
+
+// ── Tauri commands ────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn bootstrap(
+    state: State<'_, SharedApp>,
+    app:   tauri::AppHandle,
+) -> Result<AppSnapshot, String> {
+    let snap = state.0.lock().map_err(|_| "lock failed")?.snapshot();
+    sync_tray(&app, &snap);
+    Ok(snap)
+}
+
+#[tauri::command]
+fn get_snapshot(state: State<'_, SharedApp>) -> Result<AppSnapshot, String> {
+    Ok(state.0.lock().map_err(|_| "lock failed")?.snapshot())
+}
+
+/// Return `{url, secret}` so the frontend can hit the backend directly.
+#[tauri::command]
+fn get_backend_endpoint(backend: State<'_, BackendState>) -> Result<serde_json::Value, String> {
+    let lock = backend.0.lock().map_err(|_| "lock failed")?;
+    let ep   = lock.as_ref().ok_or("backend not yet started")?;
+    Ok(serde_json::json!({ "url": ep.url, "secret": ep.secret }))
+}
+
+#[tauri::command]
+async fn get_preferences(backend: State<'_, BackendState>) -> Result<api::Preferences, String> {
+    let ep = get_endpoint(&backend)?;
+    api::get_preferences(&ep).await
+}
+
+#[tauri::command]
+async fn patch_preferences(
+    backend:    State<'_, BackendState>,
+    tray_cache: State<'_, TrayCache>,
+    app:        tauri::AppHandle,
+    update:     api::PrefsUpdate,
+) -> Result<api::Preferences, String> {
+    tracing::info!("[patch_prefs] Tauri received: llm_provider={:?} selected_model={:?} tone={:?}",
+        update.llm_provider, update.selected_model, update.tone_preset);
+    let ep = get_endpoint(&backend)?;
+    let result = api::patch_preferences(&ep, update).await;
+    match &result {
+        Ok(p) => {
+            tracing::info!("[patch_prefs] backend returned: llm_provider={:?}", p.llm_provider);
+            // Keep tray cache in sync so sync_tray never needs async
+            if let Ok(mut cache) = tray_cache.0.lock() {
+                cache.selected_model = p.selected_model.clone();
+                cache.custom_prompt  = p.custom_prompt.clone();
+            }
+            // Re-render tray menu to show updated checkmark
+            let shared = app.state::<SharedApp>();
+            if let Ok(d) = shared.0.lock() {
+                let snap = d.snapshot();
+                drop(d);
+                sync_tray(&app, &snap);
+            }
+        }
+        Err(e) => tracing::warn!("[patch_prefs] backend error: {e}"),
+    }
+    result
+}
+
+#[tauri::command]
+async fn get_history(
+    backend: State<'_, BackendState>,
+    limit:   Option<i64>,
+) -> Result<Vec<api::Recording>, String> {
+    let ep = get_endpoint(&backend)?;
+    api::get_history(&ep, limit.unwrap_or(50)).await
+}
+
+#[tauri::command]
+async fn submit_edit_feedback(
+    backend:      State<'_, BackendState>,
+    recording_id: String,
+    user_kept:    String,
+    target_app:   Option<String>,
+) -> Result<(), String> {
+    let ep = get_endpoint(&backend)?;
+    api::submit_feedback(&ep, &recording_id, &user_kept, target_app.as_deref()).await
+}
+
+#[tauri::command]
+async fn set_mode(
+    key:     String,
+    state:   State<'_, SharedApp>,
+    backend: State<'_, BackendState>,
+    app:     tauri::AppHandle,
+) -> Result<AppSnapshot, String> {
+    // 1. Update in-memory mode index (affects the snapshot shown in the UI)
+    let snap = state.0.lock().map_err(|_| "lock failed")?.set_mode(&key)?;
+    sync_tray(&app, &snap);
+
+    // 2. Persist selected_model to backend SQLite (affects actual polish calls)
+    //    Fire-and-forget — if backend isn't up yet, we still return the snap.
+    if let Ok(ep) = get_endpoint(&backend) {
+        let _ = api::patch_preferences(&ep, api::PrefsUpdate {
+            selected_model: Some(key),
+            ..Default::default()
+        })
+        .await;
+    }
+
+    Ok(snap)
+}
+
+#[tauri::command]
+fn request_accessibility(state: State<'_, SharedApp>) -> Result<AppSnapshot, String> {
+    paster::request_permission();
+    Ok(state.0.lock().map_err(|_| "lock failed")?.snapshot())
+}
+
+#[tauri::command]
+fn request_input_monitoring(state: State<'_, SharedApp>) -> Result<AppSnapshot, String> {
+    paster::request_input_monitoring();
+    Ok(state.0.lock().map_err(|_| "lock failed")?.snapshot())
+}
+
+/// Run the 5-method AX field reading diagnostic on whatever is focused right now.
+/// The Tauri app already has Accessibility permission, so unlike a fresh standalone
+/// binary, this can always reach the focused application.
+///
+/// `delay_secs` is how long to wait before sampling — gives the user time to
+/// click into the target app before the diagnostic runs.
+#[tauri::command]
+async fn diagnose_ax(delay_secs: u64) -> Result<paster::AxDiagnostics, String> {
+    let delay = delay_secs.clamp(0, 30);
+    if delay > 0 {
+        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+    }
+    // Run the (synchronous, FFI-heavy) diagnostic on a blocking thread.
+    let report = tokio::task::spawn_blocking(paster::diagnose_focused_field)
+        .await
+        .map_err(|e| format!("diagnostic task failed: {e}"))?;
+    Ok(report)
+}
+
+/// UI button: start or stop recording depending on current state.
+/// - idle      → start recording, return snapshot with state="recording"
+/// - recording → stop recording, kick off async SSE pipeline, return state="processing"
+/// - processing → no-op (return current snapshot)
+#[tauri::command]
+fn toggle_recording(
+    state:   State<'_, SharedApp>,
+    backend: State<'_, BackendState>,
+    app:     tauri::AppHandle,
+) -> Result<AppSnapshot, String> {
+    let current_state = state.0.lock().map_err(|_| "lock failed")?.state;
+
+    match current_state {
+        desktop::AppState::Idle => {
+            // Pre-unlock the focused app's AX tree before recording begins.
+            #[cfg(target_os = "macos")]
+            {
+                let pid = paster::unlock_focused_app_now();
+                tracing::debug!("[record] pre-unlocked AX for focused app pid={pid:?}");
+            }
+            // Start recording and return immediately
+            let snap = state.0.lock().map_err(|_| "lock failed")?.start_recording()?;
+            sync_tray(&app, &snap);
+            Ok(snap)
+        }
+        desktop::AppState::Recording => {
+            // Extract wav bytes synchronously, then hand off the async SSE pipeline
+            let wav = state.0.lock().map_err(|_| "lock failed")?.stop_and_extract()?;
+            let snap = state.0.lock().map_err(|_| "lock failed")?.snapshot();
+            sync_tray(&app, &snap);
+
+            // Kick off the SSE pipeline in the background (same as hotkey release)
+            let shared2   = Arc::clone(&state.0);
+            let app2      = app.clone();
+            let back_arc2 = Arc::clone(&backend.0);
+            // UI button path: no WS streaming pre-transcript (hotkey path handles it)
+            let pre_tx_ui: Option<String> = None;
+            tauri::async_runtime::spawn(async move {
+                let result = run_voice_polish_sse(&back_arc2, wav, None, pre_tx_ui, &app2).await;
+
+                // Spawn edit-watcher immediately after paste (non-blocking).
+                // Capture watch_start NOW — before the spawn — so the ring
+                // buffer timestamp filter doesn't miss early mouse clicks.
+                let watch_start = std::time::Instant::now();
+                if let Ok(ref done) = result {
+                    let back3 = Arc::clone(&back_arc2);
+                    tauri::async_runtime::spawn(watch_for_edit(
+                        back3,
+                        done.recording_id.clone(),
+                        done.polished.clone(),
+                        watch_start,
+                    ));
+                }
+
+                let mut d  = match shared2.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                let finished_snap = match result {
+                    Ok(done) => d.finish_ok(voice_polish_core::ProcessSummary {
+                        transcript:    done.polished.clone(),
+                        polished:      done.polished,
+                        model:         done.model_used,
+                        confidence:    done.confidence.unwrap_or(0.0),
+                        transcribe_ms: done.latency_ms.transcribe as u64,
+                        polish_ms:     done.latency_ms.polish as u64,
+                    }),
+                    Err(e) => d.finish_err(e),
+                };
+                sync_tray(&app2, &finished_snap);
+                let _ = app2.emit("app-state", &finished_snap);
+            });
+
+            Ok(snap) // Return "processing" snapshot to the UI immediately
+        }
+        desktop::AppState::Processing => {
+            // Already in flight — return current snapshot, don't do anything
+            Ok(state.0.lock().map_err(|_| "lock failed")?.snapshot())
+        }
+    }
+}
+
+// ── Recording flow ────────────────────────────────────────────────────────────
+
+/// Start recording. Called when user presses Caps Lock (or taps the button).
+fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
+    // Pre-unlock the focused app's AX tree BEFORE recording begins.
+    // Chrome / Electron need ~150-200 ms to build their accessibility cache after
+    // AXEnhancedUserInterface / AXManualAccessibility is set.  By unlocking here
+    // we give the browser the full dictation window (typically 2-10 s) to get
+    // ready, so that post-paste edit detection can read AXValue reliably.
+    #[cfg(target_os = "macos")]
+    {
+        let pid = paster::unlock_focused_app_now();
+        tracing::debug!("[record] pre-unlocked AX for focused app pid={pid:?}");
+    }
+
+    let snap = shared.lock().ok().and_then(|mut d| d.start_recording().ok());
+    if let Some(snap) = snap {
+        sync_tray(app, &snap);
+        let _ = app.emit("app-state", &snap);
+    }
+
+    // ── P5: Start Deepgram WS streaming immediately ────────────────────────────
+    // Take the chunk receiver from the recorder and open a WebSocket to Deepgram.
+    // The transcript will be ready (or close to it) by the time Caps Lock is released.
+    let chunk_recv = shared.lock().ok().and_then(|mut d| d.take_chunk_receiver());
+    if let Some(chunk_recv) = chunk_recv {
+        let back_arc = app.state::<BackendState>().0.clone();
+        let streaming_state = app.state::<StreamingState>();
+        let (transcript_tx, transcript_rx) = tokio::sync::oneshot::channel::<String>();
+        // Use ok() — a poisoned mutex (from a previous panic) must not cascade
+        if let Some(mut g) = streaming_state.0.lock().ok() {
+            *g = Some(transcript_rx);
+        }
+
+        tauri::async_runtime::spawn(async move {
+            // ── P5 hot path: minimise time-to-first-audio-byte ─────────────────
+            //
+            // The backend's `preferences` table does NOT store API keys — they
+            // live in the .env file / process environment.  Fetching prefs here
+            // just for the key added ~100-200 ms of unnecessary HTTP latency
+            // before the WS could connect.  Get the key from the env directly.
+            //
+            // Language still comes from prefs (local HTTP, fast) but is fetched
+            // AFTER we know the key is present, so we fail-fast cheaply.
+            let deepgram_key = std::env::var("DEEPGRAM_API_KEY").unwrap_or_default();
+            if deepgram_key.is_empty() {
+                tracing::warn!("[dg_stream] DEEPGRAM_API_KEY not set — WS streaming disabled");
+                let _ = transcript_tx.send(String::new());
+                return;
+            }
+            tracing::debug!("[dg_stream] API key present ({} chars)", deepgram_key.len());
+
+            // Fetch language from local backend prefs (127.0.0.1, <20 ms).
+            let ep_opt   = back_arc.lock().ok().and_then(|g| g.clone());
+            let language = if let Some(ref ep) = ep_opt {
+                api::get_preferences(ep).await.ok()
+                    .map(|p| p.language.clone())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            let transcript = dg_stream::stream_to_deepgram(chunk_recv, &deepgram_key, &language).await;
+            tracing::info!(
+                "[dg_stream] pre-transcript result: {}",
+                transcript.as_deref().unwrap_or("<none>")
+            );
+            let _ = transcript_tx.send(transcript.unwrap_or_default());
+        });
+    } else {
+        tracing::debug!("[dg_stream] no chunk receiver — WS streaming not started");
+    }
+}
+
+/// Stop recording, ship WAV to backend via SSE, paste the result.
+fn do_finish_recording(
+    shared:   Arc<Mutex<DesktopApp>>,
+    app:      tauri::AppHandle,
+    back_arc: Arc<Mutex<Option<BackendEndpoint>>>,
+) {
+    // Extract wav bytes synchronously (near-instant, no I/O).
+    // This also drops the recorder's chunk_tx, signalling the WS task to close.
+    let wav = {
+        let mut d = match shared.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if let Some(t) = app.tray_by_id("said") {
+            let _ = t.set_title(Some("[  …  ]  Said"));
+        }
+        match d.stop_and_extract() {
+            Ok(w) => w,
+            Err(e) => {
+                let snap = d.finish_err(e);
+                let _ = app.emit("app-state", &snap);
+                return;
+            }
+        }
+    };
+
+    // ── P5: Take the transcript receiver before spawning the async task ────────
+    // Use ok() so a poisoned mutex from a previous panic doesn't cascade-crash.
+    let transcript_rx = app.state::<StreamingState>()
+        .0.lock().ok()
+        .and_then(|mut g| g.take());
+
+    // Do the async SSE pipeline in a tokio task
+    let shared2   = Arc::clone(&shared);
+    let app2      = app.clone();
+    let back_arc2 = Arc::clone(&back_arc);
+
+    tauri::async_runtime::spawn(async move {
+        // ── P5: Wait up to 2 s for the Deepgram WS transcript ─────────────────
+        // stop_and_extract() dropped chunk_tx, which closes the audio channel and
+        // triggers CloseStream inside the WS task.  Deepgram usually finalises in
+        // 100–200 ms, so the transcript should arrive quickly.
+        // Wait up to 4 s for the Deepgram WS transcript.
+        // In practice the WS path takes ~1.5-2 s from Caps Lock release to final
+        // transcript (CloseStream + Deepgram finalize + 300ms endpointing window).
+        // If it still doesn't arrive, we fall through to the normal HTTP STT path.
+        let pre_transcript: Option<String> = if let Some(rx) = transcript_rx {
+            match tokio::time::timeout(std::time::Duration::from_secs(4), rx).await {
+                Ok(Ok(t)) if !t.is_empty() => {
+                    tracing::info!("[finish] WS pre-transcript ready ({} chars): {t:?}", t.len());
+                    Some(t)
+                }
+                Ok(_) => {
+                    tracing::debug!("[finish] WS transcript empty — using HTTP STT");
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!("[finish] WS transcript timed out after 4 s — falling back to HTTP STT");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let result = run_voice_polish_sse(&back_arc2, wav, None, pre_transcript, &app2).await;
+
+        // Spawn edit-watcher immediately after paste (non-blocking).
+        // Capture watch_start NOW — before the spawn — so the ring
+        // buffer timestamp filter doesn't miss early mouse clicks.
+        let watch_start = std::time::Instant::now();
+        if let Ok(ref done) = result {
+            let back3 = Arc::clone(&back_arc2);
+            tauri::async_runtime::spawn(watch_for_edit(
+                back3,
+                done.recording_id.clone(),
+                done.polished.clone(),
+                watch_start,
+            ));
+        }
+
+        let mut d    = match shared2.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let snap = match result {
+            Ok(done) => d.finish_ok(ProcessSummary {
+                transcript:    done.polished.clone(),
+                polished:      done.polished,
+                model:         done.model_used,
+                confidence:    done.confidence.unwrap_or(0.0),
+                transcribe_ms: done.latency_ms.transcribe as u64,
+                polish_ms:     done.latency_ms.polish as u64,
+            }),
+            Err(e) => d.finish_err(e),
+        };
+        sync_tray(&app2, &snap);
+        let _ = app2.emit("app-state", &snap);
+    });
+}
+
+/// Async SSE consumer: streams tokens from backend, pastes full text at end.
+async fn run_voice_polish_sse(
+    back_arc:       &Arc<Mutex<Option<BackendEndpoint>>>,
+    wav:            Vec<u8>,
+    target_app:     Option<String>,
+    pre_transcript: Option<String>,
+    app:            &tauri::AppHandle,
+) -> Result<api::PolishDone, String> {
+    let ep = {
+        let lock = back_arc.lock().map_err(|_| "backend lock failed")?;
+        lock.clone().ok_or("backend not started")?
+    };
+
+    let app_clone = app.clone();
+
+    let done = api::stream_voice_polish(&ep, wav, target_app, pre_transcript, move |event| {
+        match &event {
+            api::PolishEvent::Token { token } => {
+                let _ = app_clone.emit(
+                    "voice-token",
+                    serde_json::json!({ "token": token }),
+                );
+            }
+            api::PolishEvent::Status { phase, transcript } => {
+                let _ = app_clone.emit(
+                    "voice-status",
+                    serde_json::json!({ "phase": phase, "transcript": transcript }),
+                );
+            }
+            api::PolishEvent::Done(done) => {
+                let _ = app_clone.emit("voice-done", done);
+            }
+            api::PolishEvent::Error { message } => {
+                let _ = app_clone.emit(
+                    "voice-error",
+                    serde_json::json!({ "message": message }),
+                );
+            }
+        }
+    })
+    .await?;
+
+    // Single paste at the end (full polished text)
+    if !done.polished.is_empty() {
+        if let Err(e) = paster::paste(&done.polished) {
+            tracing::warn!("[main] paste failed: {e}");
+        }
+    }
+
+    Ok(done)
+}
+
+// ── Cloud auth commands ───────────────────────────────────────────────────────
+
+/// Cloud URL — read from env, default to the hosted service.
+fn cloud_url() -> String {
+    std::env::var("CLOUD_API_URL")
+        .unwrap_or_else(|_| "https://cloud.voicepolish.app".into())
+}
+
+#[tauri::command]
+async fn cloud_signup(
+    email:    String,
+    password: String,
+    backend:  State<'_, BackendState>,
+) -> Result<api::CloudAuthResponse, String> {
+    let resp = api::cloud_signup(&cloud_url(), &email, &password).await?;
+    // Persist token in local backend SQLite
+    if let Ok(ep) = get_endpoint(&backend) {
+        let _ = api::store_cloud_token(&ep, &resp.token, &resp.account.license_tier).await;
+    }
+    Ok(resp)
+}
+
+#[tauri::command]
+async fn cloud_login(
+    email:    String,
+    password: String,
+    backend:  State<'_, BackendState>,
+) -> Result<api::CloudAuthResponse, String> {
+    let resp = api::cloud_login(&cloud_url(), &email, &password).await?;
+    if let Ok(ep) = get_endpoint(&backend) {
+        let _ = api::store_cloud_token(&ep, &resp.token, &resp.account.license_tier).await;
+    }
+    Ok(resp)
+}
+
+#[tauri::command]
+async fn cloud_logout(backend: State<'_, BackendState>) -> Result<(), String> {
+    let ep = get_endpoint(&backend)?;
+    api::clear_cloud_token(&ep).await
+}
+
+#[tauri::command]
+async fn get_cloud_status(backend: State<'_, BackendState>) -> Result<api::CloudStatus, String> {
+    let ep = get_endpoint(&backend)?;
+    api::get_cloud_status(&ep).await
+}
+
+// ── OpenAI OAuth commands ─────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn get_openai_status(backend: State<'_, BackendState>) -> Result<serde_json::Value, String> {
+    let ep = get_endpoint(&backend)?;
+    api::get_openai_status(&ep).await
+}
+
+#[tauri::command]
+async fn initiate_openai_oauth(backend: State<'_, BackendState>) -> Result<serde_json::Value, String> {
+    let ep     = get_endpoint(&backend)?;
+    let result = api::initiate_openai_oauth(&ep).await?;
+    // Open the auth URL in the user's default browser
+    if let Some(url) = result.get("auth_url").and_then(|v| v.as_str()) {
+        let _ = open::that(url);
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+async fn disconnect_openai(backend: State<'_, BackendState>) -> Result<(), String> {
+    let ep = get_endpoint(&backend)?;
+    api::disconnect_openai(&ep).await
+}
+
+/// On launch, refresh license from cloud if a token is stored.
+/// Returns the cached tier on network failure (graceful degradation).
+#[tauri::command]
+async fn refresh_license(backend: State<'_, BackendState>) -> Result<serde_json::Value, String> {
+    let ep     = get_endpoint(&backend)?;
+    let status = api::get_cloud_status(&ep).await?;
+    if !status.connected {
+        return Ok(serde_json::json!({ "tier": "free", "source": "local" }));
+    }
+    // We don't store the raw token in Tauri state, but the backend has it.
+    // We can get it back via the status endpoint... but the backend doesn't
+    // expose the raw token over HTTP for security. So for license refresh,
+    // Tauri asks the backend to re-check — the backend can do this if needed.
+    // For now, return the locally-stored tier.
+    Ok(serde_json::json!({
+        "tier":      status.license_tier,
+        "connected": status.connected,
+        "source":    "local",
+    }))
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn get_endpoint(backend: &State<'_, BackendState>) -> Result<BackendEndpoint, String> {
+    let lock = backend.0.lock().map_err(|_| "lock failed")?;
+    lock.clone().ok_or_else(|| "backend not started".into())
+}
+
+// ── Edit watcher ──────────────────────────────────────────────────────────────
+
+/// After pasting, poll the focused text element for up to 2 minutes.
+/// When the user stops typing for 8 s (or switches apps), submit the final
+/// text as edit feedback so the learning pipeline can capture the correction.
+async fn watch_for_edit(
+    back_arc:     Arc<Mutex<Option<BackendEndpoint>>>,
+    recording_id: String,
+    polished:     String,             // the AI-generated text we pasted
+    watch_start:  std::time::Instant, // captured at the call site, right after paste
+) {
+    use std::time::{Duration, Instant};
+
+    // Let the paste animation settle and focus move into the text field.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // Snapshot the PID right after paste.
+    let initial_pid = paster::focused_pid();
+
+    // Attempt to get the initial field value.  Chrome / Electron may still be
+    // building their AX cache even after the pre-unlock at recording-start, so
+    // we retry a few times with increasing delays before declaring "AX blind".
+    let post_paste = {
+        let mut val = paster::read_focused_value().unwrap_or_default();
+        if val.is_empty() {
+            // 2nd attempt after 300 ms
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            val = paster::read_focused_value().unwrap_or_default();
+        }
+        if val.is_empty() {
+            // 3rd attempt after another 500 ms — AX tree should be ready by now
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            val = paster::read_focused_value().unwrap_or_default();
+        }
+        val
+    };
+
+    let mut last_val = post_paste.clone();
+    let mut idle_at  = Instant::now();
+    let started      = Instant::now();
+
+    tracing::info!(
+        "[edit-watch] watching {recording_id} — initial field readable: {} (len={})",
+        !post_paste.is_empty(),
+        post_paste.len(),
+    );
+
+    // Poll loop: 30 ms cadence.
+    loop {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Check PID FIRST — if the user switched apps, break immediately WITHOUT
+        // reading the new app's field value.  If we read first, last_val gets
+        // overwritten with the new app's (empty) text, corrupting the diff.
+        let now_pid = paster::focused_pid();
+        let pid_switched = matches!(
+            (initial_pid, now_pid),
+            (Some(a), Some(b)) if a != b
+        );
+        if pid_switched { break; }
+
+        // Still in the same app — read the current field value.
+        let now_val = paster::read_focused_value().unwrap_or_default();
+        if now_val != last_val {
+            idle_at  = Instant::now();
+            last_val = now_val;
+        }
+
+        let done = idle_at.elapsed() > Duration::from_secs(8)  // 8s idle — user stopped typing
+            || started.elapsed() > Duration::from_secs(120);   // 2-min cap
+
+        if done { break; }
+    }
+
+    let final_pid = paster::focused_pid();
+    tracing::info!(
+        "[edit-watch] done watching {recording_id} — field changed: {}, same app: {}",
+        last_val != post_paste,
+        matches!((initial_pid, final_pid), (Some(a), Some(b)) if a == b),
+    );
+
+    // ── Determine user_kept ────────────────────────────────────────────────────
+
+    let user_kept: String;
+
+    if !post_paste.is_empty() {
+        // ── AX was readable — compare values directly ──────────────────────────
+        if last_val == post_paste {
+            tracing::info!("[edit-watch] no edits detected for {recording_id}");
+            return;
+        }
+        user_kept = extract_kept(&polished, &post_paste, &last_val);
+        tracing::info!(
+            "[edit-watch] edit captured (AX) for {recording_id}: {:?} → {:?}",
+            polished.chars().take(60).collect::<String>(),
+            user_kept.chars().take(60).collect::<String>(),
+        );
+    } else {
+        // ── AX blind (Lark, Chrome contenteditable, WebView) ─────────────────
+        // AXValue returned nil.  Replay the keystrokes the CGEventTap has been
+        // recording in its ring buffer since watch_start (same technique as
+        // Wispr Flow — universal, works in any app).
+
+        #[cfg(target_os = "macos")]
+        {
+            match reconstruct_from_keystrokes(&polished, watch_start) {
+                Some(reconstructed) if reconstructed.trim() != polished.trim() => {
+                    user_kept = reconstructed;
+                    tracing::info!(
+                        "[edit-watch] edit captured (keystrokes) for {recording_id}: {:?} → {:?}",
+                        polished.chars().take(60).collect::<String>(),
+                        user_kept.chars().take(60).collect::<String>(),
+                    );
+                }
+                Some(_) => {
+                    // Keystrokes replayed cleanly — user made no change.
+                    tracing::info!(
+                        "[edit-watch] keystroke replay: no change from polished — skipping {recording_id}"
+                    );
+                    return;
+                }
+                None => {
+                    // Reconstruction uncertain (mouse click / Cmd+Z / Cmd+X).
+                    // Try Cmd+A+C clipboard capture as a last resort if still in the same app.
+                    tracing::info!(
+                        "[edit-watch] keystroke replay uncertain — trying clipboard fallback for {recording_id}"
+                    );
+
+                    let same_app = matches!(
+                        (initial_pid, final_pid),
+                        (Some(a), Some(b)) if a == b
+                    );
+                    if !same_app {
+                        tracing::info!("[edit-watch] app switched — skipping {recording_id}");
+                        return;
+                    }
+
+                    let captured = tokio::task::spawn_blocking(paster::capture_focused_text_via_selection)
+                        .await
+                        .unwrap_or(None);
+                    let Some(raw) = captured else {
+                        tracing::info!(
+                            "[edit-watch] clipboard fallback returned nothing — skipping {recording_id}"
+                        );
+                        return;
+                    };
+                    let captured         = raw.trim().to_string();
+                    let polished_trimmed = polished.trim();
+                    if !captured.contains(polished_trimmed) {
+                        tracing::info!(
+                            "[edit-watch] polished text not found in field — skipping {recording_id}"
+                        );
+                        return;
+                    }
+                    let edited = extract_kept(polished_trimmed, polished_trimmed, &captured);
+                    if edited == polished_trimmed {
+                        tracing::info!(
+                            "[edit-watch] no edit found via clipboard fallback — skipping {recording_id}"
+                        );
+                        return;
+                    }
+                    user_kept = edited;
+                    tracing::info!(
+                        "[edit-watch] edit captured (clipboard) for {recording_id}: {:?} → {:?}",
+                        polished.chars().take(60).collect::<String>(),
+                        user_kept.chars().take(60).collect::<String>(),
+                    );
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            tracing::info!("[edit-watch] AX blind — skipping (non-macOS) for {recording_id}");
+            return;
+        }
+    }
+
+    if user_kept.is_empty() || user_kept.trim() == polished.trim() {
+        tracing::info!("[edit-watch] no meaningful diff for {recording_id} — skipping");
+        return;
+    }
+
+    // ── Submit to backend ──────────────────────────────────────────────────────
+    let ep = back_arc.lock().ok().and_then(|g| g.clone());
+    if let Some(ep) = ep {
+        match api::submit_feedback(&ep, &recording_id, &user_kept, None).await {
+            Ok(()) => tracing::info!("[edit-watch] ✓ feedback submitted for {recording_id}"),
+            Err(e) => tracing::warn!("[edit-watch] feedback error for {recording_id}: {e}"),
+        }
+    }
+}
+
+/// Given what we pasted (`polished`), where the field was right after paste
+/// (`post_paste`), and the final field value (`last_val`), extract the user's
+/// edited version of our text.
+fn extract_kept(polished: &str, post_paste: &str, last_val: &str) -> String {
+    // Find where our polished text starts in the field.
+    let Some(offset) = post_paste.find(polished.trim()) else {
+        // Can't locate it precisely — return the full field value.
+        return last_val.to_string();
+    };
+
+    let prefix    = &post_paste[..offset];
+    let after_end = offset + polished.trim().len();
+    let suffix    = &post_paste[after_end..];
+
+    // In last_val, strip the same prefix and suffix to get the edited middle.
+    if let Some(lv_after_prefix) = last_val.strip_prefix(prefix) {
+        if let Some(edited) = lv_after_prefix.strip_suffix(suffix) {
+            return edited.trim().to_string();
+        }
+        // Suffix changed too — return everything after the prefix.
+        return lv_after_prefix.trim().to_string();
+    }
+
+    // Prefix changed — return full field value as a fallback.
+    last_val.to_string()
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+fn main() {
+    // 1. Load env vars from .env files
+    voice_polish_core::load_env();
+
+    // 2. Tracing
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
+    // 3. Shared state
+    let shared_app  = Arc::new(Mutex::new(DesktopApp::new()));
+    let backend_arc = Arc::new(Mutex::new(None::<BackendEndpoint>));
+
+    tauri::Builder::default()
+        .setup({
+            let shared   = Arc::clone(&shared_app);
+            let back_arc = Arc::clone(&backend_arc);
+            move |app| {
+                // ── Spawn backend daemon ──────────────────────────────────────
+                match backend::spawn() {
+                    Ok(handle) => {
+                        let ep = handle.endpoint();
+                        *back_arc.lock().unwrap() = Some(ep.clone());
+                        tracing::info!("[main] backend daemon ready");
+                        // Seed the tray cache with real prefs so the first tray
+                        // menu already shows the correct model checkmark.
+                        let app_h = app.handle().clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Ok(prefs) = api::get_preferences(&ep).await {
+                                if let Ok(mut cache) = app_h.state::<TrayCache>().0.lock() {
+                                    cache.selected_model = prefs.selected_model;
+                                    cache.custom_prompt  = prefs.custom_prompt;
+                                }
+                                // Re-render now that we have real data
+                                let shared = app_h.state::<SharedApp>();
+                                if let Ok(d) = shared.0.lock() {
+                                    let snap = d.snapshot();
+                                    drop(d);
+                                    sync_tray(&app_h, &snap);
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("[main] failed to spawn backend: {e}");
+                        // App continues without backend; commands return errors.
+                    }
+                }
+
+                // ── System tray ───────────────────────────────────────────────
+                // Build the initial menu from a fresh snapshot. It will be
+                // rebuilt by `sync_tray()` on every state change.
+                let initial_snap = shared.lock().ok().map(|d| d.snapshot());
+                // Initial menu uses defaults (model=smart, no custom prompt) —
+                // sync_tray() will refresh it with real prefs once the backend is ready.
+                let initial_menu = match &initial_snap {
+                    Some(snap) => build_tray_menu(app.handle(), snap, "smart", None)?,
+                    None => Menu::with_items(app, &[
+                        &MenuItem::with_id(app, "show", "Open Said", true, None::<&str>)?,
+                        &PredefinedMenuItem::separator(app)?,
+                        &MenuItem::with_id(app, "quit", "Quit Said", true, None::<&str>)?,
+                    ])?,
+                };
+
+                // Brand mark — embedded retina PNG, marked as template so
+                // macOS auto-tints to match menu bar appearance.
+                let tray_icon = tauri::image::Image::from_bytes(
+                    include_bytes!("../icons/tray@2x.png")
+                ).ok();
+
+                let mut tray_builder = TrayIconBuilder::with_id("said")
+                    .tooltip("Said — Voice Polish Studio")
+                    .menu(&initial_menu)
+                    .show_menu_on_left_click(true);   // ← left-click opens menu
+
+                if let Some(icon) = tray_icon {
+                    tray_builder = tray_builder.icon(icon).icon_as_template(true);
+                }
+
+                tray_builder
+                    .on_menu_event(|app, event| {
+                        let id = event.id.as_ref();
+                        match id {
+                            "tray_toggle" => tray_toggle_recording(app),
+                            "show" => {
+                                if let Some(w) = app.get_webview_window("main") {
+                                    let _ = w.show();
+                                    let _ = w.set_focus();
+                                }
+                            }
+                            "settings"  => tray_open_settings(app),
+                            "reconnect" => tray_reconnect_openai(app),
+                            "quit"      => app.exit(0),
+                            // Model switch — "smart" | "mini"
+                            _ if id.starts_with("tray_model_") => {
+                                let key = &id["tray_model_".len()..];
+                                tray_set_model(app, key);
+                            }
+                            // Polish my message — tone preset suffix
+                            _ if id.starts_with("tray_polish_") => {
+                                let tone = &id["tray_polish_".len()..];
+                                tray_polish_message(app, tone);
+                            }
+                            _ => {}
+                        }
+                    })
+                    .build(app)?;
+
+                // ── Close window → hide (keep running in menu bar) ────────────
+                if let Some(window) = app.get_webview_window("main") {
+                    let win = window.clone();
+                    window.on_window_event(move |event| {
+                        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                            api.prevent_close();
+                            let _ = win.hide();
+                        }
+                    });
+                }
+
+                // ── Caps Lock hold-to-record (macOS only) ─────────────────────
+                #[cfg(target_os = "macos")]
+                {
+                    let h_press   = app.handle().clone();
+                    let a_press   = Arc::clone(&shared);
+                    let h_release = app.handle().clone();
+                    let a_release = Arc::clone(&shared);
+                    let b_release = Arc::clone(&back_arc);
+
+                    hotkey::start_hold_listener(
+                        Arc::new(move || {
+                            let a = Arc::clone(&a_press);
+                            let h = h_press.clone();
+                            std::thread::spawn(move || do_start_recording(&a, &h));
+                        }),
+                        Arc::new(move || {
+                            let a = Arc::clone(&a_release);
+                            let h = h_release.clone();
+                            let b = Arc::clone(&b_release);
+                            std::thread::spawn(move || do_finish_recording(a, h, b));
+                        }),
+                    );
+                }
+
+                Ok(())
+            }
+        })
+        .manage(SharedApp(shared_app))
+        .manage(BackendState(backend_arc))
+        .manage(StreamingState(Mutex::new(None)))
+        .manage(TrayCache(Mutex::new(TrayCacheInner::default())))
+        .invoke_handler(tauri::generate_handler![
+            bootstrap,
+            get_snapshot,
+            get_backend_endpoint,
+            get_preferences,
+            patch_preferences,
+            get_history,
+            submit_edit_feedback,
+            toggle_recording,
+            set_mode,
+            request_accessibility,
+            request_input_monitoring,
+            diagnose_ax,
+            // Cloud auth
+            cloud_signup,
+            cloud_login,
+            cloud_logout,
+            get_cloud_status,
+            refresh_license,
+            // OpenAI OAuth
+            get_openai_status,
+            initiate_openai_oauth,
+            disconnect_openai,
+        ])
+        .build(tauri::generate_context!())
+        .expect("failed to build Voice Polish desktop")
+        .run(|_handle, event| {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                api.prevent_exit();
+            }
+        });
+}

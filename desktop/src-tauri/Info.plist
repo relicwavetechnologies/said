@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Said records your voice to transcribe and polish your text.</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Said uses Apple Events to paste text into other apps.</string>
+</dict>
+</plist>

@@ -1,0 +1,39 @@
+[package]
+name    = "polish-backend"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "polish_backend"
+path = "src/lib.rs"
+
+[[bin]]
+name = "polish-backend"
+path = "src/main.rs"
+
+[dependencies]
+axum               = { version = "0.7", features = ["multipart"] }
+async-stream       = "0.3"
+tokio              = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap               = { version = "4", features = ["derive"] }
+uuid               = { workspace = true }
+reqwest            = { workspace = true }
+
+# SQLite
+rusqlite    = { version = "0.31", features = ["bundled"] }
+r2d2        = "0.8"
+r2d2_sqlite = "0.24"
+
+# Async utilities
+futures     = "0.3"
+bytes       = "1"
+sha2        = "0.10"
+hex         = "0.4"
+tower-http  = { version = "0.5", features = ["cors"] }
+anyhow      = "1"
+
+voice-polish-core = { path = "../core" }

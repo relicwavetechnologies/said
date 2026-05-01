@@ -1,0 +1,14 @@
+[package]
+name    = "voice-polish-paster"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa           = "0.26"
+objc            = "0.2"
+core-graphics   = "0.24"
+core-foundation = "0.10"
+libc            = "0.2"
