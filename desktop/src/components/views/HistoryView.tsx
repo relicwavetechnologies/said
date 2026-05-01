@@ -1,19 +1,309 @@
-import React, { useMemo } from "react";
-import { Clock, Tag } from "lucide-react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import { Clock, Copy, Play, Pause, Trash2, Tag, MoreHorizontal, Check } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { groupHistory } from "@/types";
-import type { AppSnapshot } from "@/types";
+import type { Recording } from "@/types";
+import { deleteRecording, getRecordingAudioUrl, listHistory } from "@/lib/invoke";
 
-interface HistoryViewProps {
-  snapshot: AppSnapshot | null;
+// ── Audio player hook ─────────────────────────────────────────────────────────
+
+function useAudioPlayer() {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [playingId, setPlayingId] = useState<string | null>(null);
+
+  const play = useCallback(async (recordingId: string, audioId: string | null) => {
+    if (!audioId) return;
+
+    // Stop existing
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+    if (playingId === recordingId) {
+      setPlayingId(null);
+      return;
+    }
+
+    const ep = await getRecordingAudioUrl(recordingId);
+    if (!ep) return;
+
+    // Fetch audio bytes with bearer token → blob URL
+    try {
+      const res = await fetch(ep.url, {
+        headers: { Authorization: `Bearer ${ep.secret}` },
+      });
+      if (!res.ok) return;
+      const blob = await res.blob();
+      const url  = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audioRef.current = audio;
+      setPlayingId(recordingId);
+      audio.play();
+      audio.onended = () => {
+        setPlayingId(null);
+        URL.revokeObjectURL(url);
+      };
+    } catch {
+      setPlayingId(null);
+    }
+  }, [playingId]);
+
+  const stop = useCallback(() => {
+    audioRef.current?.pause();
+    audioRef.current = null;
+    setPlayingId(null);
+  }, []);
+
+  return { playingId, play, stop };
 }
 
-export function HistoryView({ snapshot }: HistoryViewProps) {
-  const history  = snapshot?.history ?? [];
-  const timeline = useMemo(() => groupHistory(history), [history]);
+// ── Context menu ──────────────────────────────────────────────────────────────
 
-  /* ── Empty state ──────────────────────────────────────────── */
-  if (history.length === 0) {
+interface MenuProps {
+  recording:   Recording;
+  playingId:   string | null;
+  onPlay:      () => void;
+  onCopy:      () => void;
+  onDelete:    () => void;
+  onClose:     () => void;
+  anchorRef:   React.RefObject<HTMLButtonElement | null>;
+}
+
+function RowMenu({ recording, playingId, onPlay, onCopy, onDelete, onClose, anchorRef }: MenuProps) {
+  const menuRef  = useRef<HTMLDivElement>(null);
+  const isPlaying = playingId === recording.id;
+  const hasAudio  = !!recording.audio_id;
+
+  // Close on outside click
+  useEffect(() => {
+    function handler(e: MouseEvent) {
+      if (
+        menuRef.current && !menuRef.current.contains(e.target as Node) &&
+        anchorRef.current && !anchorRef.current.contains(e.target as Node)
+      ) {
+        onClose();
+      }
+    }
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [onClose, anchorRef]);
+
+  const item = (
+    icon: React.ReactNode,
+    label: string,
+    action: () => void,
+    danger = false,
+    disabled = false,
+  ) => (
+    <button
+      onClick={() => { if (!disabled) { action(); onClose(); } }}
+      disabled={disabled}
+      className="w-full flex items-center gap-2.5 px-3 py-2 text-left text-[13px] rounded-lg transition-colors disabled:opacity-40"
+      style={{
+        color: danger ? "hsl(0 75% 62%)" : disabled ? "hsl(var(--muted-foreground))" : "hsl(var(--foreground))",
+      }}
+      onMouseEnter={(e) => {
+        if (!disabled) e.currentTarget.style.background = "hsl(var(--surface-4))";
+      }}
+      onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+    >
+      {icon}
+      {label}
+    </button>
+  );
+
+  return (
+    <div
+      ref={menuRef}
+      className="absolute right-0 top-8 z-50 rounded-xl shadow-xl border py-1.5 px-1.5 min-w-[180px]"
+      style={{
+        background: "hsl(var(--surface-1))",
+        borderColor: "hsl(var(--surface-3))",
+        boxShadow: "0 8px 32px rgba(0,0,0,0.4)",
+      }}
+    >
+      {item(
+        isPlaying ? <Pause size={13} /> : <Play size={13} />,
+        isPlaying ? "Pause" : "Play recording",
+        onPlay,
+        false,
+        !hasAudio,
+      )}
+      {item(<Copy size={13} />, "Copy text", onCopy)}
+      <div className="my-1 mx-1 border-t" style={{ borderColor: "hsl(var(--surface-3))" }} />
+      {item(<Trash2 size={13} />, "Delete", onDelete, true)}
+    </div>
+  );
+}
+
+// ── Single history row ────────────────────────────────────────────────────────
+
+interface RowProps {
+  recording:   Recording;
+  playingId:   string | null;
+  onPlay:      (r: Recording) => void;
+  onDelete:    (r: Recording) => void;
+}
+
+function HistoryRow({ recording, playingId, onPlay, onDelete }: RowProps) {
+  const [menuOpen, setMenuOpen]   = useState(false);
+  const [copied,   setCopied]     = useState(false);
+  const btnRef = useRef<HTMLButtonElement>(null);
+
+  const time = new Date(recording.timestamp_ms).toLocaleTimeString([], {
+    hour: "2-digit", minute: "2-digit",
+  });
+
+  const isPlaying = playingId === recording.id;
+
+  function handleCopy() {
+    navigator.clipboard.writeText(recording.polished ?? recording.transcript ?? "");
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1800);
+  }
+
+  return (
+    <div
+      className="relative flex gap-4 px-5 py-4 transition-colors group"
+      onMouseEnter={(e) => { e.currentTarget.style.background = "hsl(var(--surface-hover))"; }}
+      onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+    >
+      {/* Timestamp */}
+      <div className="w-20 flex-shrink-0 pt-0.5">
+        <div className="flex items-center gap-1 text-[11px] text-muted-foreground tabular-nums">
+          <Clock size={10} className="opacity-70" />
+          <span>{time}</span>
+        </div>
+      </div>
+
+      {/* Content */}
+      <div className="flex-1 min-w-0">
+        <p className="text-[14px] text-foreground leading-relaxed">
+          {recording.polished || (
+            <span className="italic text-muted-foreground">—</span>
+          )}
+        </p>
+        <div className="flex items-center gap-3 mt-2 flex-wrap">
+          {recording.word_count != null && (
+            <span className="text-[11px] text-muted-foreground tabular-nums">
+              {recording.word_count} words
+            </span>
+          )}
+          {recording.model_used && (
+            <span className="flex items-center gap-1 text-[11px] text-muted-foreground">
+              <Tag size={9} className="opacity-70" />
+              {recording.model_used}
+            </span>
+          )}
+          {isPlaying && (
+            <span className="text-[11px] flex items-center gap-1" style={{ color: "hsl(var(--chip-lime-fg))" }}>
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
+              Playing…
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Action buttons — visible on hover */}
+      <div className="flex-shrink-0 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+        {/* Quick copy */}
+        <button
+          onClick={handleCopy}
+          title="Copy text"
+          className="w-7 h-7 rounded-lg flex items-center justify-center transition-colors"
+          style={{ color: copied ? "hsl(var(--chip-lime-fg))" : "hsl(var(--muted-foreground))" }}
+          onMouseEnter={(e) => { e.currentTarget.style.background = "hsl(var(--surface-4))"; }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+        >
+          {copied ? <Check size={13} /> : <Copy size={13} />}
+        </button>
+
+        {/* Quick play — only when audio exists */}
+        {recording.audio_id && (
+          <button
+            onClick={() => onPlay(recording)}
+            title={isPlaying ? "Pause" : "Play"}
+            className="w-7 h-7 rounded-lg flex items-center justify-center transition-colors"
+            style={{ color: isPlaying ? "hsl(var(--chip-lime-fg))" : "hsl(var(--muted-foreground))" }}
+            onMouseEnter={(e) => { e.currentTarget.style.background = "hsl(var(--surface-4))"; }}
+            onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+          >
+            {isPlaying ? <Pause size={13} /> : <Play size={13} />}
+          </button>
+        )}
+
+        {/* More menu */}
+        <div className="relative">
+          <button
+            ref={btnRef}
+            onClick={() => setMenuOpen((o) => !o)}
+            title="More options"
+            className="w-7 h-7 rounded-lg flex items-center justify-center transition-colors"
+            style={{
+              color: menuOpen ? "hsl(var(--foreground))" : "hsl(var(--muted-foreground))",
+              background: menuOpen ? "hsl(var(--surface-4))" : "transparent",
+            }}
+            onMouseEnter={(e) => { e.currentTarget.style.background = "hsl(var(--surface-4))"; }}
+            onMouseLeave={(e) => {
+              if (!menuOpen) e.currentTarget.style.background = "transparent";
+            }}
+          >
+            <MoreHorizontal size={14} />
+          </button>
+
+          {menuOpen && (
+            <RowMenu
+              recording={recording}
+              playingId={playingId}
+              onPlay={() => onPlay(recording)}
+              onCopy={handleCopy}
+              onDelete={() => onDelete(recording)}
+              onClose={() => setMenuOpen(false)}
+              anchorRef={btnRef}
+            />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Main view ─────────────────────────────────────────────────────────────────
+
+export function HistoryView() {
+  const [recordings, setRecordings] = useState<Recording[]>([]);
+  const { playingId, play, stop }   = useAudioPlayer();
+
+  useEffect(() => {
+    listHistory(200).then(setRecordings);
+  }, []);
+
+  async function handleDelete(rec: Recording) {
+    stop();
+    await deleteRecording(rec.id);
+    setRecordings((prev) => prev.filter((r) => r.id !== rec.id));
+  }
+
+  function handlePlay(rec: Recording) {
+    play(rec.id, rec.audio_id);
+  }
+
+  const items = recordings.map((r) => ({
+    timestamp_ms:      r.timestamp_ms,
+    polished:          r.polished,
+    word_count:        r.word_count,
+    recording_seconds: r.recording_seconds,
+    model:             r.model_used,
+    transcribe_ms:     r.transcribe_ms ?? 0,
+    embed_ms:          r.embed_ms ?? 0,
+    polish_ms:         r.polish_ms ?? 0,
+  }));
+  const timeline = groupHistory(items);
+
+  // Map group index back to recordings for easy lookup
+  const recByTs = new Map(recordings.map((r) => [r.timestamp_ms, r]));
+
+  if (recordings.length === 0) {
     return (
       <div className="h-full flex items-center justify-center">
         <div className="text-center px-8">
@@ -35,22 +325,16 @@ export function HistoryView({ snapshot }: HistoryViewProps) {
   return (
     <ScrollArea className="h-full">
       <div className="p-7 pb-12 max-w-3xl mx-auto">
-
-        {/* ── Header ──────────────────────────────────── */}
         <div className="mb-7">
-          <h1 className="text-[28px] font-bold tracking-tight text-foreground leading-tight">
-            History
-          </h1>
+          <h1 className="text-[28px] font-bold tracking-tight text-foreground leading-tight">History</h1>
           <p className="text-[13px] text-muted-foreground mt-1 tabular-nums">
-            {history.length} total recording{history.length !== 1 ? "s" : ""}
+            {recordings.length} recording{recordings.length !== 1 ? "s" : ""} · kept for 1 day
           </p>
         </div>
 
-        {/* ── Timeline groups ──────────────────────────── */}
         <div className="space-y-7">
           {timeline.map((group) => (
             <div key={group.label}>
-              {/* Date label */}
               <div className="flex items-center justify-between mb-3 px-1">
                 <span className="section-label">{group.label}</span>
                 <span className="text-[10px] text-muted-foreground tabular-nums">
@@ -58,53 +342,24 @@ export function HistoryView({ snapshot }: HistoryViewProps) {
                 </span>
               </div>
 
-              {/* Card list */}
               <div className="tile overflow-hidden">
-                {group.items.map((item, idx) => (
-                  <div
-                    key={idx}
-                    className="flex gap-4 px-5 py-4 transition-colors"
-                    onMouseEnter={(e) => { e.currentTarget.style.background = "hsl(var(--surface-hover))"; }}
-                    onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
-                  >
-                    {/* Timestamp */}
-                    <div className="w-20 flex-shrink-0 pt-0.5">
-                      <div className="flex items-center gap-1 text-[11px] text-muted-foreground tabular-nums">
-                        <Clock size={10} className="opacity-70" />
-                        <span>{item.time}</span>
-                      </div>
-                    </div>
-
-                    {/* Content */}
-                    <div className="flex-1 min-w-0">
-                      <p className="text-[14px] text-foreground leading-relaxed">
-                        {item.text || (
-                          <span className="italic text-muted-foreground">—</span>
-                        )}
-                      </p>
-
-                      {/* Meta row */}
-                      <div className="flex items-center gap-3 mt-2 flex-wrap">
-                        {item.word_count != null && (
-                          <span className="text-[11px] text-muted-foreground tabular-nums">
-                            {item.word_count} words
-                          </span>
-                        )}
-                        {item.model && (
-                          <span className="flex items-center gap-1 text-[11px] text-muted-foreground">
-                            <Tag size={9} className="opacity-70" />
-                            {item.model}
-                          </span>
-                        )}
-                      </div>
-                    </div>
-
-                    {/* Right badge */}
-                    <div className="flex-shrink-0 flex items-start pt-0.5">
-                      <span className="badge-done">Polished</span>
-                    </div>
-                  </div>
-                ))}
+                {group.items.map((item, idx) => {
+                  const rec = recByTs.get(item.timestamp_ms);
+                  if (!rec) return null;
+                  return (
+                    <React.Fragment key={rec.id}>
+                      {idx > 0 && (
+                        <div className="mx-5 border-t" style={{ borderColor: "hsl(var(--surface-3))" }} />
+                      )}
+                      <HistoryRow
+                        recording={rec}
+                        playingId={playingId}
+                        onPlay={handlePlay}
+                        onDelete={handleDelete}
+                      />
+                    </React.Fragment>
+                  );
+                })}
               </div>
             </div>
           ))}

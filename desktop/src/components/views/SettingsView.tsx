@@ -11,8 +11,8 @@ import {
   cloudLogin, cloudLogout, cloudSignup, getCloudStatus,
   getPreferences, patchPreferences, diagnoseAx,
   getOpenAIStatus, initiateOpenAIOAuth, disconnectOpenAI,
-  requestNotifications,
-  type AxDiagnostics,
+  requestNotifications, checkNotificationPermission, isTauriRuntime,
+  type AxDiagnostics, type NotifPermission,
 } from "@/lib/invoke";
 
 // ── Tone presets ──────────────────────────────────────────────────────────────
@@ -92,9 +92,10 @@ export function SettingsView({ snapshot, onAccessibility, onInputMonitoring }: S
   const axGranted  = snapshot?.accessibility_granted    ?? false;
   const imGranted  = snapshot?.input_monitoring_granted ?? false;
 
-  // null = not yet asked this session; true/false = result of last request attempt
-  const [notifGranted, setNotifGranted] = useState<boolean | null>(null);
-  const [notifBusy,    setNotifBusy]    = useState(false);
+  const [notifPerm,      setNotifPerm]      = useState<NotifPermission>("unknown");
+  const [notifBusy,      setNotifBusy]      = useState(false);
+  const [notifTestLog,   setNotifTestLog]   = useState<string>("");
+  const [notifCountdown, setNotifCountdown] = useState(0);
   const axSupported = snapshot?.auto_paste_supported    ?? false;
 
   // ── Prefs state ─────────────────────────────────────────────────────────────
@@ -146,6 +147,60 @@ export function SettingsView({ snapshot, onAccessibility, onInputMonitoring }: S
     const report = await diagnoseAx(0);
     setAxReport(report);
     setAxBusy(false);
+  }
+
+  useEffect(() => {
+    checkNotificationPermission().then(setNotifPerm);
+  }, []);
+
+  async function handleNotifTest() {
+    setNotifBusy(true);
+    setNotifTestLog("Checking permission…");
+
+    const current = await checkNotificationPermission();
+    setNotifTestLog(`Current permission: ${current}`);
+
+    if (current !== "granted") {
+      setNotifTestLog(`Permission is "${current}" — requesting…`);
+      const result = await requestNotifications();
+      setNotifPerm(result);
+      setNotifTestLog(`After request: ${result}`);
+
+      if (result !== "granted") {
+        const hint = result === "denied"
+          ? "Denied — open System Settings → Notifications → Said and enable it there."
+          : `Unexpected state: ${result}`;
+        setNotifTestLog(`${result === "denied" ? "❌" : "⚠️"} ${hint}`);
+        setNotifBusy(false);
+        return;
+      }
+    } else {
+      setNotifPerm("granted");
+    }
+
+    // macOS suppresses notifications from the frontmost app.
+    // Give the user 3 seconds to switch to another app, then fire.
+    setNotifTestLog("✅ Permission granted — switching focus, fire in 3s…\n(switch to any other app now!)");
+    for (let s = 3; s > 0; s--) {
+      setNotifCountdown(s);
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    setNotifCountdown(0);
+
+    setNotifTestLog("🔔 Firing notification now…");
+    try {
+      if (isTauriRuntime()) {
+        const { sendNotification } = await import("@tauri-apps/plugin-notification");
+        await sendNotification({
+          title: "Said — Test ✓",
+          body: "It works! Notifications are set up correctly.",
+        });
+      }
+      setNotifTestLog("✅ sendNotification() called — check your notification banner or Notification Center.");
+    } catch (err) {
+      setNotifTestLog(`❌ sendNotification threw: ${String(err)}`);
+    }
+    setNotifBusy(false);
   }
 
   useEffect(() => {
@@ -533,10 +588,10 @@ export function SettingsView({ snapshot, onAccessibility, onInputMonitoring }: S
               <div
                 className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0"
                 style={{
-                  background: notifGranted === true
+                  background: notifPerm === "granted"
                     ? "hsl(var(--chip-lime-bg))"
                     : "hsl(var(--surface-4))",
-                  color: notifGranted === true
+                  color: notifPerm === "granted"
                     ? "hsl(var(--chip-lime-fg))"
                     : "hsl(var(--muted-foreground))",
                 }}
@@ -546,16 +601,16 @@ export function SettingsView({ snapshot, onAccessibility, onInputMonitoring }: S
               <div className="flex-1 min-w-0">
                 <p className="text-[13px] font-medium text-foreground">Notifications</p>
                 <p className="text-[12px] text-muted-foreground mt-0.5 leading-relaxed">
-                  {notifGranted === true
+                  {notifPerm === "granted"
                     ? "Granted — Said will notify you when a learning edit is ready to review."
-                    : notifGranted === false
+                    : notifPerm === "denied"
                     ? "Denied — open System Settings → Notifications → Said to enable."
                     : "Said asks once to send learning-edit notifications."}
                 </p>
               </div>
               <div className="flex-shrink-0 ml-4">
                 {axSupported ? (
-                  notifGranted === true ? (
+                  notifPerm === "granted" ? (
                     <span
                       className="text-[12px] font-semibold px-3 py-1.5 rounded-lg flex items-center gap-1"
                       style={{ background: "hsl(var(--chip-lime-bg))", color: "hsl(var(--chip-lime-fg))" }}
@@ -565,17 +620,12 @@ export function SettingsView({ snapshot, onAccessibility, onInputMonitoring }: S
                   ) : (
                     <button
                       disabled={notifBusy}
-                      onClick={async () => {
-                        setNotifBusy(true);
-                        const ok = await requestNotifications();
-                        setNotifGranted(ok);
-                        setNotifBusy(false);
-                      }}
+                      onClick={handleNotifTest}
                       className="text-[12px] font-semibold px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1.5 disabled:opacity-50"
                       style={{ background: "hsl(var(--primary))", color: "hsl(var(--primary-foreground))" }}
                     >
                       {notifBusy && <Loader2 size={11} className="animate-spin" />}
-                      {notifGranted === false ? "Open Settings" : "Allow"}
+                      {notifPerm === "denied" ? "Open Settings" : "Allow"}
                     </button>
                   )
                 ) : (
@@ -1084,6 +1134,71 @@ export function SettingsView({ snapshot, onAccessibility, onInputMonitoring }: S
             </div>
           )}
         </Section>
+
+        {/* ── Notification test (temp debug) ───────────── */}
+        <div className="mb-7">
+          <p className="section-label px-1 mb-2.5">Notification Debug</p>
+          <div className="tile p-5 space-y-3">
+            <div className="flex items-center gap-3">
+              <div
+                className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 text-muted-foreground"
+                style={{ background: "hsl(var(--surface-4))" }}
+              >
+                <Bell size={16} />
+              </div>
+              <div className="flex-1">
+                <p className="text-[13px] font-medium text-foreground">Test Notifications</p>
+                <p className="text-[12px] text-muted-foreground">
+                  Current permission:{" "}
+                  <span
+                    className="font-semibold"
+                    style={{
+                      color: notifPerm === "granted"
+                        ? "hsl(var(--chip-lime-fg))"
+                        : notifPerm === "denied"
+                        ? "hsl(0 75% 65%)"
+                        : "hsl(var(--muted-foreground))",
+                    }}
+                  >
+                    {notifPerm}
+                  </span>
+                </p>
+              </div>
+              <button
+                disabled={notifBusy}
+                onClick={handleNotifTest}
+                className="text-[12px] font-semibold px-4 py-2 rounded-lg transition-colors flex items-center gap-1.5 disabled:opacity-50"
+                style={{ background: "hsl(var(--primary))", color: "hsl(var(--primary-foreground))" }}
+              >
+                {notifCountdown > 0
+                  ? <>{notifCountdown}s — switch apps!</>
+                  : notifBusy
+                  ? <><Loader2 size={12} className="animate-spin" /> Working…</>
+                  : <><Bell size={12} /> Send Test</>
+                }
+              </button>
+            </div>
+
+            {notifTestLog && (
+              <div
+                className="rounded-lg px-3 py-2.5 font-mono text-[11px] leading-relaxed whitespace-pre-wrap"
+                style={{ background: "hsl(var(--surface-4))", color: "hsl(var(--foreground))" }}
+              >
+                {notifTestLog}
+              </div>
+            )}
+
+            {notifPerm === "denied" && (
+              <p
+                className="text-[11px] leading-relaxed rounded-lg px-3 py-2.5"
+                style={{ background: "hsl(38 80% 12%)", color: "hsl(38 90% 70%)" }}
+              >
+                macOS only shows the permission dialog once. Since it was denied, you must enable it manually:{" "}
+                <strong>System Settings → Notifications → Said → Allow Notifications</strong>
+              </p>
+            )}
+          </div>
+        </div>
 
         {/* ── About ────────────────────────────────────── */}
         <Section title="About">

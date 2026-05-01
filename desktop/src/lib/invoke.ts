@@ -292,6 +292,26 @@ export async function requestInputMonitoring(): Promise<void> {
   }
 }
 
+/** Delete a recording (SQLite row + WAV file). */
+export async function deleteRecording(id: string): Promise<void> {
+  if (!isTauriRuntime()) return;
+  await tauriInvoke("delete_recording", { id });
+}
+
+/** Return { url, secret } to fetch a recording's WAV audio with Authorization header. */
+export async function getRecordingAudioUrl(
+  id: string
+): Promise<{ url: string; secret: string } | null> {
+  if (!isTauriRuntime()) return null;
+  try {
+    return await tauriInvoke<{ url: string; secret: string }>(
+      "get_recording_audio_url", { id }
+    );
+  } catch {
+    return null;
+  }
+}
+
 /** Submit edit feedback so the backend can learn from user corrections. */
 export async function submitEditFeedback(
   recordingId: string,
@@ -470,13 +490,56 @@ export async function disconnectOpenAI(): Promise<void> {
 
 // ── Notification permission ───────────────────────────────────────────────────
 
-/** Request macOS notification permission. Returns true if the system accepted it. */
-export async function requestNotifications(): Promise<boolean> {
-  if (!isTauriRuntime()) return false;
+// isPermissionGranted() returns a PermissionState string: "granted" | "denied" | "prompt"
+// requestPermission()   returns a PermissionState string — does NOT re-prompt if already "denied"
+
+export type NotifPermission = "granted" | "denied" | "prompt" | "unknown";
+
+/** Check the current macOS notification permission state without prompting. */
+export async function checkNotificationPermission(): Promise<NotifPermission> {
+  if (!isTauriRuntime()) return "unknown";
   try {
-    return await tauriInvoke<boolean>("request_notifications");
+    const { isPermissionGranted } = await import("@tauri-apps/plugin-notification");
+    const state = await isPermissionGranted();
+    // The plugin returns a PermissionState string
+    return (state as NotifPermission) ?? "unknown";
   } catch {
-    return false;
+    return "unknown";
+  }
+}
+
+/** Request macOS notification permission.
+ *  Returns the resulting PermissionState string.
+ *  NOTE: if already "denied", macOS will NOT re-prompt — user must enable in System Settings. */
+export async function requestNotifications(): Promise<NotifPermission> {
+  if (!isTauriRuntime()) return "unknown";
+  try {
+    const { isPermissionGranted, requestPermission } = await import(
+      "@tauri-apps/plugin-notification"
+    );
+    const current = await isPermissionGranted();
+    if (current === "granted") return "granted";
+    // Will show the system dialog if state is "prompt"; silently returns "denied" if already denied
+    const result = await requestPermission();
+    return (result as NotifPermission) ?? "denied";
+  } catch {
+    return "unknown";
+  }
+}
+
+/** Send a native notification. Silently no-ops if permission is not granted. */
+export async function sendNotification(title: string, body: string): Promise<void> {
+  if (!isTauriRuntime()) return;
+  try {
+    const { isPermissionGranted, sendNotification: pluginSend } = await import(
+      "@tauri-apps/plugin-notification"
+    );
+    const state = await isPermissionGranted();
+    if (state === "granted") {
+      await pluginSend({ title, body });
+    }
+  } catch {
+    // silently ignore
   }
 }
 

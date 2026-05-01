@@ -28,6 +28,7 @@ use crate::{
         prompt::{build_system_prompt, build_tray_system_prompt, build_user_message},
     },
     store::{
+        corrections,
         history::{insert_recording, InsertRecording},
         openai_oauth,
         prefs::get_prefs,
@@ -98,13 +99,22 @@ pub async fn polish(
         };
         let examples_used = rag_examples.len();
 
-        // 2. Build prompt
+        // 2. Load word corrections + build prompt
+        let word_corrections = if tone_override.is_none() {
+            corrections::load_all(&pool, &user_id)
+        } else {
+            vec![]
+        };
+        if !word_corrections.is_empty() {
+            info!("[text] {} word correction(s) loaded", word_corrections.len());
+        }
+
         // tone_override → use tray-specific English-locked prompt (no RAG, no persona)
-        // Otherwise → use full RACC prompt with user prefs + RAG examples
+        // Otherwise → use full RACC prompt with user prefs + RAG examples + corrections
         let system_prompt = if let Some(ref tone) = tone_override {
             build_tray_system_prompt(tone)
         } else {
-            build_system_prompt(&prefs, &rag_examples)
+            build_system_prompt(&prefs, &rag_examples, &word_corrections)
         };
         let user_message  = build_user_message(&transcript);
 
@@ -205,6 +215,7 @@ pub async fn polish(
                     polish_ms:     Some(p_ms),
                     target_app:    ta2.as_deref(),
                     source:        "text",
+                    audio_id:      None,
                 });
             });
         }

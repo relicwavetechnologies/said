@@ -86,6 +86,7 @@ pub struct Recording {
     pub target_app:        Option<String>,
     pub edit_count:        i64,
     pub source:            String,
+    pub audio_id:          Option<String>,
 }
 
 /// Result of a completed polish operation (from the `done` SSE event).
@@ -689,4 +690,27 @@ pub async fn resolve_pending_edit(
     } else {
         Err(format!("resolve error: {status}"))
     }
+}
+
+/// Hard-delete a single recording (SQLite row + WAV file).
+pub async fn delete_recording(ep: &BackendEndpoint, id: &str) -> Result<(), String> {
+    let url    = format!("{}/v1/recordings/{id}", ep.url);
+    let status = Client::new()
+        .delete(&url)
+        .header("Authorization", ep.bearer())
+        .send()
+        .await
+        .map_err(|e| format!("delete recording failed: {e}"))?
+        .status();
+    if status.is_success() || status.as_u16() == 204 {
+        Ok(())
+    } else {
+        Err(format!("delete error: {status}"))
+    }
+}
+
+/// Return the full URL (with inline bearer token) to stream a recording's WAV.
+/// Used by the frontend to construct an <audio> src via fetch+blob.
+pub fn recording_audio_url(ep: &BackendEndpoint, id: &str) -> String {
+    format!("{}/v1/recordings/{id}/audio", ep.url)
 }

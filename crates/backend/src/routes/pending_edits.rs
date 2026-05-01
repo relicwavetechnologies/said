@@ -12,8 +12,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use reqwest::Client;
+
 use crate::{
-    store::{history, pending_edits, vectors},
+    embedder::gemini,
+    store::{corrections, history, pending_edits, prefs::get_prefs, vectors},
     AppState,
 };
 
@@ -92,7 +95,37 @@ pub async fn resolve(
                         None,
                     );
                     history::apply_edit_feedback(&state.pool, rec_id, &pe.user_kept);
+
+                    // Extract and store word-level corrections
+                    let diffs = corrections::extract_diffs(&pe.ai_output, &pe.user_kept);
+                    if !diffs.is_empty() {
+                        corrections::upsert(&state.pool, &state.default_user_id, &diffs);
+                        info!("[pending-edits] stored {} word correction(s)", diffs.len());
+                    }
+
                     info!("[pending-edits] approved {id} → edit_event {:?}", event_id);
+
+                    // Fire-and-forget: embed transcript → upsert preference_vector
+                    if let Some(ref eid) = event_id {
+                        let pool2       = state.pool.clone();
+                        let user_id2    = state.default_user_id.clone();
+                        let event_id2   = eid.clone();
+                        let transcript2 = rec.transcript.clone();
+                        let gemini_key  = get_prefs(&state.pool, &state.default_user_id)
+                            .and_then(|p| p.gemini_api_key)
+                            .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+                            .unwrap_or_default();
+                        tokio::spawn(async move {
+                            let http = Client::new();
+                            match gemini::embed(&http, &pool2, &transcript2, &gemini_key).await {
+                                None => warn!("[pending-edits] embedding skipped for {event_id2}"),
+                                Some(emb) => {
+                                    vectors::upsert_vector(&pool2, &user_id2, &event_id2, &emb);
+                                    info!("[pending-edits] vector stored for {event_id2}");
+                                }
+                            }
+                        });
+                    }
                 } else {
                     warn!("[pending-edits] recording {rec_id} not found for approval of {id}");
                 }

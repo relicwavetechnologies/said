@@ -52,7 +52,7 @@ pub async fn stream_to_deepgram(
          &endpointing=300"
     );
 
-    info!("[dg_stream] connecting (lang={lang}, 16kHz), key_len={}", deepgram_key.len());
+    debug!("[dg_stream] connecting (lang={lang}, 16kHz), key_len={}", deepgram_key.len());
 
     let mut req = match url_str.into_client_request() {
         Ok(r)  => r,
@@ -82,7 +82,7 @@ pub async fn stream_to_deepgram(
         Ok(Ok(pair)) => pair,
     };
 
-    info!("[dg_stream] connected to Deepgram WS");
+    debug!("[dg_stream] connected to Deepgram WS");
 
     let (mut ws_tx, mut ws_rx) = ws.split();
 
@@ -132,7 +132,7 @@ pub async fn stream_to_deepgram(
                     }
                     None => {
                         // Audio channel closed → recording stopped
-                        info!("[dg_stream] audio ended ({chunks_sent} chunks sent) — sending CloseStream");
+                        debug!("[dg_stream] audio ended ({chunks_sent} chunks sent) — sending CloseStream");
                         let close = r#"{"type":"CloseStream"}"#;
                         if let Err(e) = ws_tx.send(Message::Text(close.into())).await {
                             warn!("[dg_stream] CloseStream send failed: {e}");
@@ -170,7 +170,7 @@ pub async fn stream_to_deepgram(
                             }
                         }
                         if let Some(fragment) = parse_speech_final(&text) {
-                            info!("[dg_stream] speech_final captured: {fragment:?}");
+                            debug!("[dg_stream] speech_final captured: {fragment:?}");
                             transcript_parts.push(fragment);
                         }
                     }
@@ -207,12 +207,12 @@ pub async fn stream_to_deepgram(
     // Scale by chunks sent: burst audio (all chunks arrive at once after TLS delay) needs
     // proportionally more time.  Formula: 12 ms/chunk, minimum 2500 ms.
     let drain_ms = (chunks_sent as u64 * 12).max(2500);
-    info!("[dg_stream] drain window: {drain_ms}ms for {chunks_sent} chunks");
+    debug!("[dg_stream] drain window: {drain_ms}ms for {chunks_sent} chunks");
     let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(drain_ms);
     loop {
         let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            info!("[dg_stream] drain timeout reached");
+            debug!("[dg_stream] drain timeout reached");
             break;
         }
 
@@ -226,31 +226,31 @@ pub async fn stream_to_deepgram(
                         let sp_f = v["speech_final"].as_bool().unwrap_or(false);
                         let t    = v["channel"]["alternatives"][0]["transcript"]
                             .as_str().unwrap_or("");
-                        info!("[dg_stream] drain Results is_final={is_f} speech_final={sp_f} transcript={t:?}");
+                        debug!("[dg_stream] drain Results is_final={is_f} speech_final={sp_f} transcript={t:?}");
                     } else {
                         debug!("[dg_stream] drain msg type={msg_type}");
                     }
                 }
                 if let Some(fragment) = parse_speech_final_or_final(&text) {
-                    info!("[dg_stream] drain captured: {fragment:?}");
+                    debug!("[dg_stream] drain captured: {fragment:?}");
                     transcript_parts.push(fragment);
                 }
                 if is_utterance_end(&text) {
-                    info!("[dg_stream] UtteranceEnd received — done");
+                    debug!("[dg_stream] UtteranceEnd received — done");
                     break;
                 }
             }
             Ok(Some(Ok(Message::Close(frame)))) => {
-                info!("[dg_stream] WS closed by server during drain: {:?}", frame);
+                debug!("[dg_stream] WS closed by server during drain: {:?}", frame);
                 break;
             }
             Ok(None) => {
-                info!("[dg_stream] WS stream ended during drain");
+                debug!("[dg_stream] WS stream ended during drain");
                 break;
             }
             Ok(Some(Err(e))) => { warn!("[dg_stream] drain WS error: {e}"); break; }
             Ok(Some(Ok(_))) => {} // ping/pong/binary — ignore
-            Err(_) => { info!("[dg_stream] drain timed out"); break; }
+            Err(_) => { debug!("[dg_stream] drain timed out"); break; }
         }
     }
 
@@ -269,7 +269,7 @@ pub async fn stream_to_deepgram(
               transcript_parts.len());
         None
     } else {
-        info!("[dg_stream] final transcript: {full:?}");
+        debug!("[dg_stream] final transcript: {full:?}");
         Some(full)
     }
 }

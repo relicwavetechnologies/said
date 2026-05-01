@@ -20,6 +20,7 @@ import {
   onPendingEditsChanged,
   getPendingEdits,
   resolvePendingEdit,
+  sendNotification,
   cloudLogin,
   cloudSignup,
   getCloudStatus,
@@ -231,8 +232,20 @@ export default function App() {
       });
     });
 
-    // Pending edits changed → refresh list
-    const refreshPending = () => getPendingEdits().then((r) => setPendingEdits(r.edits));
+    // Pending edits changed → refresh list + send native notification
+    const refreshPending = async () => {
+      const r = await getPendingEdits();
+      setPendingEdits(r.edits);
+      if (r.edits.length > 0) {
+        const edit = r.edits[0];
+        const ai   = edit.ai_output.length > 50 ? edit.ai_output.slice(0, 50) + "…" : edit.ai_output;
+        const kept = edit.user_kept.length  > 50 ? edit.user_kept.slice(0, 50)  + "…" : edit.user_kept;
+        sendNotification(
+          "Said noticed an edit — tap to review",
+          `"${ai}"  →  "${kept}"`
+        );
+      }
+    };
     refreshPending();
     const unsubPending = onPendingEditsChanged(refreshPending);
 
@@ -537,7 +550,7 @@ export default function App() {
                 }}
               />
             )}
-            {activeView === "history"  && <HistoryView  snapshot={snapshotWithHistory} />}
+            {activeView === "history"  && <HistoryView />}
             {activeView === "insights" && <InsightsView snapshot={snapshotWithHistory} />}
             {activeView === "settings" && (
               <SettingsView

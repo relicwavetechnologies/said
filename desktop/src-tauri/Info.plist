@@ -6,5 +6,9 @@
   <string>Said records your voice to transcribe and polish your text.</string>
   <key>NSAppleEventsUsageDescription</key>
   <string>Said uses Apple Events to paste text into other apps.</string>
+  <!-- Alert style: without this key macOS delivers notifications silently
+       (Notification Center only, no banner). "alert" = persistent banner. -->
+  <key>NSUserNotificationAlertStyle</key>
+  <string>alert</string>
 </dict>
 </plist>

@@ -2,8 +2,9 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 use std::path::PathBuf;
-use tracing::info;
+use tracing::{info, warn};
 
+pub mod corrections;
 pub mod history;
 pub mod openai_oauth;
 pub mod pending_edits;
@@ -20,6 +21,8 @@ const MIGRATION_004: &str = include_str!("migrations/004_api_keys.sql");
 const MIGRATION_005: &str = include_str!("migrations/005_llm_provider.sql");
 const MIGRATION_006: &str = include_str!("migrations/006_openai_oauth.sql");
 const MIGRATION_007: &str = include_str!("migrations/007_pending_edits.sql");
+const MIGRATION_008: &str = include_str!("migrations/008_recording_audio_id.sql");
+const MIGRATION_009: &str = include_str!("migrations/009_word_corrections.sql");
 
 /// Open (or create) the SQLite database at `path`, run pending migrations,
 /// and return a connection pool.
@@ -46,6 +49,8 @@ pub fn open(path: &PathBuf) -> DbPool {
         .expect("failed to create SQLite connection pool");
 
     run_migrations(&pool);
+    purge_garbage_edits(&pool);
+    corrections::backfill_from_edit_events(&pool);
     pool
 }
 
@@ -112,6 +117,22 @@ fn run_migrations(pool: &DbPool) {
         conn.execute_batch("PRAGMA user_version = 7")
             .expect("failed to set user_version to 7");
     }
+
+    if version < 8 {
+        info!("running migration 008_recording_audio_id");
+        conn.execute_batch(MIGRATION_008)
+            .expect("migration 008 failed");
+        conn.execute_batch("PRAGMA user_version = 8")
+            .expect("failed to set user_version to 8");
+    }
+
+    if version < 9 {
+        info!("running migration 009_word_corrections");
+        conn.execute_batch(MIGRATION_009)
+            .expect("migration 009 failed");
+        conn.execute_batch("PRAGMA user_version = 9")
+            .expect("failed to set user_version to 9");
+    }
 }
 
 /// Return the default database path: ~/Library/Application Support/VoicePolish/db.sqlite
@@ -170,4 +191,64 @@ pub fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+/// Remove edit_events (and their linked preference_vectors) where user_kept
+/// has no meaningful word overlap with ai_output — i.e. the watcher captured
+/// a UI placeholder (e.g. Slack's "Type / for commands") instead of the real edit.
+/// Runs once at startup so stale garbage never poisons future RAG retrievals.
+fn purge_garbage_edits(pool: &DbPool) {
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(e) => { warn!("[purge] pool error: {e}"); return; }
+    };
+
+    // Load all edit_events for inspection
+    let rows: Vec<(String, String, String)> = {
+        let mut stmt = match conn.prepare(
+            "SELECT id, ai_output, user_kept FROM edit_events"
+        ) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })
+        .ok()
+        .map(|it| it.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    };
+
+    let mut deleted = 0usize;
+    for (id, ai_output, user_kept) in &rows {
+        if !has_word_overlap(user_kept, ai_output) {
+            // Delete from preference_vectors first (JOIN dependency)
+            let _ = conn.execute(
+                "DELETE FROM preference_vectors WHERE edit_event_id = ?1",
+                params![id],
+            );
+            if let Ok(n) = conn.execute(
+                "DELETE FROM edit_events WHERE id = ?1",
+                params![id],
+            ) {
+                if n > 0 { deleted += 1; }
+            }
+        }
+    }
+
+    if deleted > 0 {
+        info!("[purge] removed {deleted} garbage edit_event(s) with no word overlap");
+    }
+}
+
+/// True if any word >3 chars from `a` appears (case-insensitive) in `b`.
+fn has_word_overlap(a: &str, b: &str) -> bool {
+    let b_words: std::collections::HashSet<String> = b
+        .split_whitespace()
+        .filter(|w| w.chars().count() > 3)
+        .map(|w| w.to_lowercase())
+        .collect();
+    if b_words.is_empty() { return !a.trim().is_empty(); }
+    a.split_whitespace()
+        .any(|w| b_words.contains(&w.to_lowercase()))
 }

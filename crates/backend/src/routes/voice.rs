@@ -74,6 +74,7 @@ use crate::{
     llm::{gateway, gemini_direct, openai_codex, prompt::{build_system_prompt, build_user_message}},
     stt::deepgram,
     store::{
+        corrections,
         history::{insert_recording, InsertRecording},
         openai_oauth,
         prefs::get_prefs,
@@ -130,8 +131,8 @@ pub async fn polish(
                 return;
             }
         };
-        info!(
-            "[voice] prefs loaded: output_language={:?} tone={:?} model={:?}",
+        debug!(
+            "[voice] prefs: lang={:?} tone={:?} model={:?}",
             prefs.output_language, prefs.tone_preset, prefs.selected_model
         );
 
@@ -205,18 +206,27 @@ pub async fn polish(
         let rag_examples = match &embedding {
             Some(emb) => {
                 let hits = retrieve_similar(&pool, &user_id, emb, 5, 0.65);
-                debug!("[voice] RAG: {} examples retrieved", hits.len());
+                info!("[rag] {} example(s) retrieved for transcript", hits.len());
+                for (i, ex) in hits.iter().enumerate() {
+                    info!("[rag] example {}: ai={:?}  kept={:?}", i + 1, ex.ai_output, ex.user_kept);
+                }
                 hits
             }
             None => {
-                debug!("[voice] RAG skipped (no embedding)");
+                info!("[rag] skipped — embedding unavailable");
                 vec![]
             }
         };
         let examples_used = rag_examples.len();
 
-        // 5. Build full system prompt (with RAG examples injected)
-        let system_prompt = build_system_prompt(&prefs, &rag_examples);
+        // 4b. Load deterministic word corrections
+        let word_corrections = corrections::load_all(&pool, &user_id);
+        if !word_corrections.is_empty() {
+            info!("[voice] {} word correction(s) loaded", word_corrections.len());
+        }
+
+        // 5. Build full system prompt (with RAG examples + word corrections)
+        let system_prompt = build_system_prompt(&prefs, &rag_examples, &word_corrections);
 
         // 6. Stream LLM tokens — dispatch to openai_codex / gemini_direct / gateway
         let llm_provider  = prefs.llm_provider.clone();
@@ -290,17 +300,18 @@ pub async fn polish(
 
         // 7. Persist recording (fire-and-forget)
         {
-            let pool2  = pool.clone();
-            let id2    = recording_id.clone();
-            let uid2   = user_id.clone();
-            let t2     = stt_transcript.clone();
-            let p2     = llm_result.polished.clone();
-            let ta2    = target_app.clone();
-            let model2 = model.clone();
-            let conf   = stt_confidence;
-            let t_ms   = transcribe_ms;
-            let e_ms   = embed_ms;
-            let p_ms   = llm_result.polish_ms as i64;
+            let pool2   = pool.clone();
+            let id2     = recording_id.clone();
+            let uid2    = user_id.clone();
+            let t2      = stt_transcript.clone();
+            let p2      = llm_result.polished.clone();
+            let ta2     = target_app.clone();
+            let model2  = model.clone();
+            let conf    = stt_confidence;
+            let t_ms    = transcribe_ms;
+            let e_ms    = embed_ms;
+            let p_ms    = llm_result.polish_ms as i64;
+            let aid2    = audio_id.clone();
             tokio::spawn(async move {
                 insert_recording(&pool2, InsertRecording {
                     id: &id2, user_id: &uid2,
@@ -313,6 +324,7 @@ pub async fn polish(
                     polish_ms:     Some(p_ms),
                     target_app:    ta2.as_deref(),
                     source:        "voice",
+                    audio_id:      Some(&aid2),
                 });
             });
         }

@@ -38,7 +38,9 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/v1/pending-edits",        post(routes::pending_edits::create))
         .route("/v1/pending-edits",        get(routes::pending_edits::list))
         .route("/v1/pending-edits/:id/resolve", post(routes::pending_edits::resolve))
-        .route("/v1/history",         get(routes::history::list))
+        .route("/v1/history",              get(routes::history::list))
+        .route("/v1/recordings/:id",       axum::routing::delete(routes::history::delete))
+        .route("/v1/recordings/:id/audio", get(routes::history::audio))
         .route("/v1/preferences",     get(routes::prefs::get_prefs))
         .route("/v1/preferences",     patch(routes::prefs::patch_prefs))
         // Cloud auth bridge — store/clear cloud token, query cloud status

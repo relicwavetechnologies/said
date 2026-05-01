@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     embedder::gemini,
-    store::{history, prefs::get_prefs, vectors},
+    store::{corrections, history, prefs::get_prefs, vectors},
     AppState,
 };
 
@@ -65,6 +65,13 @@ pub async fn submit(
             return StatusCode::INTERNAL_SERVER_ERROR;
         }
     };
+
+    // ── Extract and store word-level corrections ────────────────────────────
+    let diffs = corrections::extract_diffs(&rec.polished, &body.user_kept);
+    if !diffs.is_empty() {
+        corrections::upsert(&pool, &rec.user_id, &diffs);
+        info!("[feedback] stored {} word correction(s)", diffs.len());
+    }
 
     info!(
         "[feedback] edit_event {} created for recording {}",

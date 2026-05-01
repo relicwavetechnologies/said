@@ -34,7 +34,6 @@ function relativeTime(ms: number): string {
   return new Date(ms).toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
-type FilterTab = "all" | "today" | "week";
 
 // ── Speed breakdown ────────────────────────────────────────────────────────────
 
@@ -273,7 +272,6 @@ export function DashboardView({
   pendingEdits   = [],
   onResolvePending,
 }: DashboardViewProps) {
-  const [filterTab, setFilterTab]       = useState<FilterTab>("all");
   const [reviewOpen, setReviewOpen]     = useState(false);
 
   const isRecording  = snapshot?.state === "recording";
@@ -284,21 +282,11 @@ export function DashboardView({
   const avgWpm     = snapshot?.avg_wpm ?? 0;
   const streak     = snapshot?.daily_streak ?? 0;
 
-  /* Filter recordings by tab */
-  const filtered = useMemo(() => {
-    if (filterTab === "all") return history;
-    const now  = Date.now();
-    const sod  = new Date(now); sod.setHours(0, 0, 0, 0);
-    const week = new Date(sod.getTime() - 6 * 86_400_000);
-    if (filterTab === "today") return history.filter((h) => h.timestamp_ms >= sod.getTime());
-    return history.filter((h) => h.timestamp_ms >= week.getTime());
-  }, [history, filterTab]);
-
-  const FILTER_TABS: { id: FilterTab; label: string }[] = [
-    { id: "all",   label: "All recordings" },
-    { id: "today", label: "Today"          },
-    { id: "week",  label: "This week"      },
-  ];
+  /* Only show recordings from the past 24 hours */
+  const filtered = useMemo(
+    () => history.filter((h) => h.timestamp_ms >= Date.now() - 86_400_000),
+    [history],
+  );
 
   return (
     <ScrollArea className="h-full">
@@ -495,10 +483,10 @@ export function DashboardView({
           <SpeedBreakdown item={history[0]} />
         )}
 
-        {/* ── Recordings section header + filters ───────── */}
+        {/* ── Recordings section header ─────────────────── */}
         <div className="flex items-center justify-between gap-3 mb-3">
           <div className="flex items-center gap-2">
-            <h2 className="text-[14px] font-semibold text-foreground">Recordings</h2>
+            <h2 className="text-[14px] font-semibold text-foreground">Last 24 hours</h2>
             <span
               className="text-[11px] tabular-nums px-1.5 py-0.5 rounded"
               style={{ background: "hsl(var(--surface-4))", color: "hsl(var(--muted-foreground))" }}
@@ -506,17 +494,12 @@ export function DashboardView({
               {filtered.length}
             </span>
           </div>
-          <div className="flex items-center gap-1.5">
-            {FILTER_TABS.map((tab) => (
-              <button
-                key={tab.id}
-                onClick={() => setFilterTab(tab.id)}
-                className={cn("pill", filterTab === tab.id && "active")}
-              >
-                {tab.label}
-              </button>
-            ))}
-          </div>
+          <button
+            onClick={() => onNavigate?.("history")}
+            className="text-[11px] text-muted-foreground hover:text-foreground transition-colors"
+          >
+            View all →
+          </button>
         </div>
 
         {/* ── Recordings list ───────────────────────────── */}
@@ -529,13 +512,9 @@ export function DashboardView({
               >
                 <Mic size={20} style={{ color: "hsl(var(--chip-lime-fg))" }} />
               </div>
-              <h3 className="text-[14px] font-semibold text-foreground mb-1">
-                {filterTab === "all" ? "No recordings yet" : "Nothing here"}
-              </h3>
+              <h3 className="text-[14px] font-semibold text-foreground mb-1">Nothing in the last 24 hours</h3>
               <p className="text-[12px] text-muted-foreground max-w-xs mx-auto leading-relaxed">
-                {filterTab === "all"
-                  ? "Hold Caps Lock to capture, release to polish. Each recording is auto-pasted into your active app."
-                  : "Try \"All recordings\" to see your full history."}
+                Hold Caps Lock to capture, release to polish. Each recording is auto-pasted into your active app.
               </p>
             </div>
           ) : (

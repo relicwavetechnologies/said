@@ -102,6 +102,7 @@ export interface Recording {
   target_app:        string | null;
   edit_count:        number;
   source:            string;
+  audio_id:          string | null;
 }
 
 /** Backend endpoint info (url + shared secret) */
@@ -177,6 +178,7 @@ export interface TimelineItem {
   text: string;
   word_count?: number;
   model?: string;
+  timestamp_ms: number;
 }
 
 export interface TimelineGroup {
@@ -229,6 +231,7 @@ export function groupHistory(history: HistoryItem[]): TimelineGroup[] {
       text: item.polished,
       word_count: item.word_count,
       model: item.model,
+      timestamp_ms: item.timestamp_ms,
     });
     buckets.set(label, existing);
   }

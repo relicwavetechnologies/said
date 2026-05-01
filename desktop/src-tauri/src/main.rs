@@ -5,8 +5,6 @@ mod backend;
 mod desktop;
 mod dg_stream;  // P5: Deepgram WebSocket live streaming
 
-#[cfg(target_os = "macos")]
-extern crate notify_rust;
 
 use std::sync::{Arc, Mutex};
 
@@ -811,7 +809,7 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
             };
 
             let transcript = dg_stream::stream_to_deepgram(chunk_recv, &deepgram_key, &language).await;
-            tracing::info!(
+            tracing::debug!(
                 "[dg_stream] pre-transcript result: {}",
                 transcript.as_deref().unwrap_or("<none>")
             );
@@ -871,7 +869,7 @@ fn do_finish_recording(
         let pre_transcript: Option<String> = if let Some(rx) = transcript_rx {
             match tokio::time::timeout(std::time::Duration::from_secs(4), rx).await {
                 Ok(Ok(t)) if !t.is_empty() => {
-                    tracing::info!("[finish] WS pre-transcript ready ({} chars): {t:?}", t.len());
+                    tracing::debug!("[finish] WS pre-transcript ready ({} chars): {t:?}", t.len());
                     Some(t)
                 }
                 Ok(_) => {
@@ -975,6 +973,29 @@ async fn run_voice_polish_sse(
     Ok(done)
 }
 
+/// Delete a recording from the backend (SQLite + WAV file).
+#[tauri::command]
+async fn delete_recording(
+    backend: State<'_, BackendState>,
+    id:      String,
+) -> Result<(), String> {
+    let ep = get_endpoint(&backend)?;
+    api::delete_recording(&ep, &id).await
+}
+
+/// Return the bearer-authed URL to stream a recording's WAV audio.
+/// The frontend fetches this URL with the Authorization header to get a blob.
+#[tauri::command]
+fn get_recording_audio_url(
+    backend: State<'_, BackendState>,
+    id:      String,
+) -> Result<serde_json::Value, String> {
+    let ep     = get_endpoint(&backend)?;
+    let url    = api::recording_audio_url(&ep, &id);
+    let secret = ep.secret.clone();
+    Ok(serde_json::json!({ "url": url, "secret": secret }))
+}
+
 /// Retry a failed recording by re-submitting its saved WAV file.
 /// `audio_id` is the UUID that the backend included in the `voice-error` event.
 #[tauri::command]
@@ -1042,24 +1063,6 @@ fn retry_recording(
     });
 
     Ok(())
-}
-
-// ── Notification permission ───────────────────────────────────────────────────
-
-/// Request macOS notification permission by sending a one-shot "permission granted"
-/// notification. Returns true if the system accepted the notification (i.e. granted).
-#[tauri::command]
-fn request_notifications() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        notify_rust::Notification::new()
-            .summary("Said — Notifications enabled")
-            .body("You'll be notified when Said notices a learning opportunity.")
-            .show()
-            .is_ok()
-    }
-    #[cfg(not(target_os = "macos"))]
-    { false }
 }
 
 // ── Pending-edit review commands ──────────────────────────────────────────────
@@ -1220,7 +1223,11 @@ async fn watch_for_edit(
         val
     };
 
-    let mut last_val = post_paste.clone();
+    let mut last_val      = post_paste.clone();
+    // best_candidate = last field value that still shared words with polished text.
+    // Needed because apps like Slack clear the input after Send, making last_val
+    // a UI placeholder ("Type / for commands") that replaces the actual edit.
+    let mut best_candidate = post_paste.clone();
     let mut idle_at  = Instant::now();
     let started      = Instant::now();
 
@@ -1248,6 +1255,11 @@ async fn watch_for_edit(
         let now_val = paster::read_focused_value().unwrap_or_default();
         if now_val != last_val {
             idle_at  = Instant::now();
+            // Only promote to best_candidate if the value still shares words
+            // with the polished text (guards against Send-cleared placeholders).
+            if shares_word_overlap(&now_val, &polished) {
+                best_candidate = now_val.clone();
+            }
             last_val = now_val;
         }
 
@@ -1257,10 +1269,24 @@ async fn watch_for_edit(
         if done { break; }
     }
 
+    // If the final field value lost all overlap with our polished text (e.g. the
+    // user sent the message and the input reverted to a placeholder), use the last
+    // meaningful intermediate value instead.
+    let effective_val = if shares_word_overlap(&last_val, &polished) {
+        last_val.clone()
+    } else if best_candidate != post_paste {
+        tracing::info!(
+            "[edit-watch] last_val lost overlap with polished (sent message?); using best_candidate"
+        );
+        best_candidate.clone()
+    } else {
+        last_val.clone()
+    };
+
     let final_pid = paster::focused_pid();
     tracing::info!(
         "[edit-watch] done watching {recording_id} — field changed: {}, same app: {}",
-        last_val != post_paste,
+        effective_val != post_paste,
         matches!((initial_pid, final_pid), (Some(a), Some(b)) if a == b),
     );
 
@@ -1270,11 +1296,11 @@ async fn watch_for_edit(
 
     if !post_paste.is_empty() {
         // ── AX was readable — compare values directly ──────────────────────────
-        if last_val == post_paste {
+        if effective_val == post_paste {
             tracing::info!("[edit-watch] no edits detected for {recording_id}");
             return;
         }
-        user_kept = extract_kept(&polished, &post_paste, &last_val);
+        user_kept = extract_kept(&polished, &post_paste, &effective_val);
         tracing::info!(
             "[edit-watch] edit captured (AX) for {recording_id}: {:?} → {:?}",
             polished.chars().take(60).collect::<String>(),
@@ -1366,6 +1392,16 @@ async fn watch_for_edit(
         return;
     }
 
+    // Sanity-check: if user_kept shares zero words with polished it is likely
+    // a UI placeholder (e.g. Slack's "Type / for commands") that leaked through.
+    if !shares_word_overlap(&user_kept, &polished) {
+        tracing::info!(
+            "[edit-watch] user_kept has no word overlap with polished — garbage, skipping. kept={:?}",
+            user_kept.chars().take(40).collect::<String>()
+        );
+        return;
+    }
+
     // ── 1. Store as pending edit in the backend ────────────────────────────────
     tracing::info!("[edit-watch] storing pending edit for {recording_id}");
     let ep_opt = back_arc.lock().ok().and_then(|g| g.clone());
@@ -1373,19 +1409,19 @@ async fn watch_for_edit(
         match api::store_pending_edit(ep, Some(&recording_id), &polished, &user_kept).await {
             Ok(pending_id) => {
                 tracing::info!("[edit-watch] pending_edit stored: {pending_id}");
-                // ── 2. Send native macOS notification (best-effort) ────────────
-                // If permission is denied, the pending badge on the dashboard
-                // is the fallback reminder for the user.
-                let ai_short   = if polished.len()   > 45 { format!("{}…", &polished[..45])   } else { polished.clone()   };
-                let kept_short = if user_kept.len()  > 45 { format!("{}…", &user_kept[..45])  } else { user_kept.clone()  };
-                let body = format!("\"{ai_short}\"  →  \"{kept_short}\"");
-                #[cfg(target_os = "macos")]
-                {
-                    let _ = notify_rust::Notification::new()
-                        .summary("Said noticed an edit — tap to review")
-                        .body(&body)
-                        .show();
-                }
+                // Send OS notification from Rust — the webview may be throttled
+                // when backgrounded, so JS sendNotification is unreliable here.
+                use tauri_plugin_notification::NotificationExt;
+                let short_kept = if user_kept.chars().count() > 60 {
+                    format!("{}…", user_kept.chars().take(60).collect::<String>())
+                } else {
+                    user_kept.clone()
+                };
+                let _ = app.notification()
+                    .builder()
+                    .title("Said noticed an edit — tap to review")
+                    .body(&short_kept)
+                    .show();
             }
             Err(e) => tracing::warn!("[edit-watch] failed to store pending edit: {e}"),
         }
@@ -1395,6 +1431,23 @@ async fn watch_for_edit(
     // (window is NOT force-shown — user opens it in their own time)
     let _ = app.emit("pending-edits-changed", ());
     let _ = back_arc; // keep arc alive until end of scope
+}
+
+/// Returns true if `candidate` shares at least one significant word (>3 chars,
+/// case-insensitive ASCII) with `reference`.  Used to detect when the app has
+/// cleared its text field (e.g. Slack post-send shows "Type / for commands").
+fn shares_word_overlap(candidate: &str, reference: &str) -> bool {
+    let ref_words: std::collections::HashSet<String> = reference
+        .split_whitespace()
+        .filter(|w| w.chars().count() > 3)
+        .map(|w| w.to_lowercase())
+        .collect();
+    if ref_words.is_empty() {
+        return !candidate.is_empty();
+    }
+    candidate
+        .split_whitespace()
+        .any(|w| ref_words.contains(&w.to_lowercase()))
 }
 
 /// Given what we pasted (`polished`), where the field was right after paste
@@ -1590,6 +1643,7 @@ fn main() {
                 Ok(())
             }
         })
+        .plugin(tauri_plugin_notification::init())
         .manage(SharedApp(shared_app))
         .manage(BackendState(backend_arc))
         .manage(StreamingState(Mutex::new(None)))
@@ -1619,8 +1673,9 @@ fn main() {
             disconnect_openai,
             // Retry
             retry_recording,
-            // Notifications
-            request_notifications,
+            // Recording management
+            delete_recording,
+            get_recording_audio_url,
             // Pending-edit review
             get_pending_edits,
             resolve_pending_edit,

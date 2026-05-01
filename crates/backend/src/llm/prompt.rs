@@ -13,7 +13,7 @@
 //! <transcript> {transcript} </transcript>
 //! ```
 
-use crate::store::prefs::Preferences;
+use crate::store::{corrections::Correction, prefs::Preferences};
 
 pub struct RagExample {
     pub ai_output: String,
@@ -21,12 +21,37 @@ pub struct RagExample {
 }
 
 /// Build the full system-prompt string.
-/// `rag_examples` is empty in Phase B/C; populated after Phase D.
-pub fn build_system_prompt(prefs: &Preferences, rag_examples: &[RagExample]) -> String {
+/// `corrections` are deterministic word-level substitutions (always applied).
+/// `rag_examples` are embedding-based similar past edits (contextual).
+pub fn build_system_prompt(
+    prefs: &Preferences,
+    rag_examples: &[RagExample],
+    corrections: &[Correction],
+) -> String {
     let lang_rule = language_rule(&prefs.output_language);
     let persona   = persona_block(prefs);
     let tone      = tone_description(&prefs.tone_preset);
 
+    // Deterministic word substitutions — always applied, no similarity threshold
+    let corrections_block = if corrections.is_empty() {
+        String::new()
+    } else {
+        let table = corrections
+            .iter()
+            .map(|c| format!("  {} → {}", c.wrong, c.right))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "<word_corrections>\n\
+             MANDATORY — always apply these exact word substitutions.\n\
+             Whenever you see the left-hand word in the transcript, replace it with \
+             the right-hand word in your output. No exceptions.\n\n\
+             {table}\n\
+             </word_corrections>\n\n"
+        )
+    };
+
+    // Contextual RAG examples — similar past edits (may be empty)
     let prefs_block = if rag_examples.is_empty() {
         String::new()
     } else {
@@ -34,14 +59,18 @@ pub fn build_system_prompt(prefs: &Preferences, rag_examples: &[RagExample]) -> 
             .iter()
             .map(|e| {
                 format!(
-                    "  ┌── EXAMPLE ──┐\n  AI produced:  \"{}\"\n  User kept:    \"{}\"\n  └─────────────┘",
+                    "  AI produced: \"{}\"\n  User changed it to: \"{}\"",
                     e.ai_output, e.user_kept
                 )
             })
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\n\n");
         format!(
-            "<preferences>\nThe user has previously edited your output as follows. Match this style.\n{examples}\n</preferences>\n\n"
+            "<preferences>\n\
+             The user has corrected your output before. Study each pair and carry the \
+             same style and word choices into the new output.\n\n\
+             {examples}\n\
+             </preferences>\n\n"
         )
     };
 
@@ -49,13 +78,15 @@ pub fn build_system_prompt(prefs: &Preferences, rag_examples: &[RagExample]) -> 
         "<output_language>\n{lang_rule}\n</output_language>\n\n\
          <role>\n{persona}\n</role>\n\n\
          <tone>\n{tone}\n</tone>\n\n\
+         {corrections_block}\
          {prefs_block}\
          <task>\n\
          Polish the transcript below into clean, natural text.\n\
          Output ONLY the polished text — no preamble, no commentary, no markdown.\n\
-         The output_language rule above is ABSOLUTE — it overrides everything else.\n\
+         The output_language rule above is ABSOLUTE — follow it for script and language.\n\
+         If <word_corrections> exist, apply those substitutions unconditionally.\n\
+         If <preferences> exist, match the user's style and word choices.\n\
          Remove disfluencies (um, uh, matlab, basically, you know).\n\
-         Honour the persona, tone, and preferences above.\n\
          </task>"
     )
 }
