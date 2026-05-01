@@ -4,10 +4,9 @@ export function Hero() {
       <div className="water-bg absolute inset-0 -z-10" aria-hidden />
 
       <div className="mx-auto w-full max-w-[1280px] px-token-md pb-token-xl pt-[100px] md:pt-[140px]">
-        <h1 className="max-w-[18ch] text-[44px] font-normal leading-[1.06] tracking-[-0.02em] text-text sm:text-[52px] md:text-[60px] lg:text-[64px]">
-          We&rsquo;ve typed for 150 years.
-          <br />
-          It&rsquo;s time to speak.
+        <h1 className="text-[40px] font-normal leading-[1.06] tracking-[-0.02em] text-text sm:text-[48px] md:text-[56px] lg:text-[64px]">
+          <span className="block whitespace-nowrap">We&rsquo;ve typed for 150 years.</span>
+          <span className="block whitespace-nowrap">It&rsquo;s time to speak.</span>
         </h1>
 
         <p className="mt-8 max-w-[520px] text-[18px] leading-[1.55] text-text/85 md:text-[22px] md:leading-[1.5]">
