@@ -22,3 +22,6 @@ __pycache__/
 
 # Temp audio
 *.wav
+
+# Claude Code worktrees & local config
+.claude/
