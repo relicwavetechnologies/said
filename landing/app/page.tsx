@@ -4,6 +4,8 @@ import { Navbar } from '@/components/Navbar';
 import { SpeakSection } from '@/components/SpeakSection';
 import { SpeedSection } from '@/components/SpeedSection';
 import { FeaturesSection } from '@/components/FeaturesSection';
+import { CodingSection } from '@/components/CodingSection';
+import { ResultsSection } from '@/components/ResultsSection';
 
 export default function HomePage() {
   return (
@@ -18,6 +20,8 @@ export default function HomePage() {
       <SpeakSection />
       <SpeedSection />
       <FeaturesSection />
+      <CodingSection />
+      <ResultsSection />
     </main>
   );
 }
