@@ -48,8 +48,8 @@ function MonitorMockup() {
     <div className="mx-auto w-full max-w-[980px]">
       {/* Bezel */}
       <div className="relative overflow-hidden rounded-[24px] border border-black/10 bg-white p-3 shadow-[0_24px_60px_rgba(41,44,61,0.10)]">
-        {/* Wallpaper */}
-        <div className="relative overflow-hidden rounded-[14px]">
+        {/* Wallpaper — fixed 16:10 aspect for an iMac-like screen */}
+        <div className="relative aspect-[16/10] overflow-hidden rounded-[14px]">
           <div
             aria-hidden
             className="absolute inset-0"
@@ -68,8 +68,8 @@ function MonitorMockup() {
             }}
           />
 
-          {/* App window */}
-          <div className="relative mx-auto my-12 w-[88%] overflow-hidden rounded-[14px] bg-white shadow-[0_18px_40px_rgba(41,44,61,0.10)]">
+          {/* App window — sits inset from the wallpaper edges */}
+          <div className="absolute inset-x-[6%] top-[8%] bottom-[8%] overflow-hidden rounded-[14px] bg-white shadow-[0_18px_40px_rgba(41,44,61,0.10)]">
             <AppToolbar />
             <Transcript />
           </div>
