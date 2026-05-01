@@ -2,6 +2,7 @@ import { AnnouncementBar } from '@/components/AnnouncementBar';
 import { Hero } from '@/components/Hero';
 import { Navbar } from '@/components/Navbar';
 import { SpeakSection } from '@/components/SpeakSection';
+import { SpeedSection } from '@/components/SpeedSection';
 
 export default function HomePage() {
   return (
@@ -14,6 +15,7 @@ export default function HomePage() {
       <Navbar />
       <Hero />
       <SpeakSection />
+      <SpeedSection />
     </main>
   );
 }
