@@ -15,22 +15,33 @@ html,
 body {
   background-color: var(--color-background);
   color: var(--color-text);
-  font-feature-settings: 'ss01', 'ss02', 'cv11';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
+/* Soft, organic water-caustic backdrop — multiple offset radial gradients
+   create the cell/blob pattern visible in the reference. */
 .water-bg {
+  background-color: #fafbfc;
   background-image:
-    radial-gradient(at 20% 30%, rgba(103, 190, 255, 0.10) 0px, transparent 45%),
-    radial-gradient(at 75% 20%, rgba(103, 190, 255, 0.08) 0px, transparent 50%),
-    radial-gradient(at 60% 75%, rgba(103, 190, 255, 0.10) 0px, transparent 55%),
-    radial-gradient(at 15% 85%, rgba(103, 190, 255, 0.08) 0px, transparent 45%);
+    radial-gradient(ellipse 220px 180px at 12% 18%, rgba(180, 195, 210, 0.22), transparent 70%),
+    radial-gradient(ellipse 260px 200px at 32% 8%,  rgba(170, 190, 210, 0.18), transparent 70%),
+    radial-gradient(ellipse 240px 200px at 58% 22%, rgba(175, 195, 215, 0.20), transparent 70%),
+    radial-gradient(ellipse 280px 220px at 82% 12%, rgba(170, 190, 210, 0.20), transparent 70%),
+    radial-gradient(ellipse 320px 240px at 8%  48%, rgba(180, 200, 215, 0.22), transparent 70%),
+    radial-gradient(ellipse 280px 220px at 42% 56%, rgba(175, 195, 210, 0.22), transparent 70%),
+    radial-gradient(ellipse 300px 240px at 72% 50%, rgba(170, 190, 210, 0.18), transparent 70%),
+    radial-gradient(ellipse 260px 220px at 92% 62%, rgba(180, 200, 215, 0.20), transparent 70%),
+    radial-gradient(ellipse 320px 220px at 18% 86%, rgba(170, 190, 210, 0.20), transparent 70%),
+    radial-gradient(ellipse 300px 240px at 52% 94%, rgba(175, 195, 215, 0.22), transparent 70%),
+    radial-gradient(ellipse 280px 220px at 82% 88%, rgba(170, 190, 210, 0.20), transparent 70%);
+  filter: saturate(0.9);
 }
 
 @keyframes pulse-dot {
   0%, 100% { transform: scale(1); opacity: 1; }
-  50% { transform: scale(1.15); opacity: 0.85; }
+  50%      { transform: scale(1.18); opacity: 0.85; }
 }
 
 .pulse-dot {

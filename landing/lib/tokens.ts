@@ -16,6 +16,8 @@ export const fontFamily = {
   sans: [
     'PP Neue Montreal Book',
     'PP Neue Montreal',
+    'var(--font-sans)',
+    'Inter Tight',
     'Inter',
     '-apple-system',
     'BlinkMacSystemFont',
