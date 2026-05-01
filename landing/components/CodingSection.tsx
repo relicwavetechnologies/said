@@ -91,23 +91,23 @@ export function CodingSection() {
     >
       {/* Sticky stage — pinned for the duration of the section */}
       <div className="sticky top-0 flex h-screen flex-col overflow-hidden">
-        <div className="mx-auto flex h-full w-full max-w-[1280px] flex-col px-token-md py-12 md:py-16">
-          {/* Header */}
-          <div className="max-w-[760px]">
-            <p className="text-[14px] tracking-[-0.005em] text-white/40">
+        <div className="mx-auto flex h-full min-h-0 w-full max-w-[1280px] flex-col px-token-md pt-6 pb-5 md:pt-8 md:pb-6">
+          {/* Header — compact so the stage gets the breathing room */}
+          <div className="max-w-[760px] shrink-0">
+            <p className="text-[12.5px] tracking-[-0.005em] text-white/40">
               Coding &amp; Prompting
             </p>
-            <h2 className="mt-4 text-[40px] font-normal leading-[1.04] tracking-[-0.02em] sm:text-[48px] md:text-[56px] lg:text-[60px]">
+            <h2 className="mt-2 text-[32px] font-normal leading-[1.04] tracking-[-0.02em] sm:text-[40px] md:text-[46px] lg:text-[50px]">
               Prompt faster with your voice
             </h2>
-            <p className="mt-5 max-w-[540px] text-[16px] leading-[1.55] text-white/55 md:text-[18px]">
+            <p className="mt-3 max-w-[520px] text-[14px] leading-[1.5] text-white/55 md:text-[15px]">
               Speak your ideas into existence with ease. Aqua understands
               syntax, libraries, and frameworks as you speak.
             </p>
           </div>
 
-          {/* Slide stage — grows to fill available space */}
-          <div className="relative mt-8 grow overflow-hidden rounded-[18px] border border-white/[0.08] bg-[#0c0c0e]">
+          {/* Slide stage — flex-1 so it fills all remaining height */}
+          <div className="relative mt-5 min-h-0 flex-1 overflow-hidden rounded-[20px] border border-white/[0.08] bg-[#0c0c0e]">
             {SLIDES.map((s, i) => (
               <div
                 key={s.id}
@@ -122,25 +122,25 @@ export function CodingSection() {
           </div>
 
           {/* Caption */}
-          <div className="mt-6 grid grid-cols-1 items-start gap-y-4 md:grid-cols-12 md:gap-x-8">
+          <div className="mt-4 grid shrink-0 grid-cols-1 items-start gap-y-3 md:grid-cols-12 md:gap-x-8">
             <div className="md:col-span-7">
-              <h3 className="text-[18px] font-medium tracking-[-0.005em]">
+              <h3 className="text-[16px] font-medium tracking-[-0.005em]">
                 {SLIDES[active].title}
               </h3>
-              <p className="mt-2 max-w-[520px] text-[14px] leading-[1.55] text-white/50">
+              <p className="mt-1 max-w-[520px] text-[13px] leading-[1.5] text-white/50">
                 {SLIDES[active].description}
               </p>
             </div>
-            <div className="md:col-span-5 md:flex md:justify-end">
+            <div className="md:col-span-5 md:flex md:justify-end md:pt-1">
               <DesignedFor logos={SLIDES[active].designedFor} />
             </div>
           </div>
 
           {/* Pagination + Hold Space row */}
-          <div className="mt-6 flex flex-wrap items-center justify-between gap-y-4">
-            <div className="flex items-center gap-2.5 text-[14px] text-white/75">
+          <div className="mt-4 flex shrink-0 flex-wrap items-center justify-between gap-y-3">
+            <div className="flex items-center gap-2.5 text-[13.5px] text-white/75">
               <span>Hold</span>
-              <kbd className="inline-flex h-8 min-w-[64px] items-center justify-center rounded-[7px] bg-white/10 px-3 font-sans text-[12.5px] font-medium text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.10)]">
+              <kbd className="inline-flex h-7 min-w-[60px] items-center justify-center rounded-[6px] bg-white/10 px-2.5 font-sans text-[12px] font-medium text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.10)]">
                 Space
               </kbd>
               <span>and try yourself</span>
