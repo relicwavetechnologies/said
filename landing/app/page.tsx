@@ -5,6 +5,7 @@ import { SpeakSection } from '@/components/SpeakSection';
 import { SpeedSection } from '@/components/SpeedSection';
 import { FeaturesSection } from '@/components/FeaturesSection';
 import { CodingSection } from '@/components/CodingSection';
+import { ProductivitySection } from '@/components/ProductivitySection';
 import { ResultsSection } from '@/components/ResultsSection';
 
 export default function HomePage() {
@@ -22,6 +23,7 @@ export default function HomePage() {
       <FeaturesSection />
       <CodingSection />
       <ResultsSection />
+      <ProductivitySection />
     </main>
   );
 }
