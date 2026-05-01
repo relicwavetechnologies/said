@@ -1,0 +1,38 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --color-accent: #67beff;
+  --color-accent-text: #0000ee;
+  --color-background: #fafbfc;
+  --color-text: #292c3d;
+  --color-muted: #7a7d88;
+  --color-ink: #000000;
+}
+
+html,
+body {
+  background-color: var(--color-background);
+  color: var(--color-text);
+  font-feature-settings: 'ss01', 'ss02', 'cv11';
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.water-bg {
+  background-image:
+    radial-gradient(at 20% 30%, rgba(103, 190, 255, 0.10) 0px, transparent 45%),
+    radial-gradient(at 75% 20%, rgba(103, 190, 255, 0.08) 0px, transparent 50%),
+    radial-gradient(at 60% 75%, rgba(103, 190, 255, 0.10) 0px, transparent 55%),
+    radial-gradient(at 15% 85%, rgba(103, 190, 255, 0.08) 0px, transparent 45%);
+}
+
+@keyframes pulse-dot {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.15); opacity: 0.85; }
+}
+
+.pulse-dot {
+  animation: pulse-dot 2.4s ease-in-out infinite;
+}
