@@ -1044,6 +1044,24 @@ fn retry_recording(
     Ok(())
 }
 
+// ── Notification permission ───────────────────────────────────────────────────
+
+/// Request macOS notification permission by sending a one-shot "permission granted"
+/// notification. Returns true if the system accepted the notification (i.e. granted).
+#[tauri::command]
+fn request_notifications() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        notify_rust::Notification::new()
+            .summary("Said — Notifications enabled")
+            .body("You'll be notified when Said notices a learning opportunity.")
+            .show()
+            .is_ok()
+    }
+    #[cfg(not(target_os = "macos"))]
+    { false }
+}
+
 // ── Pending-edit review commands ──────────────────────────────────────────────
 
 #[tauri::command]
@@ -1601,6 +1619,8 @@ fn main() {
             disconnect_openai,
             // Retry
             retry_recording,
+            // Notifications
+            request_notifications,
             // Pending-edit review
             get_pending_edits,
             resolve_pending_edit,

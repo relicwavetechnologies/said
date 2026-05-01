@@ -4,13 +4,14 @@ import { cn } from "@/lib/utils";
 import {
   Shield, Cpu, Key, Info, Wifi, Check, Bot, Sparkles,
   Languages, MessageSquareText, Loader2, Cloud, LogIn, LogOut, RefreshCw, UserPlus,
-  TestTube, Eye, EyeOff,
+  TestTube, Eye, EyeOff, Bell,
 } from "lucide-react";
 import type { AppSnapshot, CloudStatus, OpenAIStatus, Preferences } from "@/types";
 import {
   cloudLogin, cloudLogout, cloudSignup, getCloudStatus,
   getPreferences, patchPreferences, diagnoseAx,
   getOpenAIStatus, initiateOpenAIOAuth, disconnectOpenAI,
+  requestNotifications,
   type AxDiagnostics,
 } from "@/lib/invoke";
 
@@ -90,6 +91,10 @@ interface SettingsViewProps {
 export function SettingsView({ snapshot, onAccessibility, onInputMonitoring }: SettingsViewProps) {
   const axGranted  = snapshot?.accessibility_granted    ?? false;
   const imGranted  = snapshot?.input_monitoring_granted ?? false;
+
+  // null = not yet asked this session; true/false = result of last request attempt
+  const [notifGranted, setNotifGranted] = useState<boolean | null>(null);
+  const [notifBusy,    setNotifBusy]    = useState(false);
   const axSupported = snapshot?.auto_paste_supported    ?? false;
 
   // ── Prefs state ─────────────────────────────────────────────────────────────
@@ -523,7 +528,66 @@ export function SettingsView({ snapshot, onAccessibility, onInputMonitoring }: S
             {/* Divider */}
             <div className="mx-5 border-t" style={{ borderColor: "hsl(var(--surface-3))" }} />
 
-            {/* Row 2: Input Monitoring */}
+            {/* Row 2: Notifications */}
+            <div className="flex items-center gap-4 px-5 py-4">
+              <div
+                className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0"
+                style={{
+                  background: notifGranted === true
+                    ? "hsl(var(--chip-lime-bg))"
+                    : "hsl(var(--surface-4))",
+                  color: notifGranted === true
+                    ? "hsl(var(--chip-lime-fg))"
+                    : "hsl(var(--muted-foreground))",
+                }}
+              >
+                <Bell size={16} />
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-[13px] font-medium text-foreground">Notifications</p>
+                <p className="text-[12px] text-muted-foreground mt-0.5 leading-relaxed">
+                  {notifGranted === true
+                    ? "Granted — Said will notify you when a learning edit is ready to review."
+                    : notifGranted === false
+                    ? "Denied — open System Settings → Notifications → Said to enable."
+                    : "Said asks once to send learning-edit notifications."}
+                </p>
+              </div>
+              <div className="flex-shrink-0 ml-4">
+                {axSupported ? (
+                  notifGranted === true ? (
+                    <span
+                      className="text-[12px] font-semibold px-3 py-1.5 rounded-lg flex items-center gap-1"
+                      style={{ background: "hsl(var(--chip-lime-bg))", color: "hsl(var(--chip-lime-fg))" }}
+                    >
+                      <Check size={11} /> Granted
+                    </span>
+                  ) : (
+                    <button
+                      disabled={notifBusy}
+                      onClick={async () => {
+                        setNotifBusy(true);
+                        const ok = await requestNotifications();
+                        setNotifGranted(ok);
+                        setNotifBusy(false);
+                      }}
+                      className="text-[12px] font-semibold px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1.5 disabled:opacity-50"
+                      style={{ background: "hsl(var(--primary))", color: "hsl(var(--primary-foreground))" }}
+                    >
+                      {notifBusy && <Loader2 size={11} className="animate-spin" />}
+                      {notifGranted === false ? "Open Settings" : "Allow"}
+                    </button>
+                  )
+                ) : (
+                  <span className="text-[12px] text-muted-foreground">macOS only</span>
+                )}
+              </div>
+            </div>
+
+            {/* Divider */}
+            <div className="mx-5 border-t" style={{ borderColor: "hsl(var(--surface-3))" }} />
+
+            {/* Row 3: Input Monitoring */}
             <div className="flex items-center gap-4 px-5 py-4">
               <div
                 className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0"

@@ -468,6 +468,18 @@ export async function disconnectOpenAI(): Promise<void> {
   await tauriInvoke("disconnect_openai");
 }
 
+// ── Notification permission ───────────────────────────────────────────────────
+
+/** Request macOS notification permission. Returns true if the system accepted it. */
+export async function requestNotifications(): Promise<boolean> {
+  if (!isTauriRuntime()) return false;
+  try {
+    return await tauriInvoke<boolean>("request_notifications");
+  } catch {
+    return false;
+  }
+}
+
 // ── Pending-edit review ───────────────────────────────────────────────────────
 
 export async function getPendingEdits(): Promise<PendingEditsResponse> {
