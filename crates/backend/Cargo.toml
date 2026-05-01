@@ -37,3 +37,4 @@ tower-http  = { version = "0.5", features = ["cors"] }
 anyhow      = "1"
 
 voice-polish-core = { path = "../core" }
+dirs              = "5"

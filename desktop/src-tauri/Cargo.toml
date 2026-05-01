@@ -27,6 +27,9 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 # Open URLs in the system default browser (for OpenAI OAuth)
 open = "5"
 
+# Resolve platform-specific directories (audio retry files)
+dirs = "5"
+
 # Workspace crates
 voice-polish-core     = { path = "../../crates/core" }
 voice-polish-paster   = { path = "../../crates/paster" }

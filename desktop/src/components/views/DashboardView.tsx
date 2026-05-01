@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from "react";
-import { Mic, Zap, Brain, Bot, Sparkles, Copy, Check, Timer } from "lucide-react";
+import { Mic, Zap, Bot, Sparkles, Copy, Check, Timer } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { HeroBanner } from "@/components/HeroBanner";
@@ -8,10 +8,9 @@ import type { AppSnapshot, HistoryItem } from "@/types";
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 function modeIcon(key: string, size = 12) {
-  if (key.includes("fast") || key.includes("mini")) return <Zap     size={size} />;
-  if (key.includes("claude"))                        return <Bot     size={size} />;
-  if (key.includes("gemini"))                        return <Sparkles size={size} />;
-  return <Brain size={size} />;
+  if (key.includes("claude"))  return <Bot      size={size} />;
+  if (key.includes("gemini"))  return <Sparkles size={size} />;
+  return <Zap size={size} />;
 }
 
 function modelLabel(model: string): string {
@@ -253,20 +252,10 @@ interface DashboardViewProps {
   snapshot:        AppSnapshot | null;
   busy:            boolean;
   onToggle:        () => void;
-  onMode:          (key: string) => void;
   onAccessibility: () => void;
-  /** Navigate to another view (used by the hero CTA → settings) */
   onNavigate?:     (view: string) => void;
-  /** Current pipeline phase: "transcribing" | "polishing" | "" */
   statusPhase?:    string;
-  /** Accumulated LLM tokens during streaming (for live preview) */
   liveText?:       string;
-  /** Whether the user has connected their OpenAI account */
-  openAIConnected?: boolean;
-  /** Active OpenAI model: "smart" | "mini" */
-  openAIModel?:    "smart" | "mini";
-  /** Called when user switches OpenAI model from the dashboard pills */
-  onOpenAIModel?:  (m: "smart" | "mini") => void;
 }
 
 // ── View ───────────────────────────────────────────────────────────────────────
@@ -275,14 +264,10 @@ export function DashboardView({
   snapshot,
   busy,
   onToggle,
-  onMode,
   onAccessibility,
   onNavigate,
-  statusPhase    = "",
-  liveText       = "",
-  openAIConnected = false,
-  openAIModel     = "smart",
-  onOpenAIModel,
+  statusPhase = "",
+  liveText    = "",
 }: DashboardViewProps) {
   const [filterTab, setFilterTab] = useState<FilterTab>("all");
 
@@ -378,50 +363,6 @@ export function DashboardView({
           <StatTile label="Day streak"    value={streak} accent  />
           <StatTile label="Sessions"      value={history.length} />
         </div>
-
-        {/* ── Model pills ───────────────────────────────── */}
-        {openAIConnected ? (
-          /* OpenAI mode: show gpt-5.4 / gpt-5.4-mini pills */
-          <div className="flex items-center gap-2 mb-6 flex-wrap">
-            <span className="section-label mr-1">Model:</span>
-            {(["smart", "mini"] as const).map((key) => {
-              const isActive = openAIModel === key;
-              const label    = key === "smart" ? "GPT-5.4" : "GPT-5.4 Mini";
-              return (
-                <button
-                  key={key}
-                  onClick={() => onOpenAIModel?.(key)}
-                  disabled={isProcessing}
-                  className={cn("pill", isActive && "active")}
-                >
-                  <span className="opacity-80"><Zap size={11} /></span>
-                  {label}
-                </button>
-              );
-            })}
-          </div>
-        ) : (
-          /* Gateway mode: show snapshot.modes pills */
-          (snapshot?.modes ?? []).length > 0 && (
-            <div className="flex items-center gap-2 mb-6 flex-wrap">
-              <span className="section-label mr-1">Model:</span>
-              {(snapshot?.modes ?? []).map((mode) => {
-                const isActive = mode.key === snapshot?.current_mode;
-                return (
-                  <button
-                    key={mode.key}
-                    onClick={() => onMode(mode.key)}
-                    disabled={isProcessing}
-                    className={cn("pill", isActive && "active")}
-                  >
-                    <span className="opacity-80">{modeIcon(mode.key, 11)}</span>
-                    {mode.label}
-                  </button>
-                );
-              })}
-            </div>
-          )
-        )}
 
         {/* ── Live streaming preview ────────────────────── */}
         {(statusPhase || liveText) && (

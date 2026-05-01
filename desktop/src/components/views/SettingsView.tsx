@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import {
-  Shield, Cpu, Key, Info, Wifi, Check, Zap, Brain, Bot, Sparkles,
+  Shield, Cpu, Key, Info, Wifi, Check, Bot, Sparkles,
   Languages, MessageSquareText, Loader2, Cloud, LogIn, LogOut, RefreshCw, UserPlus,
   TestTube, Eye, EyeOff,
 } from "lucide-react";
@@ -35,15 +35,6 @@ const LANGUAGES = [
   { key: "en",   label: "English" },
   { key: "en-IN",label: "English (India)" },
 ];
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-function modeIcon(key: string) {
-  if (key.includes("fast") || key.includes("mini")) return <Zap      size={16} />;
-  if (key.includes("claude"))                        return <Bot      size={16} />;
-  if (key.includes("gemini"))                        return <Sparkles size={16} />;
-  return <Brain size={16} />;
-}
 
 // ── Sub-components ────────────────────────────────────────────────────────────
 
@@ -92,13 +83,11 @@ interface SettingsViewProps {
   snapshot:          AppSnapshot | null;
   onAccessibility:   () => void;
   onInputMonitoring: () => void;
-  openAIModel?:      "smart" | "mini";
-  onOpenAIModel?:    (m: "smart" | "mini") => void;
 }
 
 // ── View ───────────────────────────────────────────────────────────────────────
 
-export function SettingsView({ snapshot, onAccessibility, onInputMonitoring, openAIModel: activeModelProp, onOpenAIModel }: SettingsViewProps) {
+export function SettingsView({ snapshot, onAccessibility, onInputMonitoring }: SettingsViewProps) {
   const axGranted  = snapshot?.accessibility_granted    ?? false;
   const imGranted  = snapshot?.input_monitoring_granted ?? false;
   const axSupported = snapshot?.auto_paste_supported    ?? false;
@@ -805,11 +794,7 @@ export function SettingsView({ snapshot, onAccessibility, onInputMonitoring, ope
 
         {/* ── Active config ─────────────────────────────── */}
         <Section title="Active Configuration">
-          {openAIStatus?.connected ? (() => {
-            // Use parent-controlled value so Active Configuration reflects the same selection as Dashboard
-            const isMini = (activeModelProp ?? (prefs?.selected_model === "mini" || prefs?.selected_model === "fast" ? "mini" : "smart")) === "mini";
-            const modelLabel = isMini ? "gpt-5.4-mini" : "gpt-5.4";
-            return (
+          {openAIStatus?.connected ? (
             /* ── Using OpenAI Codex ─────────────────────── */
             <>
               <Row
@@ -819,22 +804,21 @@ export function SettingsView({ snapshot, onAccessibility, onInputMonitoring, ope
                 action={<span className="badge-done">Connected</span>}
               />
               <Row
-                icon={<Zap size={16} />}
-                label="Active Model"
-                description={isMini ? "Fast · lightweight" : "Full intelligence"}
-                action={<span className="badge-model">{modelLabel}</span>}
+                icon={<Bot size={16} />}
+                label="Model"
+                description="gpt-5.4-mini · fast and lightweight"
+                action={<span className="badge-model">gpt-5.4-mini</span>}
                 last
               />
             </>
-            );
-          })() : (
+          ) : (
             /* ── Using Gateway (default) ─────────────────── */
             <>
               <Row
                 icon={<Cpu size={16} />}
-                label="Current Mode"
-                description={snapshot?.current_mode_label ?? "Loading…"}
-                action={<span className="badge-model">{snapshot?.current_mode ?? "—"}</span>}
+                label="Model"
+                description="gpt-5.4-mini via gateway"
+                action={<span className="badge-model">gpt-5.4-mini</span>}
               />
               <Row
                 icon={<Wifi size={16} />}
@@ -945,84 +929,6 @@ export function SettingsView({ snapshot, onAccessibility, onInputMonitoring, ope
             </div>
           )}
         </div>
-
-        {/* ── Available models ──────────────────────────── */}
-        {openAIStatus?.connected ? (() => {
-          // Use parent-controlled value when available (keeps Dashboard in sync)
-          const activeKey: "smart" | "mini" = activeModelProp
-            ?? (prefs?.selected_model === "mini" || prefs?.selected_model === "fast" ? "mini" : "smart");
-
-          function selectModel(key: "smart" | "mini") {
-            // Optimistic local update
-            setPrefs((p) => p ? { ...p, selected_model: key } : p);
-            patch({ selected_model: key });
-            // Lift to App.tsx so Dashboard pill also updates
-            onOpenAIModel?.(key);
-          }
-
-          const models = [
-            { key: "smart" as const, label: "GPT-5.4",      sub: "Full intelligence · ChatGPT Pro" },
-            { key: "mini"  as const, label: "GPT-5.4 Mini", sub: "Faster · lightweight · ChatGPT Pro" },
-          ];
-
-          return (
-            <div className="mb-7">
-              <p className="section-label px-1 mb-2.5">Model</p>
-              <div className="flex gap-3">
-                {models.map((m) => {
-                  const active = activeKey === m.key;
-                  return (
-                    <button
-                      key={m.key}
-                      onClick={() => selectModel(m.key)}
-                      className="flex-1 flex flex-col items-start gap-1 rounded-xl border px-4 py-3 text-left transition-all"
-                      style={{
-                        borderColor: active ? "hsl(var(--chip-lime-fg) / 0.6)" : "hsl(var(--border))",
-                        background:  active ? "hsl(var(--chip-lime-fg) / 0.07)" : "hsl(var(--surface-2))",
-                      }}
-                    >
-                      <span className="flex items-center gap-1.5 w-full">
-                        <Zap size={12} style={{ color: active ? "hsl(var(--chip-lime-fg))" : undefined }} className={active ? "" : "text-muted-foreground"} />
-                        <span className="text-[12px] font-semibold text-foreground">{m.label}</span>
-                        {active && (
-                          <span className="ml-auto text-[10px] font-semibold px-1.5 py-0.5 rounded-full"
-                            style={{ background: "hsl(var(--chip-lime-fg) / 0.15)", color: "hsl(var(--chip-lime-fg))" }}>
-                            Active
-                          </span>
-                        )}
-                      </span>
-                      <span className="text-[11px] text-muted-foreground">{m.sub}</span>
-                    </button>
-                  );
-                })}
-              </div>
-              {saving && (
-                <p className="text-[11px] text-muted-foreground mt-2 flex items-center gap-1">
-                  <Loader2 size={10} className="animate-spin" /> Saving…
-                </p>
-              )}
-            </div>
-          );
-        })() : (
-          (snapshot?.modes ?? []).length > 0 && (
-            <Section title="Available Models">
-              {(snapshot?.modes ?? []).map((mode, i, arr) => (
-                <Row
-                  key={mode.key}
-                  icon={modeIcon(mode.key)}
-                  label={mode.label}
-                  description={mode.model}
-                  action={
-                    snapshot?.current_mode === mode.key ? (
-                      <span className="badge-model">Active</span>
-                    ) : undefined
-                  }
-                  last={i === arr.length - 1}
-                />
-              ))}
-            </Section>
-          )
-        )}
 
         {/* ── Cloud Account ─────────────────────────────── */}
         <Section title="Cloud Account">

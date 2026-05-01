@@ -257,15 +257,14 @@ struct BackendState(Arc<Mutex<Option<BackendEndpoint>>>);
 struct StreamingState(Mutex<Option<tokio::sync::oneshot::Receiver<String>>>);
 
 /// Lightweight cache of tray-relevant prefs so `sync_tray` never needs async.
-/// Updated whenever patch_preferences or tray_set_model changes the model.
 struct TrayCache(Mutex<TrayCacheInner>);
 struct TrayCacheInner {
-    selected_model: String,       // "smart" | "mini"
-    custom_prompt:  Option<String>,
+    custom_prompt:   Option<String>,
+    output_language: String,        // "hinglish" | "english" | "hindi"
 }
 impl Default for TrayCacheInner {
     fn default() -> Self {
-        Self { selected_model: "smart".into(), custom_prompt: None }
+        Self { custom_prompt: None, output_language: "hinglish".into() }
     }
 }
 
@@ -282,14 +281,12 @@ fn tray_title(state: &str) -> &'static str {
 }
 
 /// Build the dynamic tray menu.
-/// Re-run on every state change so recording label and model checkmarks stay in sync.
-///
-/// `selected_model` — "smart" | "mini"; loaded from SQLite prefs.
+/// Re-run on every state change so recording label and language checkmarks stay in sync.
 fn build_tray_menu(
-    app:            &tauri::AppHandle,
-    snap:           &AppSnapshot,
-    selected_model: &str,
-    custom_prompt:  Option<&str>,
+    app:             &tauri::AppHandle,
+    snap:            &AppSnapshot,
+    custom_prompt:   Option<&str>,
+    output_language: &str,
 ) -> Result<Menu<tauri::Wry>, tauri::Error> {
 
     // ── 1. Toggle recording (state-aware label + enabled) ──────────────
@@ -303,17 +300,21 @@ fn build_tray_menu(
         app, "tray_toggle", toggle_label, toggle_enabled, None::<&str>,
     )?;
 
-    // ── 2. Model submenu — GPT-5.4 / GPT-5.4 Mini ──────────────────────
-    let smart_label = if selected_model == "smart" { "✓  Smart  (gpt-5.4)" } else { "    Smart  (gpt-5.4)" };
-    let mini_label  = if selected_model == "mini"  { "✓  Fast   (gpt-5.4-mini)" } else { "    Fast   (gpt-5.4-mini)" };
-    let model_smart = MenuItem::with_id(app, "tray_model_smart", smart_label, true, None::<&str>)?;
-    let model_mini  = MenuItem::with_id(app, "tray_model_mini",  mini_label,  true, None::<&str>)?;
-    let model_submenu = Submenu::with_items(app, "Model", true, &[
-        &model_smart as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
-        &model_mini,
+    // ── 2. Output language submenu ─────────────────────────────────────
+    let mk_lang = |id: &str, label: &str, active: bool| -> Result<MenuItem<tauri::Wry>, tauri::Error> {
+        let prefix = if active { "✓  " } else { "    " };
+        MenuItem::with_id(app, id, format!("{prefix}{label}"), true, None::<&str>)
+    };
+    let lang_hinglish = mk_lang("tray_lang_hinglish", "Hinglish → Hinglish",         output_language == "hinglish")?;
+    let lang_english  = mk_lang("tray_lang_english",  "Hindi → Polished English",     output_language == "english")?;
+    let lang_hindi    = mk_lang("tray_lang_hindi",     "Hindi → Hindi (Devanagari)",  output_language == "hindi")?;
+    let lang_submenu  = Submenu::with_items(app, "Output Language", true, &[
+        &lang_hinglish as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
+        &lang_english,
+        &lang_hindi,
     ])?;
 
-    // ── 3. "Polish my message" submenu ─────────────────────────────────
+    // ── 4. "Polish my message" submenu ─────────────────────────────────
     // Fixed English-output presets + optional Custom entry
     let p_prof     = MenuItem::with_id(app, "tray_polish_professional", "Professional English", true, None::<&str>)?;
     let p_casual   = MenuItem::with_id(app, "tray_polish_casual",       "Casual",               true, None::<&str>)?;
@@ -350,12 +351,11 @@ fn build_tray_menu(
     let sep2 = PredefinedMenuItem::separator(app)?;
     let sep3 = PredefinedMenuItem::separator(app)?;
     let sep4 = PredefinedMenuItem::separator(app)?;
-    let sep5 = PredefinedMenuItem::separator(app)?;
 
     Menu::with_items(app, &[
         &toggle           as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
         &sep1,
-        &model_submenu,
+        &lang_submenu,
         &sep2,
         &polish_submenu,
         &sep3,
@@ -373,13 +373,13 @@ fn sync_tray(handle: &tauri::AppHandle, snap: &AppSnapshot) {
         let _ = tray.set_title(Some(tray_title(&snap.state)));
 
         // Read from in-process cache — never blocks on async or HTTP
-        let cache   = handle.state::<TrayCache>();
-        let inner   = cache.0.lock().unwrap_or_else(|p| p.into_inner());
-        let model   = inner.selected_model.clone();
-        let custom  = inner.custom_prompt.clone();
+        let cache  = handle.state::<TrayCache>();
+        let inner  = cache.0.lock().unwrap_or_else(|p| p.into_inner());
+        let custom = inner.custom_prompt.clone();
+        let lang   = inner.output_language.clone();
         drop(inner);
 
-        if let Ok(menu) = build_tray_menu(handle, snap, &model, custom.as_deref()) {
+        if let Ok(menu) = build_tray_menu(handle, snap, custom.as_deref(), &lang) {
             let _ = tray.set_menu(Some(menu));
         }
     }
@@ -411,46 +411,6 @@ fn tray_toggle_recording(app: &tauri::AppHandle) {
         }
         desktop::AppState::Processing => {} // ignore — already in flight
     }
-}
-
-/// Switch active model from a tray menu click.
-fn tray_set_model(app: &tauri::AppHandle, key: &str) {
-    let shared  = app.state::<SharedApp>();
-    let backend = app.state::<BackendState>();
-
-    // Update the tray cache immediately — sync_tray reads from here
-    if let Ok(mut cache) = app.state::<TrayCache>().0.lock() {
-        cache.selected_model = key.to_string();
-    }
-
-    let snap = match shared.0.lock() {
-        Ok(mut d) => d.set_mode(key).ok(),
-        Err(_) => None,
-    };
-    if let Some(snap) = snap {
-        sync_tray(app, &snap);
-        let _ = app.emit("app-state", &snap);
-    }
-
-    // Persist to backend SQLite (fire-and-forget)
-    let back_arc = Arc::clone(&backend.0);
-    let key_owned = key.to_string();
-    tauri::async_runtime::spawn(async move {
-        let ep = {
-            let lock = match back_arc.lock() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            match lock.clone() {
-                Some(e) => e,
-                None    => return,
-            }
-        };
-        let _ = api::patch_preferences(
-            &ep,
-            api::PrefsUpdate { selected_model: Some(key_owned), ..Default::default() },
-        ).await;
-    });
 }
 
 /// Polish the currently selected text using the given tone preset.
@@ -515,6 +475,36 @@ fn tray_open_settings(app: &tauri::AppHandle) {
         let _ = w.set_focus();
     }
     let _ = app.emit("nav-settings", ());
+}
+
+/// Switch output language from the tray menu and persist to SQLite.
+fn tray_set_output_language(app: &tauri::AppHandle, lang: &str) {
+    // Update cache immediately so sync_tray shows the new checkmark
+    if let Ok(mut cache) = app.state::<TrayCache>().0.lock() {
+        cache.output_language = lang.to_string();
+    }
+    // Re-render tray with new checkmark
+    let shared = app.state::<SharedApp>();
+    if let Ok(d) = shared.0.lock() {
+        let snap = d.snapshot();
+        drop(d);
+        sync_tray(app, &snap);
+    }
+    // Persist to backend (fire-and-forget)
+    let backend  = app.state::<BackendState>();
+    let ep_opt   = backend.0.lock().ok().and_then(|g| g.clone());
+    let lang_own = lang.to_string();
+    let app_h    = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Some(ep) = ep_opt {
+            let _ = api::patch_preferences(&ep, api::PrefsUpdate {
+                output_language: Some(lang_own),
+                ..Default::default()
+            }).await;
+            // Tell the frontend to refresh its prefs so the settings page stays in sync
+            let _ = app_h.emit("prefs-changed", ());
+        }
+    });
 }
 
 /// Initiate OpenAI OAuth from the tray menu — opens the system browser and
@@ -592,8 +582,8 @@ async fn patch_preferences(
             tracing::info!("[patch_prefs] backend returned: llm_provider={:?}", p.llm_provider);
             // Keep tray cache in sync so sync_tray never needs async
             if let Ok(mut cache) = tray_cache.0.lock() {
-                cache.selected_model = p.selected_model.clone();
-                cache.custom_prompt  = p.custom_prompt.clone();
+                cache.custom_prompt   = p.custom_prompt.clone();
+                cache.output_language = p.output_language.clone();
             }
             // Re-render tray menu to show updated checkmark
             let shared = app.state::<SharedApp>();
@@ -629,26 +619,14 @@ async fn submit_edit_feedback(
 }
 
 #[tauri::command]
-async fn set_mode(
-    key:     String,
-    state:   State<'_, SharedApp>,
-    backend: State<'_, BackendState>,
-    app:     tauri::AppHandle,
+fn set_mode(
+    _key:  String,
+    state: State<'_, SharedApp>,
+    app:   tauri::AppHandle,
 ) -> Result<AppSnapshot, String> {
-    // 1. Update in-memory mode index (affects the snapshot shown in the UI)
-    let snap = state.0.lock().map_err(|_| "lock failed")?.set_mode(&key)?;
+    // Model switching removed — always uses gpt-5.4-mini.
+    let snap = state.0.lock().map_err(|_| "lock failed")?.snapshot();
     sync_tray(&app, &snap);
-
-    // 2. Persist selected_model to backend SQLite (affects actual polish calls)
-    //    Fire-and-forget — if backend isn't up yet, we still return the snap.
-    if let Ok(ep) = get_endpoint(&backend) {
-        let _ = api::patch_preferences(&ep, api::PrefsUpdate {
-            selected_model: Some(key),
-            ..Default::default()
-        })
-        .await;
-    }
-
     Ok(snap)
 }
 
@@ -730,7 +708,7 @@ fn toggle_recording(
                 if let Ok(ref done) = result {
                     let back3 = Arc::clone(&back_arc2);
                     tauri::async_runtime::spawn(watch_for_edit(
-                        back3,
+                        back3, app2.clone(),
                         done.recording_id.clone(),
                         done.polished.clone(),
                         watch_start,
@@ -913,7 +891,7 @@ fn do_finish_recording(
         if let Ok(ref done) = result {
             let back3 = Arc::clone(&back_arc2);
             tauri::async_runtime::spawn(watch_for_edit(
-                back3,
+                back3, app2.clone(),
                 done.recording_id.clone(),
                 done.polished.clone(),
                 watch_start,
@@ -972,10 +950,10 @@ async fn run_voice_polish_sse(
             api::PolishEvent::Done(done) => {
                 let _ = app_clone.emit("voice-done", done);
             }
-            api::PolishEvent::Error { message } => {
+            api::PolishEvent::Error { message, audio_id } => {
                 let _ = app_clone.emit(
                     "voice-error",
-                    serde_json::json!({ "message": message }),
+                    serde_json::json!({ "message": message, "audio_id": audio_id }),
                 );
             }
         }
@@ -990,6 +968,75 @@ async fn run_voice_polish_sse(
     }
 
     Ok(done)
+}
+
+/// Retry a failed recording by re-submitting its saved WAV file.
+/// `audio_id` is the UUID that the backend included in the `voice-error` event.
+#[tauri::command]
+fn retry_recording(
+    audio_id: String,
+    state:    State<'_, SharedApp>,
+    backend:  State<'_, BackendState>,
+    app:      tauri::AppHandle,
+) -> Result<(), String> {
+    // Read WAV from the saved file
+    let audio_dir = {
+        let base = dirs::data_local_dir()
+            .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        base.join("VoicePolish").join("audio")
+    };
+    let wav_path = audio_dir.join(format!("{audio_id}.wav"));
+    let wav = std::fs::read(&wav_path)
+        .map_err(|e| format!("saved audio not found: {e}"))?;
+
+    // Mark as processing so the UI shows a spinner
+    {
+        let mut d = state.0.lock().map_err(|_| "lock failed")?;
+        if d.state != desktop::AppState::Idle {
+            return Err("busy — wait for current operation to finish".into());
+        }
+        d.state = desktop::AppState::Processing;
+    }
+
+    let shared2   = Arc::clone(&state.0);
+    let app2      = app.clone();
+    let back_arc2 = Arc::clone(&backend.0);
+
+    tauri::async_runtime::spawn(async move {
+        let result = run_voice_polish_sse(&back_arc2, wav, None, None, &app2).await;
+
+        let watch_start = std::time::Instant::now();
+        if let Ok(ref done) = result {
+            let back3 = Arc::clone(&back_arc2);
+            tauri::async_runtime::spawn(watch_for_edit(
+                back3, app2.clone(),
+                done.recording_id.clone(),
+                done.polished.clone(),
+                watch_start,
+            ));
+        }
+
+        let mut d = match shared2.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let snap = match result {
+            Ok(done) => d.finish_ok(ProcessSummary {
+                transcript:    done.polished.clone(),
+                polished:      done.polished,
+                model:         done.model_used,
+                confidence:    done.confidence.unwrap_or(0.0),
+                transcribe_ms: done.latency_ms.transcribe as u64,
+                polish_ms:     done.latency_ms.polish as u64,
+            }),
+            Err(e) => d.finish_err(e),
+        };
+        sync_tray(&app2, &snap);
+        let _ = app2.emit("app-state", &snap);
+    });
+
+    Ok(())
 }
 
 // ── Cloud auth commands ───────────────────────────────────────────────────────
@@ -1095,10 +1142,11 @@ fn get_endpoint(backend: &State<'_, BackendState>) -> Result<BackendEndpoint, St
 // ── Edit watcher ──────────────────────────────────────────────────────────────
 
 /// After pasting, poll the focused text element for up to 2 minutes.
-/// When the user stops typing for 8 s (or switches apps), submit the final
-/// text as edit feedback so the learning pipeline can capture the correction.
+/// When the user stops typing for 8 s (or switches apps), emit "edit-detected"
+/// so the frontend can ask "Save this preference?" before writing to SQLite.
 async fn watch_for_edit(
     back_arc:     Arc<Mutex<Option<BackendEndpoint>>>,
+    app:          tauri::AppHandle,
     recording_id: String,
     polished:     String,             // the AI-generated text we pasted
     watch_start:  std::time::Instant, // captured at the call site, right after paste
@@ -1275,14 +1323,17 @@ async fn watch_for_edit(
         return;
     }
 
-    // ── Submit to backend ──────────────────────────────────────────────────────
-    let ep = back_arc.lock().ok().and_then(|g| g.clone());
-    if let Some(ep) = ep {
-        match api::submit_feedback(&ep, &recording_id, &user_kept, None).await {
-            Ok(()) => tracing::info!("[edit-watch] ✓ feedback submitted for {recording_id}"),
-            Err(e) => tracing::warn!("[edit-watch] feedback error for {recording_id}: {e}"),
-        }
-    }
+    // ── Emit to frontend for user confirmation ─────────────────────────────────
+    // The frontend shows "Save this preference?" with a diff — user must confirm
+    // before we write to the learning corpus.
+    tracing::info!("[edit-watch] emitting edit-detected for {recording_id}");
+    let _ = app.emit("edit-detected", serde_json::json!({
+        "recording_id": recording_id,
+        "ai_output":    polished,
+        "user_kept":    user_kept,
+    }));
+    // The Tauri command `submit_edit_feedback` is called by the frontend if user confirms.
+    let _ = back_arc; // keep arc alive until end of scope
 }
 
 /// Given what we pasted (`polished`), where the field was right after paste
@@ -1347,8 +1398,8 @@ fn main() {
                         tauri::async_runtime::spawn(async move {
                             if let Ok(prefs) = api::get_preferences(&ep).await {
                                 if let Ok(mut cache) = app_h.state::<TrayCache>().0.lock() {
-                                    cache.selected_model = prefs.selected_model;
-                                    cache.custom_prompt  = prefs.custom_prompt;
+                                    cache.custom_prompt   = prefs.custom_prompt;
+                                    cache.output_language = prefs.output_language;
                                 }
                                 // Re-render now that we have real data
                                 let shared = app_h.state::<SharedApp>();
@@ -1373,7 +1424,7 @@ fn main() {
                 // Initial menu uses defaults (model=smart, no custom prompt) —
                 // sync_tray() will refresh it with real prefs once the backend is ready.
                 let initial_menu = match &initial_snap {
-                    Some(snap) => build_tray_menu(app.handle(), snap, "smart", None)?,
+                    Some(snap) => build_tray_menu(app.handle(), snap, None, "hinglish")?,
                     None => Menu::with_items(app, &[
                         &MenuItem::with_id(app, "show", "Open Said", true, None::<&str>)?,
                         &PredefinedMenuItem::separator(app)?,
@@ -1410,10 +1461,10 @@ fn main() {
                             "settings"  => tray_open_settings(app),
                             "reconnect" => tray_reconnect_openai(app),
                             "quit"      => app.exit(0),
-                            // Model switch — "smart" | "mini"
-                            _ if id.starts_with("tray_model_") => {
-                                let key = &id["tray_model_".len()..];
-                                tray_set_model(app, key);
+                            // Output language switch
+                            _ if id.starts_with("tray_lang_") => {
+                                let lang = &id["tray_lang_".len()..];
+                                tray_set_output_language(app, lang);
                             }
                             // Polish my message — tone preset suffix
                             _ if id.starts_with("tray_polish_") => {
@@ -1490,12 +1541,21 @@ fn main() {
             get_openai_status,
             initiate_openai_oauth,
             disconnect_openai,
+            // Retry
+            retry_recording,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Voice Polish desktop")
         .run(|_handle, event| {
-            if let tauri::RunEvent::ExitRequested { api, .. } = event {
-                api.prevent_exit();
+            // Only prevent exit when the last window is closed (so closing the
+            // window hides it rather than quitting). An explicit app.exit(0)
+            // from the tray "Quit Said" item bypasses this and terminates.
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+                if code.is_none() {
+                    // Window closed — hide instead of quit
+                    api.prevent_exit();
+                }
+                // code.is_some() means app.exit(N) was called — let it through
             }
         });
 }

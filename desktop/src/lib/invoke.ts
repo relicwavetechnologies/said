@@ -104,15 +104,14 @@ const MOCK_AVG_WPM = Math.round(
 const mockSnapshot: AppSnapshot = {
   state: "idle",
   platform: "browser-preview",
-  current_mode: "smart",
-  current_mode_label: "Smart",
-  current_model: "gpt-5.4",
+  current_mode: "mini",
+  current_mode_label: "Fast (gpt-5.4-mini)",
+  current_model: "gpt-5.4-mini",
   auto_paste_supported: false,
   accessibility_granted: false,
   input_monitoring_granted: false,
   modes: [
-    { key: "fast",  label: "Fast (gpt-5.4-mini)", model: "gpt-5.4-mini", icon: "fast"  },
-    { key: "smart", label: "Smart (gpt-5.4)",     model: "gpt-5.4",      icon: "smart" },
+    { key: "mini", label: "Fast (gpt-5.4-mini)", model: "gpt-5.4-mini", icon: "fast" },
   ],
   last_result: {
     transcript: "kal sham meeting thodi delayed ho gayi thi",
@@ -139,13 +138,8 @@ async function mockInvoke(
     return structuredClone(mockSnapshot);
   }
 
-  if (command === "set_mode" && args) {
-    const mode = mockSnapshot.modes.find((m) => m.key === args.key);
-    if (mode) {
-      mockSnapshot.current_mode = mode.key;
-      mockSnapshot.current_mode_label = mode.label;
-      mockSnapshot.current_model = mode.model;
-    }
+  if (command === "set_mode") {
+    // Model switching removed — always mini
     return structuredClone(mockSnapshot);
   }
 
@@ -355,15 +349,32 @@ export function onVoiceDone(
   return () => unsub();
 }
 
-/** Listen for error events. */
+/** Listen for error events. `audioId` is the saved WAV id for retrying. */
 export function onVoiceError(
-  handler: (message: string) => void
+  handler: (message: string, audioId?: string) => void
 ): Unsubscribe {
   if (!isTauriRuntime()) return () => {};
   let unsub: Unsubscribe = () => {};
-  listen<{ message: string }>("voice-error", (e) =>
-    handler(e.payload.message)
+  listen<{ message: string; audio_id?: string }>("voice-error", (e) =>
+    handler(e.payload.message, e.payload.audio_id)
   ).then((fn) => { unsub = fn; });
+  return () => unsub();
+}
+
+/** Listen for detected edits that need user confirmation before being saved. */
+export interface EditDetectedPayload {
+  recording_id: string;
+  ai_output:    string;
+  user_kept:    string;
+}
+export function onEditDetected(
+  handler: (payload: EditDetectedPayload) => void
+): Unsubscribe {
+  if (!isTauriRuntime()) return () => {};
+  let unsub: Unsubscribe = () => {};
+  listen<EditDetectedPayload>("edit-detected", (e) => handler(e.payload)).then(
+    (fn) => { unsub = fn; }
+  );
   return () => unsub();
 }
 

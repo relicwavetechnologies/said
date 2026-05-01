@@ -5,22 +5,9 @@ import {
   BarChart2,
   Settings,
   HelpCircle,
-  Zap,
-  Brain,
-  Bot,
-  Sparkles,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { AppSnapshot } from "@/types";
-
-// ── Mode → icon mapping ────────────────────────────────────────────────────────
-
-function modeIcon(key: string) {
-  if (key.includes("fast") || key.includes("mini")) return <Zap     size={14} />;
-  if (key.includes("claude"))                        return <Bot     size={14} />;
-  if (key.includes("gemini"))                        return <Sparkles size={14} />;
-  return <Brain size={14} />;
-}
 
 // ── Nav item type ──────────────────────────────────────────────────────────────
 
@@ -80,17 +67,15 @@ function NavButton({
 // ── Props ──────────────────────────────────────────────────────────────────────
 
 interface SidebarProps {
-  snapshot:       AppSnapshot | null;
-  activeView:     string;
-  onViewChange:   (view: string) => void;
-  busy:           boolean;
-  openAIModel?:   "smart" | "mini";
-  onOpenAIModel?: (m: "smart" | "mini") => void;
+  snapshot:     AppSnapshot | null;
+  activeView:   string;
+  onViewChange: (view: string) => void;
+  busy:         boolean;
 }
 
 // ── Component ──────────────────────────────────────────────────────────────────
 
-export function Sidebar({ snapshot, activeView, onViewChange, busy, openAIModel = "smart", onOpenAIModel }: SidebarProps) {
+export function Sidebar({ snapshot, activeView, onViewChange, busy }: SidebarProps) {
   const isRecording  = snapshot?.state === "recording";
   const isProcessing = snapshot?.state === "processing" || busy;
 
@@ -176,35 +161,6 @@ export function Sidebar({ snapshot, activeView, onViewChange, busy, openAIModel 
                 onClick={() => !busy && onViewChange(item.id)}
               />
             ))}
-          </div>
-        </section>
-
-        {/* Models section — OpenAI GPT-5.4 / GPT-5.4 Mini */}
-        <section>
-          <p className="section-label px-3 mb-2">Models</p>
-          <div className="space-y-0.5">
-            {([
-              { key: "smart" as const, label: "Smart (gpt-5.4)",      icon: <Brain size={14} /> },
-              { key: "mini"  as const, label: "Fast (gpt-5.4-mini)",  icon: <Zap   size={14} /> },
-            ]).map((m) => {
-              const isActive = openAIModel === m.key;
-              return (
-                <button
-                  key={m.key}
-                  onClick={() => !busy && onOpenAIModel?.(m.key)}
-                  className={cn("nav-item", isActive && "active")}
-                >
-                  <span className="flex-shrink-0 opacity-70">{m.icon}</span>
-                  <span className="flex-1 truncate">{m.label}</span>
-                  {isActive && (
-                    <span
-                      className="w-1.5 h-1.5 rounded-full flex-shrink-0"
-                      style={{ background: "hsl(var(--primary))" }}
-                    />
-                  )}
-                </button>
-              );
-            })}
           </div>
         </section>
 
