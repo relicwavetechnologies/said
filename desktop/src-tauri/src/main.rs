@@ -1325,10 +1325,13 @@ async fn watch_for_edit(
         return;
     }
 
-    // ── Emit to frontend for user confirmation ─────────────────────────────────
-    // The frontend shows "Save this preference?" with a diff — user must confirm
-    // before we write to the learning corpus.
+    // ── Show window + emit to frontend for user confirmation ──────────────────
+    // The toast renders inside the Tauri window, so bring it to the front first.
     tracing::info!("[edit-watch] emitting edit-detected for {recording_id}");
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
     let _ = app.emit("edit-detected", serde_json::json!({
         "recording_id": recording_id,
         "ai_output":    polished,
