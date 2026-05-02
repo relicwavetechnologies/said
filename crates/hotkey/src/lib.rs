@@ -274,7 +274,8 @@ mod imp {
     /// syscall entirely — the permission can only be revoked with an app restart.
     /// Slow path: calls the API at most every 2 s (debounce).  When permission
     /// transitions from denied → granted after launch, automatically restarts the
-    /// hold listener using the stored callbacks.
+    /// hold listener using the stored callbacks — but ONLY if `start_hold_listener`
+    /// was already called and its initial tap creation failed.
     pub fn is_input_monitoring_granted() -> bool {
         // Fast path — tap is already running, permission can't be revoked at runtime.
         if TAP_CREATED.load(Ordering::Relaxed) { return true; }
@@ -293,11 +294,18 @@ mod imp {
         let granted = unsafe { ffi::CGPreflightListenEventAccess() };
         if !granted { return false; }
 
-        // Permission was just granted (transition: denied → granted after launch).
-        tracing::info!("[hotkey] Input Monitoring newly granted — restarting hold listener");
+        // Permission IS granted.  But only restart the listener if
+        // start_hold_listener was already called (HOLD_CALLBACKS is set) AND the
+        // tap it spawned failed (TAP_CREATED is still false).  If the initial
+        // start_hold_listener hasn't been called yet, just report the status —
+        // don't spawn a tap, because start_hold_listener will do that itself.
+        if HOLD_CALLBACKS.get().is_some() {
+            // start_hold_listener was called earlier but its tap creation failed.
+            // Now permission is granted — spawn a new tap.
+            TAP_CREATED.store(true, Ordering::Relaxed);
+            tracing::info!("[hotkey] Input Monitoring newly granted — restarting hold listener");
 
-        // Restart the hold listener with the saved callbacks.
-        if let Some((on_press, on_release)) = HOLD_CALLBACKS.get() {
+            let (on_press, on_release) = HOLD_CALLBACKS.get().unwrap();
             let p = Arc::clone(on_press);
             let r = Arc::clone(on_release);
             std::thread::spawn(move || unsafe {

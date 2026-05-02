@@ -668,9 +668,19 @@ pub async fn store_pending_edit(
 /// Three-way edit classifier response.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ClassifyEditResponse {
-    pub should_learn: bool,
-    pub reason:       String,
-    pub pending_id:   Option<String>,
+    pub should_learn:     bool,
+    pub reason:           String,
+    pub pending_id:       Option<String>,
+    /// Number of word/phrase corrections found in this edit.
+    #[serde(default)]
+    pub correction_count: usize,
+    /// True if any correction matches a previously-seen correction.
+    #[serde(default)]
+    pub is_repeat:        bool,
+    /// True if the user should be notified (2+ corrections OR repeat).
+    /// Single first-time corrections are stored silently.
+    #[serde(default)]
+    pub notify:           bool,
 }
 
 /// Classify an edit using the Groq-based three-way classifier.
