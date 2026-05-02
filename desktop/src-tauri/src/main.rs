@@ -37,41 +37,79 @@ use voice_polish_hotkey as hotkey;
 /// after `since`.  Returns `None` only if reconstruction is truly unreliable
 /// Show a macOS native notification.
 ///
-/// `tauri-plugin-notification` uses `mac-notification-sys`, which requires the
-/// calling process to live inside a proper `.app` bundle with a registered
-/// bundle identifier.  In `tauri dev` we run the raw debug binary directly
-/// (`target/debug/voice-polish-desktop`) — the Cocoa call still returns OK,
-/// but macOS silently refuses to display the banner.
+/// Two-path notifier.
 ///
-/// `osascript` always works because AppleScript executes inside Apple's
-/// bundled Script Editor process, which has notification permission by
-/// default.  We use it as the primary path in dev, the Tauri plugin in
-/// release.  The function is non-blocking-ish — osascript spawn returns in
-/// ~50 ms; we don't wait for the child.
+/// The macOS notification banner shows the icon of the *process that posted
+/// it*, which is why we have two paths:
+///
+/// 1. **Production (.app bundle):** use `tauri-plugin-notification`. The
+///    plugin posts via the app's own bundle, so the banner shows the Said
+///    icon (icon.icns from tauri.conf.json's `bundle.icon`). This is the
+///    only path that gets the brand on the banner.
+///
+/// 2. **Dev (raw debug binary):** the plugin silently no-ops because
+///    `mac-notification-sys` requires a registered bundle identifier.
+///    Fall back to `osascript`, which always shows a banner but uses the
+///    Script Editor icon (we can't override it via AppleScript). At least
+///    the user sees *that* something happened in dev.
+///
+/// We detect "running inside a .app" by inspecting the executable path
+/// (`*.app/Contents/MacOS/*`). Cheap, no syscalls, no environment sniffing.
 #[cfg(target_os = "macos")]
-fn notify_macos(title: &str, body: &str) {
-    use std::process::{Command, Stdio};
+fn notify_macos(app: &tauri::AppHandle, title: &str, body: &str) {
+    use tauri_plugin_notification::NotificationExt;
 
+    if is_bundled_app() {
+        match app
+            .notification()
+            .builder()
+            .title(title)
+            .body(body)
+            .show()
+        {
+            Ok(_) => {
+                tracing::info!("[notify] plugin sent (Said icon): {title}");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("[notify] plugin failed: {e} — falling back to osascript");
+            }
+        }
+    }
+    osa_fallback(title, body);
+}
+
+#[cfg(target_os = "macos")]
+fn is_bundled_app() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .map(|s| s.contains(".app/Contents/MacOS/"))
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn osa_fallback(title: &str, body: &str) {
+    use std::process::{Command, Stdio};
     // AppleScript string literals: backslash-escape `\` and `"`.
     let title_esc = title.replace('\\', "\\\\").replace('"', "\\\"");
     let body_esc  = body .replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!(
         r#"display notification "{body_esc}" with title "{title_esc}""#
     );
-
     match Command::new("osascript")
         .arg("-e").arg(&script)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
     {
-        Ok(_)  => tracing::info!("[notify] osa sent: {title}"),
+        Ok(_)  => tracing::info!("[notify] osa sent (no icon): {title}"),
         Err(e) => tracing::warn!("[notify] osascript spawn failed: {e}"),
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn notify_macos(_title: &str, _body: &str) {}
+fn notify_macos(_app: &tauri::AppHandle, _title: &str, _body: &str) {}
 
 /// Translate a raw pipeline error string into one short human sentence.
 ///
@@ -1169,6 +1207,7 @@ async fn run_voice_polish_sse(
                 // banner is the only attention signal; the user controls when
                 // to bring Said forward.
                 notify_macos(
+                    &app_clone,
                     "Said couldn't finish that recording",
                     &format!("{human}  Open Said to retry or view history."),
                 );
@@ -1389,6 +1428,7 @@ async fn add_vocabulary_term(
 
     // OS-level fallback for when the Said window isn't focused.
     notify_macos(
+        &app,
         "Added to vocabulary",
         &format!("Said will recognise \"{term}\" on your next recording."),
     );
@@ -1427,6 +1467,7 @@ async fn star_vocabulary_term(
             "kind": "starred", "term": term,
         }));
         notify_macos(
+            &app,
             "Pinned to vocabulary",
             &format!("Said will keep \"{term}\" even if you stop using it."),
         );
@@ -1938,7 +1979,7 @@ async fn watch_for_edit(
                             "Said remembered your correction.".to_string(),
                         ),
                     };
-                    notify_macos(title, &body);
+                    notify_macos(&app, title, &body);
                 }
 
                 if resp.learned || resp.pending_id.is_some() {
