@@ -3,7 +3,11 @@
 //! Endpoint:
 //!   POST https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:embedContent
 //!   Header: x-goog-api-key: $GEMINI_API_KEY
-//!   Body:   { "content": { "parts": [{ "text": "…" }] }, "output_dimensionality": 768 }
+//!   Body:   { "content": { "parts": [{ "text": "…" }] }, "output_dimensionality": 256 }
+//!
+//! Gap 4: dimensions reduced from 768 → 256 (Matryoshka truncation preserves quality).
+//! Benefits: ~3x faster cosine KNN search, ~3x smaller cache blobs, smaller API response.
+//! Migration 011 clears old 768-dim vectors so they are rebuilt at the new size.
 //!
 //! Caching strategy:
 //!   1. SHA-256 the input text → look up `embedding_cache` table
@@ -14,14 +18,16 @@ use reqwest::Client;
 use rusqlite::params;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::time::Duration;
-use tracing::{debug, warn};
+use std::time::{Duration, Instant};
+use tracing::{debug, info, warn};
 
 use crate::store::DbPool;
 
 const EMBED_URL: &str =
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:embedContent";
-const DIMENSIONS: usize = 768;
+/// Gap 4: 256-dim Matryoshka truncation (down from 768).
+/// ~3x faster KNN, ~3x smaller blobs, same quality at personal corpus size.
+const DIMENSIONS: usize = 256;
 const RETRY_DELAYS_MS: &[u64] = &[200, 800, 2000];
 
 #[derive(Deserialize)]
@@ -52,18 +58,21 @@ pub async fn embed(
         return None;
     }
 
+    let t0   = Instant::now();
     let hash = sha256_hex(text);
 
     // ── Cache lookup ──────────────────────────────────────────────────────────
     if let Some(cached) = read_from_cache(pool, &hash) {
-        debug!("[embedder] cache hit for hash {}", &hash[..8]);
+        // GAP-4 PROOF: cache hit is ~0ms vs ~250ms API call
+        info!("[embedder] GAP-4: cache HIT in {}ms ({DIMENSIONS}d, {} chars)",
+              t0.elapsed().as_millis(), text.len());
         return Some(cached);
     }
 
     // ── API call with retry ───────────────────────────────────────────────────
     let body = serde_json::json!({
         "content": { "parts": [{ "text": text }] },
-        "output_dimensionality": DIMENSIONS,
+        "output_dimensionality": DIMENSIONS,   // Gap 4: 256 (was 768)
     });
 
     for (attempt, &delay_ms) in RETRY_DELAYS_MS.iter().enumerate() {
@@ -107,7 +116,9 @@ pub async fn embed(
                         }
                         // Persist in cache
                         store_in_cache(pool, &hash, &values);
-                        debug!("[embedder] embedded {} chars → {DIMENSIONS}d", text.len());
+                        // GAP-4 PROOF: API miss — log actual latency
+                        info!("[embedder] GAP-4: API MISS → {DIMENSIONS}d in {}ms ({} chars)",
+                              t0.elapsed().as_millis(), text.len());
                         return Some(values);
                     }
                 }

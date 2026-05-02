@@ -1,5 +1,6 @@
 pub mod gateway;
 pub mod gemini_direct;
+pub mod groq;
 pub mod openai_codex;
 pub mod prompt;
 

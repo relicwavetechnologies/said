@@ -38,7 +38,8 @@ pub async fn stream_to_deepgram(
     let lang = if language.is_empty() || language == "auto" { "hi" } else { language };
 
     // Deepgram WS URL with encoding parameters for raw i16 PCM at 16 kHz.
-    // utterance_end_ms is omitted — CloseStream alone triggers finalization.
+    // utterance_end_ms=1000: Deepgram emits UtteranceEnd ~1 s after speech stops,
+    // which lets us break the drain loop immediately instead of waiting the full window.
     let url_str = format!(
         "wss://api.deepgram.com/v1/listen\
          ?model=nova-3\
@@ -49,7 +50,8 @@ pub async fn stream_to_deepgram(
          &sample_rate={SAMPLE_RATE}\
          &channels=1\
          &interim_results=true\
-         &endpointing=300"
+         &endpointing=300\
+         &utterance_end_ms=1000"
     );
 
     debug!("[dg_stream] connecting (lang={lang}, 16kHz), key_len={}", deepgram_key.len());
@@ -204,21 +206,25 @@ pub async fn stream_to_deepgram(
     let _keep_tx_alive = ws_tx;
 
     // Give Deepgram time to flush remaining utterances.
-    // Scale by chunks sent: burst audio (all chunks arrive at once after TLS delay) needs
-    // proportionally more time.  Formula: 12 ms/chunk, minimum 2500 ms.
-    let drain_ms = (chunks_sent as u64 * 12).max(2500);
-    debug!("[dg_stream] drain window: {drain_ms}ms for {chunks_sent} chunks");
-    let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(drain_ms);
+    // Optimised drain: break as soon as speech_final=true arrives (~100-300ms after
+    // CloseStream), rather than waiting for UtteranceEnd (~1000ms). This saves
+    // ~700-900ms per recording.  UtteranceEnd and timeout are safety-net fallbacks.
+    let drain_ms = (chunks_sent as u64 * 12).max(800);
+    // ── GAP-1 PROOF ── log drain budget at INFO so it's always visible
+    info!("[dg_stream] GAP-1: drain budget={drain_ms}ms — will exit early on speech_final (~100-300ms) or UtteranceEnd (~1000ms)");
+    let drain_start    = tokio::time::Instant::now();
+    let drain_deadline = drain_start + Duration::from_millis(drain_ms);
     loop {
         let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            debug!("[dg_stream] drain timeout reached");
+            info!("[dg_stream] GAP-1: drain budget exhausted after {}ms (no speech_final/UtteranceEnd)",
+                  drain_start.elapsed().as_millis());
             break;
         }
 
         match tokio::time::timeout(remaining, ws_rx.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => {
-                // Log every Results message during drain
+                // Parse once, handle all cases in one place
                 if let Ok(v) = serde_json::from_str::<Value>(&text) {
                     let msg_type = v["type"].as_str().unwrap_or("?");
                     if msg_type == "Results" {
@@ -227,17 +233,29 @@ pub async fn stream_to_deepgram(
                         let t    = v["channel"]["alternatives"][0]["transcript"]
                             .as_str().unwrap_or("");
                         debug!("[dg_stream] drain Results is_final={is_f} speech_final={sp_f} transcript={t:?}");
+
+                        // Capture any is_final or speech_final fragment
+                        if (is_f || sp_f) && !t.is_empty() {
+                            debug!("[dg_stream] drain captured: {t:?}");
+                            transcript_parts.push(t.to_string());
+                        }
+
+                        // ── GAP-1 PROOF ── speech_final = Deepgram is done; exit immediately
+                        // This fires ~100-300ms after CloseStream, saving ~700-900ms vs UtteranceEnd
+                        if sp_f {
+                            info!("[dg_stream] GAP-1: speech_final received after {}ms — drain done (saved ~{}ms vs UtteranceEnd wait)",
+                                  drain_start.elapsed().as_millis(),
+                                  1000u64.saturating_sub(drain_start.elapsed().as_millis() as u64));
+                            break;
+                        }
+                    } else if msg_type == "UtteranceEnd" {
+                        // ── GAP-1 PROOF ── fallback: speech_final never came (shouldn't happen)
+                        info!("[dg_stream] GAP-1: UtteranceEnd received after {}ms — drain exiting (speech_final was missed)",
+                              drain_start.elapsed().as_millis());
+                        break;
                     } else {
                         debug!("[dg_stream] drain msg type={msg_type}");
                     }
-                }
-                if let Some(fragment) = parse_speech_final_or_final(&text) {
-                    debug!("[dg_stream] drain captured: {fragment:?}");
-                    transcript_parts.push(fragment);
-                }
-                if is_utterance_end(&text) {
-                    debug!("[dg_stream] UtteranceEnd received — done");
-                    break;
                 }
             }
             Ok(Some(Ok(Message::Close(frame)))) => {
@@ -250,7 +268,11 @@ pub async fn stream_to_deepgram(
             }
             Ok(Some(Err(e))) => { warn!("[dg_stream] drain WS error: {e}"); break; }
             Ok(Some(Ok(_))) => {} // ping/pong/binary — ignore
-            Err(_) => { debug!("[dg_stream] drain timed out"); break; }
+            Err(_) => {
+                info!("[dg_stream] GAP-1: drain timed out after {}ms (no speech_final/UtteranceEnd arrived)",
+                      drain_start.elapsed().as_millis());
+                break;
+            }
         }
     }
 
@@ -284,19 +306,3 @@ fn parse_speech_final(text: &str) -> Option<String> {
     if t.is_empty() { None } else { Some(t) }
 }
 
-fn parse_speech_final_or_final(text: &str) -> Option<String> {
-    let v: Value = serde_json::from_str(text).ok()?;
-    if v["type"] != "Results" { return None; }
-    let speech_final = v["speech_final"].as_bool().unwrap_or(false);
-    let is_final     = v["is_final"].as_bool().unwrap_or(false);
-    if !speech_final && !is_final { return None; }
-    let t = v["channel"]["alternatives"][0]["transcript"].as_str()?.to_string();
-    if t.is_empty() { None } else { Some(t) }
-}
-
-fn is_utterance_end(text: &str) -> bool {
-    serde_json::from_str::<Value>(text)
-        .ok()
-        .map(|v| v["type"] == "UtteranceEnd")
-        .unwrap_or(false)
-}

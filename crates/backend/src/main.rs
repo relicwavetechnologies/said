@@ -49,6 +49,7 @@ async fn main() {
         pool:            pool.clone(),
         shared_secret:   std::sync::Arc::new(secret),
         default_user_id: std::sync::Arc::new(user_id.clone()),
+        prefs_cache:     std::sync::Arc::new(tokio::sync::RwLock::new(None)),
     };
 
     // ── Build router ──────────────────────────────────────────────────────────

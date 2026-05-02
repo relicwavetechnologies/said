@@ -23,6 +23,8 @@ const MIGRATION_006: &str = include_str!("migrations/006_openai_oauth.sql");
 const MIGRATION_007: &str = include_str!("migrations/007_pending_edits.sql");
 const MIGRATION_008: &str = include_str!("migrations/008_recording_audio_id.sql");
 const MIGRATION_009: &str = include_str!("migrations/009_word_corrections.sql");
+const MIGRATION_010: &str = include_str!("migrations/010_groq_api_key.sql");
+const MIGRATION_011: &str = include_str!("migrations/011_embed_dims_256.sql");
 
 /// Open (or create) the SQLite database at `path`, run pending migrations,
 /// and return a connection pool.
@@ -132,6 +134,22 @@ fn run_migrations(pool: &DbPool) {
             .expect("migration 009 failed");
         conn.execute_batch("PRAGMA user_version = 9")
             .expect("failed to set user_version to 9");
+    }
+
+    if version < 10 {
+        info!("running migration 010_groq_api_key");
+        conn.execute_batch(MIGRATION_010)
+            .expect("migration 010 failed");
+        conn.execute_batch("PRAGMA user_version = 10")
+            .expect("failed to set user_version to 10");
+    }
+
+    if version < 11 {
+        info!("running migration 011_embed_dims_256 — clearing 768-dim vectors for 256-dim rebuild");
+        conn.execute_batch(MIGRATION_011)
+            .expect("migration 011 failed");
+        conn.execute_batch("PRAGMA user_version = 11")
+            .expect("failed to set user_version to 11");
     }
 }
 

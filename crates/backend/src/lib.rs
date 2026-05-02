@@ -5,6 +5,8 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 
 pub mod auth;
@@ -14,6 +16,54 @@ pub mod routes;
 pub mod stt;
 pub mod store;
 
+// ── Preferences hot-cache (Gap 3) ─────────────────────────────────────────────
+//
+// Avoids a SQLite SELECT on every voice/text/feedback request.
+// TTL = 30 s. Invalidated immediately on PATCH /v1/preferences.
+// At personal scale one user has exactly one entry, so the HashMap is a formality.
+
+const PREFS_CACHE_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+pub struct CachedPrefs {
+    pub prefs:      store::prefs::Preferences,
+    pub cached_at:  Instant,
+}
+
+pub type PrefsCache = Arc<RwLock<Option<CachedPrefs>>>;
+
+/// Read preferences, hitting the in-memory cache when fresh.
+/// Falls back to SQLite on miss or TTL expiry.
+pub async fn get_prefs_cached(
+    cache: &PrefsCache,
+    pool:  &store::DbPool,
+    user_id: &str,
+) -> Option<store::prefs::Preferences> {
+    // ── Fast path: cache hit ──────────────────────────────────────────────────
+    {
+        let guard = cache.read().await;
+        if let Some(ref entry) = *guard {
+            if entry.cached_at.elapsed() < PREFS_CACHE_TTL {
+                return Some(entry.prefs.clone());
+            }
+        }
+    }
+
+    // ── Slow path: SQLite read + re-populate cache ────────────────────────────
+    let prefs = store::prefs::get_prefs(pool, user_id)?;
+    let mut guard = cache.write().await;
+    *guard = Some(CachedPrefs { prefs: prefs.clone(), cached_at: Instant::now() });
+    tracing::debug!("[prefs-cache] miss → refreshed from SQLite");
+    Some(prefs)
+}
+
+/// Invalidate the cache after a successful preferences update.
+pub async fn invalidate_prefs_cache(cache: &PrefsCache) {
+    let mut guard = cache.write().await;
+    *guard = None;
+    tracing::debug!("[prefs-cache] invalidated");
+}
+
 // ── Application state ─────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -21,6 +71,8 @@ pub struct AppState {
     pub pool:            store::DbPool,
     pub shared_secret:   Arc<String>,
     pub default_user_id: Arc<String>,
+    /// Gap 3: in-memory preferences cache — avoids SQLite SELECT per request.
+    pub prefs_cache:     PrefsCache,
 }
 
 // ── Router factory ────────────────────────────────────────────────────────────
@@ -81,6 +133,7 @@ pub fn router() -> Router {
         pool,
         shared_secret:   Arc::new(secret),
         default_user_id: Arc::new(user_id),
+        prefs_cache:     Arc::new(RwLock::new(None)),
     };
 
     router_with_state(state)

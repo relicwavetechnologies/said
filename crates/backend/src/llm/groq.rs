@@ -1,0 +1,142 @@
+//! Groq LLM client.
+//!
+//! Groq exposes an OpenAI-compatible Chat Completions endpoint with much lower
+//! latency (~200–400 ms TTFT) because requests run on Groq's LPU hardware.
+//!
+//! API reference: https://console.groq.com/docs/openai
+//! Endpoint: https://api.groq.com/openai/v1/chat/completions
+//! Auth: Authorization: Bearer {groq_api_key}
+//!
+//! SSE format is identical to OpenAI: `data: {choices:[{delta:{content:"…"}}]}`
+//!
+//! Recommended models (fast, multilingual):
+//!   - llama-3.3-70b-versatile  (best quality, ~300ms TTFT)
+//!   - llama-3.1-8b-instant     (fastest, ~150ms TTFT)
+//!   - gemma2-9b-it             (Google Gemma, good Hinglish)
+//!   - mixtral-8x7b-32768       (32k context)
+
+use futures::StreamExt;
+use reqwest::Client;
+use serde::Deserialize;
+use serde_json::json;
+use std::time::Instant;
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
+
+pub use super::PolishResult;
+
+const GROQ_ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions";
+
+/// Default model — best balance of quality and speed for Hinglish.
+pub const GROQ_MODEL_DEFAULT: &str = "llama-3.3-70b-versatile";
+/// Fast model — lower latency, slightly less quality.
+pub const GROQ_MODEL_FAST:    &str = "llama-3.1-8b-instant";
+
+// ── SSE types (identical to OpenAI format) ────────────────────────────────────
+
+#[derive(Deserialize)]
+struct StreamChunk {
+    choices: Vec<StreamChoice>,
+}
+#[derive(Deserialize)]
+struct StreamChoice {
+    delta: Delta,
+}
+#[derive(Deserialize)]
+struct Delta {
+    #[serde(default)]
+    content: Option<String>,
+}
+
+/// Stream a polish operation through Groq's Chat Completions API.
+///
+/// `model` defaults to `GROQ_MODEL_DEFAULT` if empty.
+/// Each token is sent on `token_tx` as it arrives.
+/// Returns the final concatenated text + latency.
+pub async fn stream_polish(
+    client:        &Client,
+    groq_api_key:  &str,
+    model:         &str,
+    system_prompt: &str,
+    user_message:  &str,
+    token_tx:      mpsc::Sender<String>,
+) -> Result<PolishResult, String> {
+    if groq_api_key.is_empty() {
+        return Err("Groq API key not set — add it in Settings → API Keys".to_string());
+    }
+
+    let model = if model.is_empty() { GROQ_MODEL_DEFAULT } else { model };
+    let start = Instant::now();
+
+    let body = json!({
+        "model":       model,
+        "stream":      true,
+        "temperature": 0.3,
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user",   "content": user_message  },
+        ]
+    });
+
+    info!("[groq] POST {GROQ_ENDPOINT} model={model}");
+
+    let resp = client
+        .post(GROQ_ENDPOINT)
+        .header("Authorization", format!("Bearer {groq_api_key}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+        .await
+        .map_err(|e| format!("Groq request failed: {e}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp.text().await.unwrap_or_default();
+        warn!("[groq] HTTP {status}: {body_text}");
+        return Err(format!("Groq API error {status}: {}", &body_text[..body_text.len().min(400)]));
+    }
+
+    // Stream SSE response
+    let mut stream   = resp.bytes_stream();
+    let mut polished = String::new();
+    let mut buf      = String::new();
+    let mut ttft_ms: Option<u64> = None;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Groq stream read error: {e}"))?;
+        let text  = String::from_utf8_lossy(&chunk);
+        buf.push_str(&text);
+
+        while let Some(nl) = buf.find('\n') {
+            let line = buf[..nl].trim().to_string();
+            buf = buf[nl + 1..].to_string();
+
+            if !line.starts_with("data: ") { continue; }
+            let data = &line[6..];
+            if data == "[DONE]" { break; }
+
+            if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
+                for choice in chunk.choices {
+                    if let Some(token) = choice.delta.content {
+                        if !token.is_empty() {
+                            if ttft_ms.is_none() {
+                                let ms = start.elapsed().as_millis() as u64;
+                                ttft_ms = Some(ms);
+                                info!("[groq] first token in {ms}ms");
+                            }
+                            polished.push_str(&token);
+                            debug!("[groq] token: {token:?}");
+                            let _ = token_tx.send(token).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let polish_ms = start.elapsed().as_millis() as u64;
+    info!("[groq] done in {polish_ms}ms, {} chars", polished.len());
+
+    Ok(PolishResult { polished, polish_ms })
+}

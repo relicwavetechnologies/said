@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Clock, Copy, Play, Pause, Trash2, Tag, MoreHorizontal, Check } from "lucide-react";
+import { Clock, Copy, Play, Pause, Trash2, MoreHorizontal, Check } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { groupHistory } from "@/types";
 import type { Recording } from "@/types";
@@ -136,12 +136,6 @@ function HistoryRow({ recording, playingId, onPlay, onDelete }: RowProps) {
           {recording.word_count != null && (
             <span className="text-[11px] text-muted-foreground tabular-nums">
               {recording.word_count} words
-            </span>
-          )}
-          {recording.model_used && (
-            <span className="flex items-center gap-1 text-[11px] text-muted-foreground">
-              <Tag size={9} className="opacity-70" />
-              {recording.model_used}
             </span>
           )}
           {isPlaying && (

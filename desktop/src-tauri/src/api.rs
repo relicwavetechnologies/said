@@ -32,7 +32,9 @@ pub struct Preferences {
     pub gemini_api_key:     Option<String>,
     #[serde(default)]
     pub gateway_api_key:    Option<String>,
-    /// LLM routing: "gateway" | "gemini_direct"
+    #[serde(default)]
+    pub groq_api_key:       Option<String>,
+    /// LLM routing: "gateway" | "gemini_direct" | "groq" | "openai_codex"
     #[serde(default = "default_llm_provider")]
     pub llm_provider:       String,
 }
@@ -64,7 +66,9 @@ pub struct PrefsUpdate {
     pub deepgram_api_key:   Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gemini_api_key:     Option<String>,
-    /// LLM routing: "gateway" | "gemini_direct"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub groq_api_key:       Option<String>,
+    /// LLM routing: "gateway" | "gemini_direct" | "groq" | "openai_codex"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_provider:       Option<String>,
 }

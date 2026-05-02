@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import {
-  Shield, Cpu, Key, Info, Wifi, Check, Bot, Sparkles,
+  Shield, Cpu, Key, Info, Wifi, Check, Bot, Sparkles, Zap,
   Languages, MessageSquareText, Loader2, Cloud, LogIn, LogOut, RefreshCw, UserPlus,
   TestTube, Eye, EyeOff, Bell,
 } from "lucide-react";
@@ -157,9 +157,11 @@ export function SettingsView({
   const [gatewayKey,    setGatewayKey]    = useState("");
   const [deepgramKey,   setDeepgramKey]   = useState("");
   const [geminiKey,     setGeminiKey]     = useState("");
+  const [groqKey,       setGroqKey]       = useState("");
   const [showGateway,   setShowGateway]   = useState(false);
   const [showDeepgram,  setShowDeepgram]  = useState(false);
   const [showGemini,    setShowGemini]    = useState(false);
+  const [showGroq,      setShowGroq]      = useState(false);
   const [keySaving,     setKeySaving]     = useState(false);
   const [keySaved,      setKeySaved]      = useState(false);
   const keySaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -261,6 +263,7 @@ export function SettingsView({
         setGatewayKey(p.gateway_api_key ? "••••••••••••••••" : "");
         setDeepgramKey(p.deepgram_api_key ? "••••••••••••••••" : "");
         setGeminiKey(p.gemini_api_key ? "••••••••••••••••" : "");
+        setGroqKey(p.groq_api_key ? "••••••••••••••••" : "");
       }
     });
     getCloudStatus().then((s) => { if (s) setCloudStatus(s); });
@@ -342,9 +345,10 @@ export function SettingsView({
     try {
       const update: Partial<Preferences> = {};
       // Only send if the user has entered a real key (not the placeholder bullets)
-      if (gatewayKey && !gatewayKey.startsWith("••"))   update.gateway_api_key  = gatewayKey;
+      if (gatewayKey  && !gatewayKey.startsWith("••"))   update.gateway_api_key  = gatewayKey;
       if (deepgramKey && !deepgramKey.startsWith("••"))  update.deepgram_api_key = deepgramKey;
       if (geminiKey   && !geminiKey.startsWith("••"))    update.gemini_api_key   = geminiKey;
+      if (groqKey     && !groqKey.startsWith("••"))      update.groq_api_key     = groqKey;
       const updated = await patchPreferences(update);
       if (updated) setPrefs(updated);
       // Show brief "Saved ✓" feedback
@@ -951,6 +955,41 @@ export function SettingsView({
               </div>
             </div>
 
+            {/* Groq API Key */}
+            <div>
+              <p className="text-[12px] font-semibold text-foreground mb-1.5 flex items-center gap-1.5">
+                <Zap size={12} className="text-muted-foreground" />
+                Groq API Key
+                <span className="ml-1 px-1.5 py-0.5 rounded text-[10px] font-medium"
+                      style={{ background: "hsl(var(--chip-lime-bg))", color: "hsl(var(--chip-lime-fg))" }}>
+                  Fast
+                </span>
+              </p>
+              <p className="text-[11px] text-muted-foreground mb-1.5">
+                Get a free key at <span className="font-medium">console.groq.com</span> — enables Groq LPU provider (llama-3.3-70b, ~200ms TTFT)
+              </p>
+              <div className="relative">
+                <input
+                  type={showGroq ? "text" : "password"}
+                  placeholder="gsk_…"
+                  value={groqKey}
+                  onChange={(e) => setGroqKey(e.target.value)}
+                  onFocus={() => {
+                    if (groqKey.startsWith("••")) setGroqKey("");
+                  }}
+                  className="input pr-9 font-mono text-[12px]"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowGroq((v) => !v)}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
+                  tabIndex={-1}
+                >
+                  {showGroq ? <EyeOff size={14} /> : <Eye size={14} />}
+                </button>
+              </div>
+            </div>
+
             {/* Save button */}
             <div className="flex items-center justify-between pt-1">
               {saveError && (
@@ -975,43 +1014,78 @@ export function SettingsView({
           </div>
         </div>
 
-        {/* ── Active config ─────────────────────────────── */}
-        <Section title="Active Configuration">
-          {openAIStatus?.connected ? (
-            /* ── Using OpenAI Codex ─────────────────────── */
-            <>
+        {/* ── LLM Provider picker ───────────────────────── */}
+        <Section title="LLM Provider">
+          {/* Provider option list */}
+          {([
+            {
+              id:    "gateway",
+              icon:  <Wifi size={15} />,
+              label: "Gateway",
+              desc:  "gpt-5.4-mini via gateway.voicepolish.app — no key needed",
+              badge: "Default",
+            },
+            {
+              id:    "groq",
+              icon:  <Zap size={15} />,
+              label: "Groq LPU",
+              desc:  "llama-3.3-70b-versatile — fastest (~200ms TTFT), free tier",
+              badge: "Fast",
+              // Key is present if: already saved in prefs OR user has typed one in the input
+              needsKey: !prefs?.groq_api_key && !(groqKey && !groqKey.startsWith("••")),
+            },
+            {
+              id:    "gemini_direct",
+              icon:  <Sparkles size={15} />,
+              label: "Gemini Direct",
+              desc:  "gemini-2.0-flash-thinking via Google AI — needs Gemini API key",
+              badge: null,
+              needsKey: !prefs?.gemini_api_key && !(geminiKey && !geminiKey.startsWith("••")),
+            },
+            {
+              id:    "openai_codex",
+              icon:  <Bot size={15} />,
+              label: "OpenAI Codex",
+              desc:  "gpt-5.4-mini via ChatGPT OAuth — connect account below",
+              badge: null,
+              needsKey: !openAIStatus?.connected,
+            },
+          ] as const).map((opt, idx, arr) => {
+            const isActive = prefs?.llm_provider === opt.id;
+            return (
               <Row
-                icon={<Sparkles size={16} />}
-                label="LLM Provider"
-                description="ChatGPT · OpenAI Codex OAuth"
-                action={<span className="badge-done">Connected</span>}
+                key={opt.id}
+                icon={opt.icon}
+                label={opt.label}
+                description={opt.desc}
+                last={idx === arr.length - 1}
+                action={
+                  <div className="flex items-center gap-2">
+                    {opt.needsKey && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded"
+                            style={{ background: "hsl(30 80% 20%)", color: "hsl(30 90% 75%)" }}>
+                        Key missing
+                      </span>
+                    )}
+                    {opt.badge && !isActive && (
+                      <span className="badge-model">{opt.badge}</span>
+                    )}
+                    <button
+                      onClick={() => patch({ llm_provider: opt.id })}
+                      className={`px-3 py-1 rounded-md text-[11px] font-medium transition-all border ${
+                        isActive
+                          ? "border-transparent text-background"
+                          : "border-border text-muted-foreground hover:text-foreground hover:border-foreground/30"
+                      }`}
+                      style={isActive ? { background: "hsl(var(--chip-lime-fg))" } : {}}
+                    >
+                      {isActive ? "✓ Active" : "Use"}
+                    </button>
+                  </div>
+                }
               />
-              <Row
-                icon={<Bot size={16} />}
-                label="Model"
-                description="gpt-5.4-mini · fast and lightweight"
-                action={<span className="badge-model">gpt-5.4-mini</span>}
-                last
-              />
-            </>
-          ) : (
-            /* ── Using Gateway (default) ─────────────────── */
-            <>
-              <Row
-                icon={<Cpu size={16} />}
-                label="Model"
-                description="gpt-5.4-mini via gateway"
-                action={<span className="badge-model">gpt-5.4-mini</span>}
-              />
-              <Row
-                icon={<Wifi size={16} />}
-                label="Gateway"
-                description="Connected to gateway.voicepolish.app"
-                action={<span className="badge-done">Connected</span>}
-                last
-              />
-            </>
-          )}
+            );
+          })}
         </Section>
         </Show>
 

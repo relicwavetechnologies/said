@@ -257,6 +257,10 @@ struct BackendState(Arc<Mutex<Option<BackendEndpoint>>>);
 /// Deepgram WebSocket streaming task.  Replaced on every new recording.
 struct StreamingState(Mutex<Option<tokio::sync::oneshot::Receiver<String>>>);
 
+/// Stores the most-recently polished text. Populated after every voice/text polish;
+/// cleared after it's pasted via Ctrl+Cmd+V or the `paste_latest` Tauri command.
+struct LatestResult(std::sync::Arc<Mutex<Option<String>>>);
+
 /// Lightweight cache of tray-relevant prefs so `sync_tray` never needs async.
 struct TrayCache(Mutex<TrayCacheInner>);
 struct TrayCacheInner {
@@ -921,7 +925,9 @@ fn do_finish_recording(
     });
 }
 
-/// Async SSE consumer: streams tokens from backend, pastes full text at end.
+/// Async SSE consumer: streams tokens from backend then stores the result.
+/// Nothing is pasted automatically. User presses Ctrl+Cmd+V (or calls
+/// `paste_latest`) to paste the stored result whenever they're ready.
 async fn run_voice_polish_sse(
     back_arc:       &Arc<Mutex<Option<BackendEndpoint>>>,
     wav:            Vec<u8>,
@@ -939,6 +945,7 @@ async fn run_voice_polish_sse(
     let done = api::stream_voice_polish(&ep, wav, target_app, pre_transcript, move |event| {
         match &event {
             api::PolishEvent::Token { token } => {
+                // Emit to UI for live preview only — no auto-paste
                 let _ = app_clone.emit(
                     "voice-token",
                     serde_json::json!({ "token": token }),
@@ -963,14 +970,37 @@ async fn run_voice_polish_sse(
     })
     .await?;
 
-    // Single paste at the end (full polished text)
+    // Store latest result — user pastes with Ctrl+Cmd+V when ready
     if !done.polished.is_empty() {
-        if let Err(e) = paster::paste(&done.polished) {
-            tracing::warn!("[main] paste failed: {e}");
+        if let Ok(mut g) = app.state::<LatestResult>().0.lock() {
+            *g = Some(done.polished.clone());
         }
+        tracing::info!("[main] result stored ({} chars) — press Ctrl+Cmd+V to paste", done.polished.len());
+        let _ = app.emit("latest-result-ready", serde_json::json!({ "chars": done.polished.len() }));
     }
 
     Ok(done)
+}
+
+/// Paste the most-recently stored polished result into the focused app.
+/// Invoked by the Ctrl+Cmd+V hotkey and by the UI's "Paste latest" button.
+#[tauri::command]
+fn paste_latest(latest: State<'_, LatestResult>) -> Result<bool, String> {
+    let text = {
+        let g = latest.0.lock().map_err(|_| "lock failed")?;
+        g.clone()
+    };
+    match text {
+        None => {
+            tracing::info!("[paste_latest] nothing stored yet");
+            Ok(false)
+        }
+        Some(t) => {
+            tracing::info!("[paste_latest] pasting {} chars", t.len());
+            paster::paste(&t).map_err(|e| format!("paste failed: {e}"))?;
+            Ok(true)
+        }
+    }
 }
 
 /// Delete a recording from the backend (SQLite + WAV file).
@@ -1638,6 +1668,27 @@ fn main() {
                         };
                         tray_polish_message(&app_shortcut, tone);
                     }));
+
+                    // ── Ctrl+Cmd+V — paste latest stored result ─────────────────
+                    let latest_arc = std::sync::Arc::clone(
+                        &app.state::<LatestResult>().inner().0
+                    );
+                    hotkey::register_paste_callback(Arc::new(move || {
+                        let text = {
+                            let Ok(g) = latest_arc.lock() else { return };
+                            g.clone()
+                        };
+                        if let Some(t) = text {
+                            tracing::info!("[paste_hotkey] Ctrl+Cmd+V → pasting {} chars", t.len());
+                            std::thread::spawn(move || {
+                                if let Err(e) = paster::paste(&t) {
+                                    tracing::warn!("[paste_hotkey] paste failed: {e}");
+                                }
+                            });
+                        } else {
+                            tracing::info!("[paste_hotkey] Ctrl+Cmd+V pressed but nothing stored yet");
+                        }
+                    }));
                 }
 
                 Ok(())
@@ -1648,6 +1699,7 @@ fn main() {
         .manage(BackendState(backend_arc))
         .manage(StreamingState(Mutex::new(None)))
         .manage(TrayCache(Mutex::new(TrayCacheInner::default())))
+        .manage(LatestResult(std::sync::Arc::new(Mutex::new(None))))
         .invoke_handler(tauri::generate_handler![
             bootstrap,
             get_snapshot,
@@ -1671,6 +1723,8 @@ fn main() {
             get_openai_status,
             initiate_openai_oauth,
             disconnect_openai,
+            // Paste latest
+            paste_latest,
             // Retry
             retry_recording,
             // Recording management

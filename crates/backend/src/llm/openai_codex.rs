@@ -7,7 +7,13 @@
 //!   - `instructions` = system prompt
 //!   - `input` = array of {type, role, content} (user/assistant messages only)
 //! SSE events use `response.output_text.delta` (not `choices[].delta.content`).
+//!
+//! Gap 5: switched from `resp.bytes().await` (buffers entire response) to
+//! `resp.bytes_stream()` (true token-by-token streaming, same as groq.rs).
+//! First polished word now appears ~200-400ms after the LLM starts responding
+//! instead of waiting for the full completion to arrive.
 
+use futures::StreamExt;
 use reqwest::Client;
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -70,34 +76,52 @@ pub async fn stream_polish(
         return Err(format!("Codex API error {status}: {body}"));
     }
 
-    // Parse SSE stream
+    // Gap 5: true SSE streaming — yield tokens as they arrive, not after full buffer
+    let mut stream   = resp.bytes_stream();
     let mut polished = String::new();
-    let bytes        = resp.bytes().await.map_err(|e| format!("codex read failed: {e}"))?;
-    let text         = String::from_utf8_lossy(&bytes);
+    let mut buf      = String::new();  // incomplete SSE line buffer
+    let mut ttft_ms: Option<u64> = None;
 
-    for line in text.lines() {
-        if !line.starts_with("data: ") { continue; }
-        let data = &line[6..];
-        if data == "[DONE]" { break; }
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("codex stream read error: {e}"))?;
+        let text  = String::from_utf8_lossy(&chunk);
+        buf.push_str(&text);
 
-        let Ok(evt) = serde_json::from_str::<serde_json::Value>(data) else { continue };
+        // SSE lines end with \n; process all complete lines
+        while let Some(nl) = buf.find('\n') {
+            let line = buf[..nl].trim().to_string();
+            buf = buf[nl + 1..].to_string();
 
-        match evt.get("type").and_then(|t| t.as_str()) {
-            Some("response.output_text.delta") => {
-                let delta = evt.get("delta")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("");
-                if !delta.is_empty() {
-                    polished.push_str(delta);
-                    // Best-effort send; drop if receiver closed
-                    let _ = token_tx.try_send(delta.to_string());
+            if !line.starts_with("data: ") { continue; }
+            let data = &line[6..];
+            if data == "[DONE]" { break; }
+
+            let Ok(evt) = serde_json::from_str::<serde_json::Value>(data) else { continue };
+
+            match evt.get("type").and_then(|t| t.as_str()) {
+                Some("response.output_text.delta") => {
+                    let delta = evt.get("delta")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("");
+                    if !delta.is_empty() {
+                        if ttft_ms.is_none() {
+                            let ms = start.elapsed().as_millis() as u64;
+                            ttft_ms = Some(ms);
+                            // GAP-5 PROOF: first token time — proves streaming works
+                            info!("[codex] GAP-5: first token in {ms}ms (true streaming, not buffered)");
+                        }
+                        polished.push_str(delta);
+                        debug!("[codex] token: {delta:?}");
+                        // Send immediately — don't wait for full response
+                        let _ = token_tx.send(delta.to_string()).await;
+                    }
                 }
+                Some("response.completed") => {
+                    debug!("[codex] response.completed");
+                    break;
+                }
+                _ => {}
             }
-            Some("response.completed") => {
-                debug!("[codex] response.completed");
-                break;
-            }
-            _ => {}
         }
     }
 

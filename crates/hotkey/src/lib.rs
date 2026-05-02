@@ -59,6 +59,7 @@ mod imp {
         pub const KC_HOME:      i64 = 115;
         pub const KC_END:       i64 = 119;
         pub const KC_A:         i64 = 0;   // Cmd+A = select-all
+        pub const KC_V:         i64 = 9;   // Ctrl+Cmd+V = paste-latest
         pub const KC_X:         i64 = 7;   // Cmd+X = cut
         pub const KC_Z:         i64 = 6;   // Cmd+Z = undo
 
@@ -192,6 +193,36 @@ mod imp {
         } else {
             false
         }
+    }
+
+    // ── Ctrl+Cmd+V — paste latest result ─────────────────────────────────────
+
+    /// Callback fired when the user presses Ctrl+Cmd+V (our app-unique paste hotkey).
+    static PASTE_CB: OnceLock<Arc<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+    /// Register a callback invoked when Ctrl+Cmd+V is pressed.
+    /// The callback should paste whatever the app has stored as the latest polished result.
+    pub fn register_paste_callback(cb: Arc<dyn Fn() + Send + Sync>) {
+        let _ = PASTE_CB.set(cb);
+    }
+
+    /// Called inside a kCGEventKeyDown handler. Returns `true` if the event was
+    /// Ctrl+Cmd+V (caller should return null to suppress the system paste action).
+    unsafe fn check_and_fire_paste(event: ffi::CGEventRef) -> bool {
+        let flags = unsafe { ffi::CGEventGetFlags(event) };
+        let ctrl  = (flags & ffi::K_CG_FLAG_CONTROL) != 0;
+        let cmd   = (flags & ffi::K_CG_FLAG_COMMAND)  != 0;
+        let alt   = (flags & ffi::K_CG_FLAG_ALT)     != 0;
+        let shift = (flags & ffi::K_CG_FLAG_SHIFT)    != 0;
+
+        // Exactly Ctrl+Cmd, no other modifiers
+        if !ctrl || !cmd || alt || shift { return false; }
+
+        let kc = unsafe { ffi::CGEventGetIntegerValueField(event, ffi::K_CG_KEYBOARD_EVENT_KEYCODE) };
+        if kc != ffi::KC_V { return false; }
+
+        if let Some(cb) = PASTE_CB.get() { cb(); }
+        true
     }
 
     // ── Input Monitoring permission tracking ──────────────────────────────────
@@ -335,6 +366,9 @@ mod imp {
             rearm_if_disabled(event_type, TOGGLE_TAP);
 
             if event_type == ffi::K_CG_EVENT_KEY_DOWN {
+                if check_and_fire_paste(event) {
+                    return std::ptr::null_mut(); // suppress Ctrl+Cmd+V system action
+                }
                 if check_and_fire_shortcut(event) {
                     return std::ptr::null_mut(); // suppress Option+N so it doesn't type a character
                 }
@@ -396,6 +430,9 @@ mod imp {
             rearm_if_disabled(event_type, HOLD_TAP);
 
             if event_type == ffi::K_CG_EVENT_KEY_DOWN {
+                if check_and_fire_paste(event) {
+                    return std::ptr::null_mut(); // suppress Ctrl+Cmd+V system action
+                }
                 if check_and_fire_shortcut(event) {
                     return std::ptr::null_mut(); // suppress Option+N so it doesn't type a character
                 }

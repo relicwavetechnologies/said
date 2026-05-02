@@ -34,6 +34,14 @@ mod imp {
             ) -> *mut c_void;
             pub fn CGEventSetFlags(event: *mut c_void, flags: u64);
             pub fn CGEventPost(tap: u32, event: *mut c_void);
+            /// Type arbitrary Unicode text via a synthetic keyboard event.
+            /// `string_length` is the number of UTF-16 code units; `unicode_string`
+            /// points to the array.  Works for any script including Devanagari.
+            pub fn CGEventKeyboardSetUnicodeString(
+                event:         *mut c_void,
+                string_length: u64,
+                unicode_string: *const u16,
+            );
             pub fn CFRelease(cf: *mut c_void);
             pub fn AXIsProcessTrusted() -> bool;
             pub fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> bool;
@@ -826,6 +834,38 @@ mod imp {
         unsafe { ffi::AXIsProcessTrusted() }
     }
 
+    /// Type `text` directly into the focused app using synthetic Unicode keyboard
+    /// events — no clipboard involved, works for any script.
+    ///
+    /// Returns `Ok(true)` if text was actually typed, `Ok(false)` if Accessibility
+    /// is not granted (caller should fall back to clipboard paste), or `Err` on
+    /// a system-level failure.
+    pub fn type_text(text: &str) -> Result<bool, String> {
+        if text.is_empty() { return Ok(true); }
+        unsafe {
+            if !ffi::AXIsProcessTrusted() { return Ok(false); }
+            let source = ffi::CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION);
+            // Encode the whole token as UTF-16 and send as a single synthetic key event.
+            // CGEventKeyboardSetUnicodeString handles multi-character strings natively.
+            let utf16: Vec<u16> = text.encode_utf16().collect();
+            let len = utf16.len() as u64;
+            let ptr = utf16.as_ptr();
+
+            let dn = ffi::CGEventCreateKeyboardEvent(source, 0, true);
+            ffi::CGEventKeyboardSetUnicodeString(dn, len, ptr);
+            ffi::CGEventPost(K_CG_HID_EVENT_TAP, dn);
+            ffi::CFRelease(dn);
+
+            let up = ffi::CGEventCreateKeyboardEvent(source, 0, false);
+            ffi::CGEventKeyboardSetUnicodeString(up, len, ptr);
+            ffi::CGEventPost(K_CG_HID_EVENT_TAP, up);
+            ffi::CFRelease(up);
+
+            if !source.is_null() { ffi::CFRelease(source); }
+        }
+        Ok(true)
+    }
+
     pub fn paste(text: &str) -> Result<(), String> {
         pbcopy(text);
 
@@ -921,6 +961,8 @@ mod imp {
 
     pub fn focused_pid() -> Option<i32> { None }
     pub fn unlock_focused_app_now() -> Option<i32> { None }
+
+    pub fn type_text(_text: &str) -> Result<bool, String> { Ok(false) }
 
     pub fn paste(text: &str) -> Result<(), String> {
         copy_to_clipboard(text)

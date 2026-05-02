@@ -24,14 +24,13 @@ use uuid::Uuid;
 use crate::{
     embedder::gemini,
     llm::{
-        gateway, gemini_direct, openai_codex,
+        gateway, gemini_direct, groq, openai_codex,
         prompt::{build_system_prompt, build_tray_system_prompt, build_user_message},
     },
     store::{
         corrections,
         history::{insert_recording, InsertRecording},
         openai_oauth,
-        prefs::get_prefs,
         vectors::retrieve_similar,
     },
     AppState,
@@ -60,10 +59,13 @@ pub async fn polish(
     let target_app    = body.target_app.clone();
     let tone_override = body.tone_override.clone();
 
+    // Gap 3: load prefs through cache before entering stream
+    let prefs_opt = crate::get_prefs_cached(&state.prefs_cache, &pool, &user_id).await;
+
     let stream = async_stream::stream! {
         let total_start = Instant::now();
 
-        let prefs = match get_prefs(&pool, &user_id) {
+        let prefs = match prefs_opt {
             Some(p) => p,
             None => {
                 yield Ok::<Event, Infallible>(Event::default().event("error")
@@ -126,6 +128,9 @@ pub async fn polish(
         let gemini_key_text = prefs.gemini_api_key.clone()
             .or_else(|| std::env::var("GEMINI_API_KEY").ok())
             .unwrap_or_default();
+        let groq_key_text = prefs.groq_api_key.clone()
+            .or_else(|| std::env::var("GROQ_API_KEY").ok())
+            .unwrap_or_default();
 
         // Resolve model + provider
         let llm_provider = prefs.llm_provider.clone();
@@ -144,6 +149,8 @@ pub async fn polish(
             (m, tok.map(|t| t.access_token))
         } else if llm_provider == "gemini_direct" {
             (gemini_direct::GEMINI_DIRECT_MODEL.to_string(), None)
+        } else if llm_provider == "groq" {
+            (groq::GROQ_MODEL_DEFAULT.to_string(), None)
         } else {
             (model.clone(), None)
         };
@@ -162,6 +169,10 @@ pub async fn polish(
             } else if llm_provider == "gemini_direct" {
                 gemini_direct::stream_polish(
                     &client_c, &gemini_key_text, &model_for_llm, &sys_p, &usr_m, token_tx,
+                ).await
+            } else if llm_provider == "groq" {
+                groq::stream_polish(
+                    &client_c, &groq_key_text, &model_for_llm, &sys_p, &usr_m, token_tx,
                 ).await
             } else {
                 gateway::stream_polish(&client_c, &gateway_key, &model_for_llm, &sys_p, &usr_m, token_tx).await
