@@ -1155,19 +1155,22 @@ async fn run_voice_polish_sse(
             api::PolishEvent::Error { message, audio_id } => {
                 let human = humanize_error(&message);
                 let _ = app_clone.emit("voice-error", serde_json::json!({
-                    "message":  human.clone(),
+                    "message":  human,
                     "audio_id": audio_id,
                 }));
-                // Native macOS notification — human copy, never raw error text.
-                notify_macos("Said couldn't finish that recording", &human);
-                // Bring Said to the front so the user can interact with the
-                // in-app toast immediately (History · Retry · Dismiss).  The
-                // osascript banner has no action buttons — the actual surface
-                // is the in-app toast.  show() + set_focus() are no-ops when
-                // the window is already visible and focused.
+                // Bounce the dock icon — macOS's standard "look at me" signal
+                // that doesn't steal focus or interrupt typing.  The in-app
+                // toast (History · Retry · Dismiss) is the actual interactive
+                // surface; the user sees it when they bring Said back into
+                // focus naturally.
+                //
+                // We deliberately DO NOT call notify_macos here: osascript
+                // banners are attributed to Script Editor, so clicking them
+                // opens Script Editor instead of Said — confusing UX with no
+                // workaround short of a properly bundled .app.
                 if let Some(w) = app_clone.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
+                    use tauri::UserAttentionType;
+                    let _ = w.request_user_attention(Some(UserAttentionType::Critical));
                 }
             }
         }
