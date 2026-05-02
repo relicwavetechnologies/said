@@ -244,14 +244,12 @@
 @layer components {
 
   /* ─── Window drag (Mac-app behavior) ──────────────────────────────
-     Whole window is draggable from any non-interactive area.
-     - The root <div data-tauri-drag-region> in App.tsx is what Tauri 2
-       hit-tests against on mousedown (it walks up the DOM tree).
-     - These CSS rules add native window-region styles (the cursor +
-       a safety-net for the WKWebView's own hit-test) that follow the
-       same rule: drag everywhere, except interactive things. */
+     Tauri 2 only treats the element directly marked with
+     data-tauri-drag-region as draggable, so chrome/gutter elements opt in
+     explicitly while buttons, inputs, and popovers stay interactive. */
 
-  html, body, #app {
+  [data-tauri-drag-region],
+  .drag-region {
     -webkit-app-region: drag;
             app-region: drag;
   }
@@ -263,9 +261,6 @@
     -webkit-app-region: no-drag;
             app-region: no-drag;
   }
-
-  /* Explicit class still works for any element that wants it */
-  .drag-region  { -webkit-app-region: drag;    app-region: drag;    }
 
   /* ── Glass surface utilities ───────────────────────────────────────
      Use .glass on cards/panels for the smart-home aesthetic.

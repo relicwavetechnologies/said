@@ -92,12 +92,9 @@ export function Sidebar({ snapshot, activeView, onViewChange, busy, onOpenInvite
       }}
     >
       {/* ── Brand header — drag region + traffic light space ── */}
-      <div
-        data-tauri-drag-region
-        className="flex items-center h-[var(--topbar-height)] px-4 flex-shrink-0 drag-region"
-      >
+      <div className="flex items-center h-[var(--topbar-height)] px-4 flex-shrink-0">
         {/* 70px left pad for macOS native traffic lights */}
-        <div data-tauri-drag-region className="w-[70px] flex-shrink-0" />
+        <div data-tauri-drag-region className="w-[70px] flex-shrink-0 drag-region" />
 
         {/* Brand mark — single source of truth in BrandMark.tsx */}
         <div className="no-drag" title="Said — Voice Polish Studio">

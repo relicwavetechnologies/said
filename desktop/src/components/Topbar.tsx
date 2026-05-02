@@ -350,12 +350,11 @@ export function Topbar({ snapshot: _snapshot, theme, toggleTheme, onLoginClick }
 
   return (
     <header
-      data-tauri-drag-region
-      className="flex items-center gap-3 h-[var(--topbar-height)] px-5 flex-shrink-0 drag-region"
+      className="flex items-center gap-3 h-[var(--topbar-height)] px-5 flex-shrink-0"
       style={{ background: "transparent" }}
     >
       {/* Drag-region spacer — search now lives only in the History view. */}
-      <div data-tauri-drag-region className="flex-1 self-stretch" />
+      <div data-tauri-drag-region className="flex-1 self-stretch drag-region" />
 
       {/* Right actions — no-drag region */}
       <div className="flex items-center gap-2.5 no-drag relative">

@@ -66,10 +66,19 @@ const DAYS      = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTHS    = ["Jan", "Feb", "Mar", "Apr"];
 const COL_COUNT = 18;
 
+// Local-calendar day index — UTC `floor(ms / DAY)` would split IST evenings
+// onto the wrong cell (UTC+5:30 means 1am IST is actually 7:30pm UTC the
+// previous day). Using the LOCAL midnight gives consistent same-day grouping.
+function localDayIdx(ms: number): number {
+  const d = new Date(ms);
+  const localMidnight = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  return Math.floor(localMidnight / 86_400_000);
+}
+
 function buildDayMap(history: HistoryItem[]): Map<number, number> {
   const map = new Map<number, number>();
   for (const item of history) {
-    const day = Math.floor(item.timestamp_ms / 86_400_000);
+    const day = localDayIdx(item.timestamp_ms);
     map.set(day, (map.get(day) ?? 0) + item.word_count);
   }
   return map;
@@ -118,7 +127,8 @@ export function InsightsView({ snapshot }: InsightsViewProps) {
 
   const dayMap        = useMemo(() => buildDayMap(history), [history]);
   const usageRows     = useMemo(() => buildUsageRows(history), [history]);
-  const todayUnixDay  = Math.floor(Date.now() / 86_400_000);
+  // Local day index — matches dayMap keys built from `localDayIdx`.
+  const todayUnixDay  = localDayIdx(Date.now());
 
   return (
     <ScrollArea className="h-full">
@@ -305,8 +315,7 @@ export function InsightsView({ snapshot }: InsightsViewProps) {
               style={{ gridTemplateColumns: `36px repeat(${COL_COUNT}, 1fr)` }}
             >
               {(() => {
-                const todayDate    = new Date(todayUnixDay * 86_400_000);
-                const todayDow     = todayDate.getDay();
+                const todayDow     = new Date().getDay();   // local DOW
                 const lastSundayIx = todayUnixDay - todayDow;
 
                 return DAYS.map((day, dayOfWeek) => (
@@ -328,7 +337,13 @@ export function InsightsView({ snapshot }: InsightsViewProps) {
                           )}
                           style={{ opacity: isFuture ? 0.3 : 1 }}
                           title={!isFuture && cellWords > 0
-                            ? `${cellWords} words on ${new Date(cellDay * 86_400_000).toLocaleDateString("en-US", { month: "short", day: "numeric" })}`
+                            ? `${cellWords} words on ${(() => {
+                                const daysAgo = todayUnixDay - cellDay;
+                                const d = new Date();
+                                d.setHours(0, 0, 0, 0);
+                                d.setDate(d.getDate() - daysAgo);
+                                return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+                              })()}`
                             : undefined}
                         />
                       );

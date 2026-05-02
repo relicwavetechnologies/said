@@ -1,13 +1,14 @@
 import React, { useState, useEffect, useRef } from "react";
 import {
   ChevronUp, ChevronDown, ChevronRight,
-  Filter, Play, Pause, Check, Copy,
+  Filter, Play, Pause, Check, Copy, Download,
   ChevronDown as CaretDown,
   Search,
   Mic, Zap, Sparkles, Database, FileText, Send, Activity,
   CircleCheck, AlertCircle,
 } from "lucide-react";
 import { useAudioPlayer } from "@/lib/useAudioPlayer";
+import { downloadRecordingAudio } from "@/lib/invoke";
 import type { AppSnapshot, Recording } from "@/types";
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -288,11 +289,19 @@ const FILTER_LABEL: Record<RecordingsFilter, string> = {
   month: "This month",
 };
 
+function audioFilename(recording: Recording): string {
+  const d     = new Date(recording.timestamp_ms);
+  const pad   = (n: number) => String(n).padStart(2, "0");
+  const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
+  return `said-${stamp}-${recording.word_count}-words.wav`;
+}
+
 export function RecordingsTable({
-  recordings, onSeeAll,
+  recordings, onSeeAll, onDownloadSuccess,
 }: {
   recordings: Recording[];
   onSeeAll:   () => void;
+  onDownloadSuccess?: (path: string) => void;
 }) {
   const { playingId, play } = useAudioPlayer();
 
@@ -419,7 +428,7 @@ export function RecordingsTable({
       <div
         className="grid items-center gap-4 py-2 text-[10.5px] font-semibold uppercase tracking-wider"
         style={{
-          gridTemplateColumns: "1fr 110px 110px 100px 90px",
+          gridTemplateColumns: "1fr 110px 110px 100px 104px",
           color: "hsl(var(--muted-foreground))",
         }}
       >
@@ -427,7 +436,7 @@ export function RecordingsTable({
         <span>Status</span>
         <span>When</span>
         <span className="text-right">Words</span>
-        <span className="text-right">Play</span>
+        <span className="text-right">Audio</span>
       </div>
 
       {items.length === 0 ? (
@@ -460,6 +469,7 @@ export function RecordingsTable({
               last={i === items.length - 1}
               isPlaying={playingId === rec.id}
               onPlay={() => play(rec.id, rec.audio_id)}
+              onDownloadSuccess={onDownloadSuccess}
             />
           ))}
         </div>
@@ -469,13 +479,14 @@ export function RecordingsTable({
 }
 
 function Row({
-  rec, live, last, isPlaying, onPlay,
+  rec, live, last, isPlaying, onPlay, onDownloadSuccess,
 }: {
   rec:        Recording;
   live:       boolean;
   last:       boolean;
   isPlaying:  boolean;
   onPlay:     () => void;
+  onDownloadSuccess?: (path: string) => void;
 }) {
   const firstDot = rec.polished.search(/[.?!]/);
   const title    = firstDot > 0 ? rec.polished.slice(0, firstDot + 1) : rec.polished;
@@ -489,6 +500,7 @@ function Row({
   const chipText = isPlaying ? "Playing…" : live ? "Latest" : isRecent ? "Recent" : "Polished";
 
   const [copied, setCopied] = useState(false);
+  const [downloading, setDownloading] = useState(false);
   const handleCopy = async (e: React.MouseEvent) => {
     e.stopPropagation();
     try {
@@ -499,6 +511,16 @@ function Row({
   };
 
   const canPlay = Boolean(rec.audio_id);
+  const handleDownload = async () => {
+    if (!rec.audio_id || downloading) return;
+    setDownloading(true);
+    try {
+      const savedPath = await downloadRecordingAudio(rec.id, audioFilename(rec));
+      if (savedPath) onDownloadSuccess?.(savedPath);
+    } finally {
+      setDownloading(false);
+    }
+  };
 
   // Sentinel-style: minimal — no fill, just hover/active states
   const playBg = isPlaying
@@ -514,7 +536,7 @@ function Row({
     <div
       className="grid items-center gap-4 py-3 group"
       style={{
-        gridTemplateColumns: "1fr 110px 110px 100px 90px",
+        gridTemplateColumns: "1fr 110px 110px 100px 104px",
         borderBottom: last ? "none" : "1px dashed hsl(var(--border))",
       }}
     >
@@ -576,7 +598,24 @@ function Row({
         </span>
       </span>
 
-      <div className="flex justify-end">
+      <div className="flex justify-end gap-1.5">
+        <button
+          onClick={handleDownload}
+          disabled={!canPlay || downloading}
+          title={!canPlay ? "Audio not available" : downloading ? "Saving..." : "Download audio"}
+          className="w-8 h-8 rounded-full flex items-center justify-center transition-all"
+          style={{
+            background: downloading ? "hsl(var(--primary) / 0.14)" : "hsl(var(--surface-4))",
+            color:      !canPlay ? "hsl(var(--muted-foreground) / 0.5)" : "hsl(var(--foreground))",
+            cursor:     canPlay && !downloading ? "pointer" : "not-allowed",
+          }}
+        >
+          {downloading ? (
+            <span className="inline-block w-2 h-2 rounded-full bg-current animate-pulse" />
+          ) : (
+            <Download size={11} />
+          )}
+        </button>
         <button
           onClick={onPlay}
           disabled={!canPlay}
@@ -617,6 +656,16 @@ function wordsToLevel(words: number, max: number): 0 | 1 | 2 | 3 | 4 {
   if (words < max * 0.50) return 2;
   if (words < max * 0.75) return 3;
   return 4;
+}
+
+/* Local-calendar day index — Math.floor(ms / DAY) gives a UTC day index, which
+ * splits days mid-evening for IST users (UTC+5:30) and other east-of-UTC zones.
+ * This helper rebuilds a date at the LOCAL midnight then floors that, so all
+ * recordings made on the same local calendar date share the same index. */
+function localDayIdx(ms: number): number {
+  const d = new Date(ms);
+  const localMidnight = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  return Math.floor(localMidnight / 86_400_000);
 }
 
 function SideStat({
@@ -679,7 +728,7 @@ export function ActivityHeatmap({
 
   const dayMap = new Map<number, number>();
   for (const h of history) {
-    const d = Math.floor(h.timestamp_ms / 86_400_000);
+    const d = localDayIdx(h.timestamp_ms);
     dayMap.set(d, (dayMap.get(d) ?? 0) + h.word_count);
   }
 
@@ -708,15 +757,17 @@ export function ActivityHeatmap({
 
   const COLS    = RANGE_COLS[range];
   const ROWS    = 7;
-  const today   = new Date();
-  today.setHours(0, 0, 0, 0);
-  const todayIdx = Math.floor(today.getTime() / 86_400_000);
-  const todayDow = today.getDay();
+  // Use the LOCAL day index (matches dayMap keys) — Math.floor of UTC ms
+  // would give a UTC day, splitting IST evenings onto the wrong cell.
+  const todayIdx = localDayIdx(Date.now());
+  const todayDow = new Date().getDay();   // local day-of-week (0 = Sun)
   const lastSundayIdx = todayIdx - todayDow;
   const startIdx      = lastSundayIdx - (COLS - 1) * 7;
 
-  // Container max-width grows/shrinks with COLS so cells stay ~20px square
-  const gridMaxWidth = Math.min(900, COLS * 22 + (COLS - 1) * 4);
+  // Fixed cell size keeps the section's HEIGHT constant when the user
+  // toggles between 1m / 3m / 6m / 12m — the grid just gets narrower /
+  // wider, the panel never grows or shrinks vertically.
+  const CELL_PX = 18;
 
   let max = 1;
   for (let c = 0; c < COLS; c++) {
@@ -728,19 +779,21 @@ export function ActivityHeatmap({
   }
   max = Math.max(max, 30);
 
+  // Build a real Date for any day-index, in LOCAL time (no UTC drift).
+  function localDateFromIdx(idx: number): Date {
+    const daysAgo = todayIdx - idx;
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    d.setDate(d.getDate() - daysAgo);
+    return d;
+  }
+
   const inWindow: number[] = [];
-  let bestIdx   = -1;
-  let bestWords = 0;
   for (let c = 0; c < COLS; c++) {
     for (let r = 0; r < ROWS; r++) {
       const idx = startIdx + c * 7 + r;
       if (idx > todayIdx) continue;
-      const w = dayMap.get(idx) ?? 0;
-      inWindow.push(w);
-      if (w > bestWords) {
-        bestWords = w;
-        bestIdx   = idx;
-      }
+      inWindow.push(dayMap.get(idx) ?? 0);
     }
   }
   const totalWords     = inWindow.reduce((s, w) => s + w, 0);
@@ -756,15 +809,11 @@ export function ActivityHeatmap({
     else break;
   }
 
-  const bestDate = bestIdx >= 0
-    ? new Date(bestIdx * 86_400_000).toLocaleDateString("en-US", { month: "short", day: "numeric" })
-    : null;
-
   const colMonthLabel: (string | null)[] = Array(COLS).fill(null);
   let lastMonth = -1;
   for (let c = 0; c < COLS; c++) {
     const colStartIdx = startIdx + c * 7;
-    const d           = new Date(colStartIdx * 86_400_000);
+    const d           = localDateFromIdx(colStartIdx);
     const m           = d.getMonth();
     if (m !== lastMonth) {
       colMonthLabel[c] = MONTH_LABELS[m];
@@ -872,23 +921,27 @@ export function ActivityHeatmap({
         </div>
       </div>
 
-      {/* Two-column layout: heatmap on the left, derived stats on the right */}
-      <div className="flex gap-8 items-stretch">
+      {/* Two-column layout: heatmap on the left, derived stats on the right.
+          Heatmap container uses fixed-px tracks so the section's HEIGHT stays
+          identical regardless of which range (1m / 3m / 6m / 12m) is selected
+          — only the WIDTH of the dot cluster changes. Horizontal scroll kicks
+          in for very wide ranges so we never overflow the panel. */}
+      <div className="flex gap-8 items-start">
 
-        {/* Heatmap — width follows the selected range */}
-        <div className="flex-shrink min-w-0" style={{ flexBasis: gridMaxWidth, maxWidth: gridMaxWidth }}>
+        {/* Heatmap — fixed-px cells, scrolls horizontally if too wide */}
+        <div className="min-w-0 flex-shrink overflow-x-auto" style={{ paddingBottom: 2 }}>
           {/* Month labels strip */}
           <div
             className="grid mb-2"
             style={{
-              gridTemplateColumns: `repeat(${COLS}, minmax(0, 1fr))`,
+              gridTemplateColumns: `repeat(${COLS}, ${CELL_PX}px)`,
               columnGap: 4,
             }}
           >
             {colMonthLabel.map((label, i) => (
               <span
                 key={i}
-                className="text-[10.5px] font-medium tabular-nums"
+                className="text-[10.5px] font-medium tabular-nums whitespace-nowrap"
                 style={{
                   color: "hsl(var(--muted-foreground))",
                   opacity: label ? 1 : 0,
@@ -900,14 +953,12 @@ export function ActivityHeatmap({
             ))}
           </div>
 
-          {/* Heatmap grid — rows use `auto` so cells take their aspect-ratio
-              height from the column width (1fr rows would collapse to 0 in
-              a container with no explicit height) */}
+          {/* Heatmap grid — fixed pixel cell size keeps section height stable */}
           <div
             className="grid"
             style={{
-              gridTemplateColumns: `repeat(${COLS}, minmax(0, 1fr))`,
-              gridTemplateRows:    `repeat(${ROWS}, auto)`,
+              gridTemplateColumns: `repeat(${COLS}, ${CELL_PX}px)`,
+              gridTemplateRows:    `repeat(${ROWS}, ${CELL_PX}px)`,
               gridAutoFlow:        "column",
               columnGap: 4,
               rowGap:    4,
@@ -922,25 +973,25 @@ export function ActivityHeatmap({
               const words  = future ? 0 : (dayMap.get(idx) ?? 0);
               const level  = future ? 0 : wordsToLevel(words, max);
               const isToday = idx === todayIdx;
-              const date    = new Date(idx * 86_400_000);
               return (
                 <span
                   key={i}
                   className={`block rounded-full transition-transform ${isToday ? "heat-current" : `heat-${level}`}`}
                   style={{
-                    aspectRatio: "1 / 1",
-                    width:       "100%",
-                    opacity:     future ? 0.3 : 1,
-                    cursor:      future ? "default" : "pointer",
+                    width:    CELL_PX,
+                    height:   CELL_PX,
+                    opacity:  future ? 0.3 : 1,
+                    cursor:   future ? "default" : "pointer",
                   }}
                   onMouseEnter={(e) => {
                     if (future) return;
                     const rect = e.currentTarget.getBoundingClientRect();
+                    const localDate = localDateFromIdx(idx);
                     setHover({
                       x:     rect.left + rect.width / 2,
                       y:     rect.top,
                       words,
-                      date:  date.toLocaleDateString("en-US", {
+                      date:  localDate.toLocaleDateString("en-US", {
                         weekday: "short",
                         month:   "short",
                         day:     "numeric",
@@ -958,9 +1009,10 @@ export function ActivityHeatmap({
           </div>
         </div>
 
-        {/* Side stats — fills the dead space to the right */}
+        {/* Side stats — different metrics from the top stat tiles to avoid
+            duplicating "Words polished" data when there's only one active day. */}
         <div
-          className="flex-1 flex flex-col justify-between gap-4 pl-6"
+          className="flex-1 flex flex-col gap-4 pl-6"
           style={{
             minWidth: 140,
             borderLeft: "1px solid hsl(var(--border))",
@@ -973,9 +1025,9 @@ export function ActivityHeatmap({
             highlight
           />
           <SideStat
-            label="Best day"
-            value={bestWords > 0 ? bestWords : "—"}
-            unit={bestWords > 0 ? `words · ${bestDate}` : ""}
+            label="Avg / day"
+            value={dailyAvg > 0 ? dailyAvg : "—"}
+            unit={dailyAvg > 0 ? "words on active days" : ""}
           />
           <SideStat
             label="Active"

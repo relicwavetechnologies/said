@@ -15,112 +15,122 @@ use crate::backend::BackendEndpoint;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Preferences {
-    pub user_id:            String,
-    pub selected_model:     String,
-    pub tone_preset:        String,
-    pub custom_prompt:      Option<String>,
-    pub language:           String,
+    pub user_id: String,
+    pub selected_model: String,
+    pub tone_preset: String,
+    pub custom_prompt: Option<String>,
+    pub language: String,
     #[serde(default)]
-    pub output_language:    String,
-    pub auto_paste:         bool,
-    pub edit_capture:       bool,
+    pub output_language: String,
+    pub auto_paste: bool,
+    pub edit_capture: bool,
     pub polish_text_hotkey: String,
     // API keys (stored in SQLite; None if not set yet)
     #[serde(default)]
-    pub deepgram_api_key:   Option<String>,
+    pub deepgram_api_key: Option<String>,
     #[serde(default)]
-    pub gemini_api_key:     Option<String>,
+    pub gemini_api_key: Option<String>,
     #[serde(default)]
-    pub gateway_api_key:    Option<String>,
+    pub gateway_api_key: Option<String>,
     #[serde(default)]
-    pub groq_api_key:       Option<String>,
+    pub groq_api_key: Option<String>,
     /// LLM routing: "gateway" | "gemini_direct" | "groq" | "openai_codex"
     #[serde(default = "default_llm_provider")]
-    pub llm_provider:       String,
+    pub llm_provider: String,
 }
 
-fn default_llm_provider() -> String { "gateway".to_string() }
+fn default_llm_provider() -> String {
+    "gateway".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PrefsUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub selected_model:     Option<String>,
+    pub selected_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tone_preset:        Option<String>,
+    pub tone_preset: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub custom_prompt:      Option<String>,
+    pub custom_prompt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub language:           Option<String>,
+    pub language: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_language:    Option<String>,
+    pub output_language: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub auto_paste:         Option<bool>,
+    pub auto_paste: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub edit_capture:       Option<bool>,
+    pub edit_capture: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub polish_text_hotkey: Option<String>,
     // API keys — Some(value) = set; None = don't touch (field omitted from JSON)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub gateway_api_key:    Option<String>,
+    pub gateway_api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub deepgram_api_key:   Option<String>,
+    pub deepgram_api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub gemini_api_key:     Option<String>,
+    pub gemini_api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub groq_api_key:       Option<String>,
+    pub groq_api_key: Option<String>,
     /// LLM routing: "gateway" | "gemini_direct" | "groq" | "openai_codex"
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub llm_provider:       Option<String>,
+    pub llm_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Recording {
-    pub id:                String,
-    pub timestamp_ms:      i64,
-    pub transcript:        String,
-    pub polished:          String,
-    pub final_text:        Option<String>,
-    pub word_count:        i64,
+    pub id: String,
+    pub timestamp_ms: i64,
+    pub transcript: String,
+    pub polished: String,
+    pub final_text: Option<String>,
+    pub word_count: i64,
     pub recording_seconds: f64,
-    pub model_used:        String,
-    pub confidence:        Option<f64>,
-    pub transcribe_ms:     Option<i64>,
-    pub embed_ms:          Option<i64>,
-    pub polish_ms:         Option<i64>,
-    pub target_app:        Option<String>,
-    pub edit_count:        i64,
-    pub source:            String,
-    pub audio_id:          Option<String>,
+    pub model_used: String,
+    pub confidence: Option<f64>,
+    pub transcribe_ms: Option<i64>,
+    pub embed_ms: Option<i64>,
+    pub polish_ms: Option<i64>,
+    pub target_app: Option<String>,
+    pub edit_count: i64,
+    pub source: String,
+    pub audio_id: Option<String>,
 }
 
 /// Result of a completed polish operation (from the `done` SSE event).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolishDone {
-    pub recording_id:  String,
-    pub polished:      String,
-    pub model_used:    String,
-    pub confidence:    Option<f64>,
+    pub recording_id: String,
+    pub polished: String,
+    pub model_used: String,
+    pub confidence: Option<f64>,
     pub examples_used: u32,
-    pub latency_ms:    PolishLatency,
+    pub latency_ms: PolishLatency,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PolishLatency {
     pub transcribe: i64,
-    pub embed:      i64,
-    pub retrieve:   i64,
-    pub polish:     i64,
-    pub total:      i64,
+    pub embed: i64,
+    pub retrieve: i64,
+    pub polish: i64,
+    pub total: i64,
 }
 
 // ── SSE event enum ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub enum PolishEvent {
-    Status { phase: String, transcript: Option<String> },
-    Token  { token: String },
-    Done   (PolishDone),
-    Error  { message: String, audio_id: Option<String> },
+    Status {
+        phase: String,
+        transcript: Option<String>,
+    },
+    Token {
+        token: String,
+    },
+    Done(PolishDone),
+    Error {
+        message: String,
+        audio_id: Option<String>,
+    },
 }
 
 // ── Voice polish ──────────────────────────────────────────────────────────────
@@ -130,22 +140,23 @@ pub enum PolishEvent {
 /// `pre_transcript` — if the caller already obtained a transcript via Deepgram
 /// WebSocket streaming (P5), pass it here so the backend can skip its own STT call.
 pub async fn stream_voice_polish<F>(
-    ep:             &BackendEndpoint,
-    wav_data:       Vec<u8>,
-    target_app:     Option<String>,
+    ep: &BackendEndpoint,
+    wav_data: Vec<u8>,
+    target_app: Option<String>,
     pre_transcript: Option<String>,
-    on_event:       F,
+    on_event: F,
 ) -> Result<PolishDone, String>
 where
     F: FnMut(PolishEvent),
 {
-    let url    = format!("{}/v1/voice/polish", ep.url);
+    let url = format!("{}/v1/voice/polish", ep.url);
     let client = Client::new();
 
-    // P5: skip uploading WAV bytes when we already have a pre_transcript — the WS
-    // path already handled STT; sending MBs of audio over localhost is wasted I/O.
     let mut form = reqwest::multipart::Form::new();
-    if pre_transcript.is_none() {
+    // Even when the WebSocket path already produced a pre_transcript, still
+    // send the WAV so the backend can persist it for history playback/download.
+    // The backend skips duplicate STT whenever pre_transcript is present.
+    if !wav_data.is_empty() {
         form = form.part(
             "audio",
             reqwest::multipart::Part::bytes(wav_data)
@@ -174,8 +185,11 @@ where
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body   = resp.text().await.unwrap_or_default();
-        return Err(format!("voice/polish error {status}: {}", &body[..body.len().min(300)]));
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "voice/polish error {status}: {}",
+            &body[..body.len().min(300)]
+        ));
     }
 
     consume_sse(resp.bytes_stream(), on_event).await
@@ -184,18 +198,18 @@ where
 /// Stream polish events for plain text.
 #[allow(dead_code)]
 pub async fn stream_text_polish<F>(
-    ep:            &BackendEndpoint,
-    text:          String,
-    target_app:    Option<String>,
+    ep: &BackendEndpoint,
+    text: String,
+    target_app: Option<String>,
     tone_override: Option<String>,
-    on_event:      F,
+    on_event: F,
 ) -> Result<PolishDone, String>
 where
     F: FnMut(PolishEvent),
 {
-    let url    = format!("{}/v1/text/polish", ep.url);
+    let url = format!("{}/v1/text/polish", ep.url);
     let client = Client::new();
-    let body   = serde_json::json!({
+    let body = serde_json::json!({
         "text":          text,
         "target_app":    target_app,
         "tone_override": tone_override,
@@ -213,8 +227,11 @@ where
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body   = resp.text().await.unwrap_or_default();
-        return Err(format!("text/polish error {status}: {}", &body[..body.len().min(300)]));
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "text/polish error {status}: {}",
+            &body[..body.len().min(300)]
+        ));
     }
 
     consume_sse(resp.bytes_stream(), on_event).await
@@ -227,7 +244,7 @@ where
     S: StreamExt<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
     F: FnMut(PolishEvent),
 {
-    let mut buf        = String::new();
+    let mut buf = String::new();
     let mut done_event: Option<PolishDone> = None;
     // Track the most recently seen `event:` line so we can dispatch correctly
     let mut event_name = String::new();
@@ -251,9 +268,13 @@ where
                 continue;
             }
 
-            let Some(data) = line.strip_prefix("data: ") else { continue };
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
             let data = data.trim();
-            if data == "[DONE]" { continue; }
+            if data == "[DONE]" {
+                continue;
+            }
 
             parse_and_dispatch(data, &event_name, &mut on_event, &mut done_event);
         }
@@ -263,10 +284,10 @@ where
 }
 
 fn parse_and_dispatch(
-    data:        &str,
-    event_name:  &str,
-    on_event:    &mut impl FnMut(PolishEvent),
-    done_event:  &mut Option<PolishDone>,
+    data: &str,
+    event_name: &str,
+    on_event: &mut impl FnMut(PolishEvent),
+    done_event: &mut Option<PolishDone>,
 ) {
     let Ok(val) = serde_json::from_str::<Value>(data) else {
         warn!("[api] unparseable SSE data: {data:?}");
@@ -278,15 +299,21 @@ fn parse_and_dispatch(
         "token" => {
             if let Some(token) = val.get("token").and_then(Value::as_str) {
                 debug!("[api] token: {token:?}");
-                on_event(PolishEvent::Token { token: token.to_string() });
+                on_event(PolishEvent::Token {
+                    token: token.to_string(),
+                });
             }
         }
         "status" => {
             if let Some(phase) = val.get("phase").and_then(Value::as_str) {
-                let transcript = val.get("transcript")
+                let transcript = val
+                    .get("transcript")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                on_event(PolishEvent::Status { phase: phase.to_string(), transcript });
+                on_event(PolishEvent::Status {
+                    phase: phase.to_string(),
+                    transcript,
+                });
             }
         }
         "done" => {
@@ -297,27 +324,45 @@ fn parse_and_dispatch(
         }
         "error" => {
             if let Some(msg) = val.get("message").and_then(Value::as_str) {
-                let audio_id = val.get("audio_id").and_then(Value::as_str).map(str::to_string);
-                on_event(PolishEvent::Error { message: msg.to_string(), audio_id });
+                let audio_id = val
+                    .get("audio_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                on_event(PolishEvent::Error {
+                    message: msg.to_string(),
+                    audio_id,
+                });
             }
         }
         // Key-sniff fallback (handles backends that omit the `event:` line)
         _ => {
             if let Some(token) = val.get("token").and_then(Value::as_str) {
-                on_event(PolishEvent::Token { token: token.to_string() });
+                on_event(PolishEvent::Token {
+                    token: token.to_string(),
+                });
             } else if let Some(phase) = val.get("phase").and_then(Value::as_str) {
-                let transcript = val.get("transcript")
+                let transcript = val
+                    .get("transcript")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                on_event(PolishEvent::Status { phase: phase.to_string(), transcript });
+                on_event(PolishEvent::Status {
+                    phase: phase.to_string(),
+                    transcript,
+                });
             } else if val.get("recording_id").is_some() {
                 if let Some(done) = parse_done(&val) {
                     on_event(PolishEvent::Done(done.clone()));
                     *done_event = Some(done);
                 }
             } else if let Some(msg) = val.get("message").and_then(Value::as_str) {
-                let audio_id = val.get("audio_id").and_then(Value::as_str).map(str::to_string);
-                on_event(PolishEvent::Error { message: msg.to_string(), audio_id });
+                let audio_id = val
+                    .get("audio_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                on_event(PolishEvent::Error {
+                    message: msg.to_string(),
+                    audio_id,
+                });
             }
         }
     }
@@ -325,11 +370,11 @@ fn parse_and_dispatch(
 
 fn parse_done(val: &Value) -> Option<PolishDone> {
     let recording_id = val["recording_id"].as_str()?.to_string();
-    let polished     = val["polished"].as_str().unwrap_or("").to_string();
-    let model_used   = val["model_used"].as_str().unwrap_or("").to_string();
-    let confidence   = val["confidence"].as_f64();
-    let examples     = val["examples_used"].as_u64().unwrap_or(0) as u32;
-    let lat          = val.get("latency_ms").cloned().unwrap_or_default();
+    let polished = val["polished"].as_str().unwrap_or("").to_string();
+    let model_used = val["model_used"].as_str().unwrap_or("").to_string();
+    let confidence = val["confidence"].as_f64();
+    let examples = val["examples_used"].as_u64().unwrap_or(0) as u32;
+    let lat = val.get("latency_ms").cloned().unwrap_or_default();
     Some(PolishDone {
         recording_id,
         polished,
@@ -338,10 +383,10 @@ fn parse_done(val: &Value) -> Option<PolishDone> {
         examples_used: examples,
         latency_ms: PolishLatency {
             transcribe: lat["transcribe"].as_i64().unwrap_or(0),
-            embed:      lat["embed"].as_i64().unwrap_or(0),
-            retrieve:   lat["retrieve"].as_i64().unwrap_or(0),
-            polish:     lat["polish"].as_i64().unwrap_or(0),
-            total:      lat["total"].as_i64().unwrap_or(0),
+            embed: lat["embed"].as_i64().unwrap_or(0),
+            retrieve: lat["retrieve"].as_i64().unwrap_or(0),
+            polish: lat["polish"].as_i64().unwrap_or(0),
+            total: lat["total"].as_i64().unwrap_or(0),
         },
     })
 }
@@ -349,7 +394,7 @@ fn parse_done(val: &Value) -> Option<PolishDone> {
 // ── Preferences ───────────────────────────────────────────────────────────────
 
 pub async fn get_preferences(ep: &BackendEndpoint) -> Result<Preferences, String> {
-    let url    = format!("{}/v1/preferences", ep.url);
+    let url = format!("{}/v1/preferences", ep.url);
     Client::new()
         .get(&url)
         .header("Authorization", ep.bearer())
@@ -362,10 +407,10 @@ pub async fn get_preferences(ep: &BackendEndpoint) -> Result<Preferences, String
 }
 
 pub async fn patch_preferences(
-    ep:     &BackendEndpoint,
+    ep: &BackendEndpoint,
     update: PrefsUpdate,
 ) -> Result<Preferences, String> {
-    let url  = format!("{}/v1/preferences", ep.url);
+    let url = format!("{}/v1/preferences", ep.url);
     let body = serde_json::to_string(&update).unwrap_or_else(|e| format!("<serialize error: {e}>"));
     tracing::info!("[patch_prefs] → PATCH {url}  body={body}");
     let resp = Client::new()
@@ -378,22 +423,34 @@ pub async fn patch_preferences(
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     tracing::info!("[patch_prefs] ← {status}  body={text}");
-    serde_json::from_str::<Preferences>(&text)
-        .map_err(|e| format!("parse prefs failed: {e} — raw: {}", &text[..text.len().min(200)]))
+    serde_json::from_str::<Preferences>(&text).map_err(|e| {
+        format!(
+            "parse prefs failed: {e} — raw: {}",
+            &text[..text.len().min(200)]
+        )
+    })
 }
 
 /// Fetch the user's correction keyterms (right-hand words from word_corrections table).
 /// Used to boost Deepgram STT recognition for words the user frequently corrects.
 pub async fn get_correction_keyterms(ep: &BackendEndpoint) -> Vec<String> {
     #[derive(serde::Deserialize)]
-    struct Resp { keyterms: Vec<String> }
+    struct Resp {
+        keyterms: Vec<String>,
+    }
     let url = format!("{}/v1/corrections", ep.url);
     let Ok(resp) = Client::new()
         .get(&url)
         .header("Authorization", ep.bearer())
         .send()
-        .await else { return vec![] };
-    resp.json::<Resp>().await.map(|b| b.keyterms).unwrap_or_default()
+        .await
+    else {
+        return vec![];
+    };
+    resp.json::<Resp>()
+        .await
+        .map(|b| b.keyterms)
+        .unwrap_or_default()
 }
 
 // ── History ───────────────────────────────────────────────────────────────────
@@ -415,31 +472,31 @@ pub async fn get_history(ep: &BackendEndpoint, limit: i64) -> Result<Vec<Recordi
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudAccount {
-    pub id:           String,
-    pub email:        String,
+    pub id: String,
+    pub email: String,
     pub license_tier: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudAuthResponse {
-    pub token:   String,
+    pub token: String,
     pub account: CloudAccount,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudStatus {
-    pub connected:    bool,
+    pub connected: bool,
     pub license_tier: String,
-    pub email:        Option<String>,
+    pub email: Option<String>,
 }
 
 /// POST /v1/auth/signup on the cloud control plane.
 pub async fn cloud_signup(
     cloud_url: &str,
-    email:     &str,
-    password:  &str,
+    email: &str,
+    password: &str,
 ) -> Result<CloudAuthResponse, String> {
-    let url  = format!("{}/v1/auth/signup", cloud_url.trim_end_matches('/'));
+    let url = format!("{}/v1/auth/signup", cloud_url.trim_end_matches('/'));
     let body = serde_json::json!({ "email": email, "password": password });
     let resp = Client::new()
         .post(&url)
@@ -461,10 +518,10 @@ pub async fn cloud_signup(
 /// POST /v1/auth/login on the cloud control plane.
 pub async fn cloud_login(
     cloud_url: &str,
-    email:     &str,
-    password:  &str,
+    email: &str,
+    password: &str,
 ) -> Result<CloudAuthResponse, String> {
-    let url  = format!("{}/v1/auth/login", cloud_url.trim_end_matches('/'));
+    let url = format!("{}/v1/auth/login", cloud_url.trim_end_matches('/'));
     let body = serde_json::json!({ "email": email, "password": password });
     let resp = Client::new()
         .post(&url)
@@ -487,7 +544,7 @@ pub async fn cloud_login(
 #[allow(dead_code)]
 pub async fn cloud_license_check(
     cloud_url: &str,
-    token:     &str,
+    token: &str,
 ) -> Result<serde_json::Value, String> {
     let url = format!("{}/v1/license/check", cloud_url.trim_end_matches('/'));
     Client::new()
@@ -504,11 +561,11 @@ pub async fn cloud_license_check(
 
 /// PUT /v1/cloud/token — persist cloud token in the local backend's SQLite.
 pub async fn store_cloud_token(
-    ep:    &BackendEndpoint,
+    ep: &BackendEndpoint,
     token: &str,
-    tier:  &str,
+    tier: &str,
 ) -> Result<(), String> {
-    let url  = format!("{}/v1/cloud/token", ep.url);
+    let url = format!("{}/v1/cloud/token", ep.url);
     let body = serde_json::json!({ "token": token, "license_tier": tier });
     let status = Client::new()
         .put(&url)
@@ -519,7 +576,9 @@ pub async fn store_cloud_token(
         .await
         .map_err(|e| format!("store token failed: {e}"))?
         .status();
-    if status.is_success() || status.as_u16() == 204 { Ok(()) } else {
+    if status.is_success() || status.as_u16() == 204 {
+        Ok(())
+    } else {
         Err(format!("store token error: {status}"))
     }
 }
@@ -535,7 +594,9 @@ pub async fn clear_cloud_token(ep: &BackendEndpoint) -> Result<(), String> {
         .await
         .map_err(|e| format!("clear token failed: {e}"))?
         .status();
-    if status.is_success() || status.as_u16() == 204 { Ok(()) } else {
+    if status.is_success() || status.as_u16() == 204 {
+        Ok(())
+    } else {
         Err(format!("clear token error: {status}"))
     }
 }
@@ -609,12 +670,12 @@ fn extract_error(body: &str) -> String {
 // ── Edit feedback ─────────────────────────────────────────────────────────────
 
 pub async fn submit_feedback(
-    ep:           &BackendEndpoint,
+    ep: &BackendEndpoint,
     recording_id: &str,
-    user_kept:    &str,
-    target_app:   Option<&str>,
+    user_kept: &str,
+    target_app: Option<&str>,
 ) -> Result<(), String> {
-    let url  = format!("{}/v1/edit-feedback", ep.url);
+    let url = format!("{}/v1/edit-feedback", ep.url);
     let body = serde_json::json!({
         "recording_id": recording_id,
         "user_kept":    user_kept,
@@ -641,10 +702,10 @@ pub async fn submit_feedback(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingEdit {
-    pub id:           String,
+    pub id: String,
     pub recording_id: Option<String>,
-    pub ai_output:    String,
-    pub user_kept:    String,
+    pub ai_output: String,
+    pub user_kept: String,
     pub timestamp_ms: i64,
 }
 
@@ -659,12 +720,12 @@ pub struct PendingEditsResponse {
 /// This is kept for manual/direct storage if needed.
 #[allow(dead_code)]
 pub async fn store_pending_edit(
-    ep:           &BackendEndpoint,
+    ep: &BackendEndpoint,
     recording_id: Option<&str>,
-    ai_output:    &str,
-    user_kept:    &str,
+    ai_output: &str,
+    user_kept: &str,
 ) -> Result<String, String> {
-    let url  = format!("{}/v1/pending-edits", ep.url);
+    let url = format!("{}/v1/pending-edits", ep.url);
     let body = serde_json::json!({
         "recording_id": recording_id,
         "ai_output":    ai_output,
@@ -680,7 +741,10 @@ pub async fn store_pending_edit(
         .json::<serde_json::Value>()
         .await
         .map_err(|e| format!("parse pending edit response: {e}"))?;
-    resp["id"].as_str().map(str::to_string).ok_or_else(|| "no id in response".into())
+    resp["id"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "no id in response".into())
 }
 
 /// Four-way edit classifier response.
@@ -691,21 +755,21 @@ pub async fn store_pending_edit(
 /// notification gate.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ClassifyEditResponse {
-    pub class:            String,
-    pub reason:           String,
-    pub pending_id:       Option<String>,
+    pub class: String,
+    pub reason: String,
+    pub pending_id: Option<String>,
     #[serde(default)]
-    pub learned:          bool,
+    pub learned: bool,
     #[serde(default)]
-    pub notify:           bool,
+    pub notify: bool,
     #[serde(default)]
-    pub promoted_count:   usize,
+    pub promoted_count: usize,
     #[serde(default)]
-    pub is_repeat:        bool,
+    pub is_repeat: bool,
     /// Flat correct_form values that were just promoted to vocabulary.
     /// Driven by the toast event the desktop emits to the frontend.
     #[serde(default)]
-    pub promoted_terms:   Vec<String>,
+    pub promoted_terms: Vec<String>,
 }
 
 /// Classify an edit using the four-way classifier.
@@ -715,13 +779,13 @@ pub struct ClassifyEditResponse {
 /// STT_ERROR auto-promotes on first sighting; POLISH_ERROR promotes only on
 /// repeat; REPHRASE/REWRITE do nothing.
 pub async fn classify_edit(
-    ep:             &BackendEndpoint,
-    recording_id:   &str,
-    ai_output:      &str,
-    user_kept:      &str,
+    ep: &BackendEndpoint,
+    recording_id: &str,
+    ai_output: &str,
+    user_kept: &str,
     capture_method: &str,
 ) -> Result<ClassifyEditResponse, String> {
-    let url  = format!("{}/v1/classify-edit", ep.url);
+    let url = format!("{}/v1/classify-edit", ep.url);
     let body = serde_json::json!({
         "recording_id":   recording_id,
         "ai_output":      ai_output,
@@ -753,7 +817,7 @@ pub async fn get_vocabulary_terms(ep: &BackendEndpoint) -> Result<Vec<String>, S
     let resp = Client::new()
         .get(&url)
         .header("Authorization", ep.bearer())
-        .timeout(std::time::Duration::from_millis(500))   // hot path — fail fast
+        .timeout(std::time::Duration::from_millis(500)) // hot path — fail fast
         .send()
         .await
         .map_err(|e| format!("get vocab terms failed: {e}"))?
@@ -767,11 +831,11 @@ pub async fn get_vocabulary_terms(ep: &BackendEndpoint) -> Result<Vec<String>, S
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VocabRow {
-    pub term:      String,
-    pub weight:    f64,
+    pub term: String,
+    pub weight: f64,
     pub use_count: i64,
     pub last_used: i64,
-    pub source:    String,   // "auto" | "manual" | "starred"
+    pub source: String, // "auto" | "manual" | "starred"
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -855,7 +919,7 @@ pub async fn star_vocabulary_term(ep: &BackendEndpoint, term: &str) -> Result<bo
 ///                                           caller should fall back to mailto
 ///   Err("...")                            — any other failure (network, 5xx)
 pub async fn send_invite_email(ep: &BackendEndpoint, to: &str) -> Result<bool, String> {
-    let url  = format!("{}/v1/invite", ep.url);
+    let url = format!("{}/v1/invite", ep.url);
     let resp = Client::new()
         .post(&url)
         .header("Authorization", ep.bearer())
@@ -909,11 +973,11 @@ pub async fn get_pending_edits(ep: &BackendEndpoint) -> Result<PendingEditsRespo
 }
 
 pub async fn resolve_pending_edit(
-    ep:     &BackendEndpoint,
-    id:     &str,
+    ep: &BackendEndpoint,
+    id: &str,
     action: &str, // "approve" | "skip"
 ) -> Result<(), String> {
-    let url    = format!("{}/v1/pending-edits/{id}/resolve", ep.url);
+    let url = format!("{}/v1/pending-edits/{id}/resolve", ep.url);
     let status = Client::new()
         .post(&url)
         .header("Authorization", ep.bearer())
@@ -931,7 +995,7 @@ pub async fn resolve_pending_edit(
 
 /// Hard-delete a single recording (SQLite row + WAV file).
 pub async fn delete_recording(ep: &BackendEndpoint, id: &str) -> Result<(), String> {
-    let url    = format!("{}/v1/recordings/{id}", ep.url);
+    let url = format!("{}/v1/recordings/{id}", ep.url);
     let status = Client::new()
         .delete(&url)
         .header("Authorization", ep.bearer())
@@ -950,4 +1014,30 @@ pub async fn delete_recording(ep: &BackendEndpoint, id: &str) -> Result<(), Stri
 /// Used by the frontend to construct an <audio> src via fetch+blob.
 pub fn recording_audio_url(ep: &BackendEndpoint, id: &str) -> String {
     format!("{}/v1/recordings/{id}/audio", ep.url)
+}
+
+/// Fetch a recording's WAV bytes from the local backend using native reqwest.
+///
+/// The frontend previously fetched this URL directly from the WKWebView, which
+/// is fragile because it needs CORS + an Authorization header + media playback
+/// to all line up inside the webview. Keeping the authenticated fetch in Tauri
+/// makes play/download buttons independent of browser fetch behavior.
+pub async fn recording_audio_bytes(ep: &BackendEndpoint, id: &str) -> Result<Vec<u8>, String> {
+    let url = recording_audio_url(ep, id);
+    let res = Client::new()
+        .get(&url)
+        .bearer_auth(&ep.secret)
+        .send()
+        .await
+        .map_err(|e| format!("audio fetch failed: {e}"))?;
+
+    let status = res.status();
+    if !status.is_success() {
+        return Err(format!("audio fetch error: {status}"));
+    }
+
+    res.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("audio read failed: {e}"))
 }

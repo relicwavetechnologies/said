@@ -24,6 +24,7 @@ interface DashboardViewProps {
   liveText?:       string;
   pendingEdits?:   PendingEdit[];
   onResolvePending?: (id: string, action: "approve" | "skip") => void;
+  onDownloadSuccess?: (path: string) => void;
 }
 
 // ── View ───────────────────────────────────────────────────────────────────────
@@ -38,6 +39,7 @@ export function DashboardView({
   liveText       = "",
   pendingEdits   = [],
   onResolvePending,
+  onDownloadSuccess,
 }: DashboardViewProps) {
   const [reviewOpen, setReviewOpen] = useState(false);
   const [recordings, setRecordings] = useState<Recording[]>([]);
@@ -208,6 +210,7 @@ export function DashboardView({
           <RecordingsTable
             recordings={recordings}
             onSeeAll={() => onNavigate?.("history")}
+            onDownloadSuccess={onDownloadSuccess}
           />
         </div>
 

@@ -37,18 +37,26 @@ import {
 } from "@/lib/invoke";
 import { useTheme } from "@/lib/useTheme";
 import type { AppSnapshot, HistoryItem, PendingEdit, Recording } from "@/types";
-import { RetryToast, EditConfirmToast, VocabularyToast } from "@/components/NotificationToast";
+import { RetryToast, EditConfirmToast, VocabularyToast, DownloadSuccessToast } from "@/components/NotificationToast";
 
 export type ActiveView = "dashboard" | "history" | "vocabulary" | "insights" | "settings";
 const VALID_VIEWS: ActiveView[] = ["dashboard", "history", "vocabulary", "insights", "settings"];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/** Compute current consecutive-day streak from a newest-first history array. */
+/** Compute current consecutive-day streak from a newest-first history array.
+ *  Uses LOCAL day-index so a 1am-IST recording doesn't end up bucketed as
+ *  "yesterday UTC" and break the streak. */
+function localDayIdx(ms: number): number {
+  const d = new Date(ms);
+  const localMidnight = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  return Math.floor(localMidnight / 86_400_000);
+}
+
 function computeStreak(items: HistoryItem[]): number {
   if (items.length === 0) return 0;
-  const todayDay = Math.floor(Date.now() / 86_400_000);
-  const activeDays = new Set(items.map((h) => Math.floor(h.timestamp_ms / 86_400_000)));
+  const todayDay = localDayIdx(Date.now());
+  const activeDays = new Set(items.map((h) => localDayIdx(h.timestamp_ms)));
   let streak = 0;
   let day = todayDay;
   // Allow today OR yesterday as the streak start (don't break if user hasn't recorded today yet)
@@ -99,6 +107,9 @@ export default function App() {
 
   // ── Vocabulary toast (manual add, auto-promote, star) ─────────────────────
   const [vocabToast, setVocabToast] = useState<VocabToastPayload | null>(null);
+
+  // ── Download success toast ────────────────────────────────────────────────
+  const [downloadToast, setDownloadToast] = useState<{ filename: string } | null>(null);
 
   // ── Pending edits ─────────────────────────────────────────────────────────
   const [pendingEdits, setPendingEdits] = useState<PendingEdit[]>([]);
@@ -175,6 +186,11 @@ export default function App() {
       setConnectError(err instanceof Error ? err.message : String(err));
       setConnectBusy(false);
     }
+  }, []);
+
+  const handleDownloadSuccess = useCallback((path: string) => {
+    const filename = path.split(/[\\/]/).pop() || "recording.wav";
+    setDownloadToast({ filename });
   }, []);
 
   // ── Auth submit ────────────────────────────────────────────────────────────
@@ -409,8 +425,11 @@ export default function App() {
   if (needsAuth === null || openAIConnected === null) {
     // Still checking — bare loading splash with the same brand as the auth screens
     return (
-      <div className="flex h-screen w-screen items-center justify-center"
-           style={{ background: "hsl(var(--background))" }}>
+      <div
+        data-tauri-drag-region
+        className="flex h-screen w-screen items-center justify-center"
+        style={{ background: "hsl(var(--background))" }}
+      >
         <div className="flex flex-col items-center gap-3">
           <BrandMark size={36} idSuffix="loading" className="opacity-70" />
           <span className="text-[12px] text-muted-foreground">Starting Said…</span>
@@ -421,8 +440,11 @@ export default function App() {
 
   if (needsAuth) {
     return (
-      <div className="flex h-screen w-screen items-center justify-center relative overflow-hidden"
-           style={{ background: "hsl(var(--background))" }}>
+      <div
+        className="flex h-screen w-screen items-center justify-center relative overflow-hidden"
+        style={{ background: "hsl(var(--background))" }}
+      >
+        <div aria-hidden data-tauri-drag-region className="absolute inset-x-0 top-0 h-12 drag-region" />
 
         {/* Mint hero glow — same wash used on the dashboard + invite modal */}
         <div
@@ -558,8 +580,11 @@ export default function App() {
   /* ── OpenAI connection gate (required — no skip) ───────────────────────── */
   if (!openAIConnected) {
     return (
-      <div className="flex h-screen w-screen items-center justify-center relative overflow-hidden"
-           style={{ background: "hsl(var(--background))" }}>
+      <div
+        className="flex h-screen w-screen items-center justify-center relative overflow-hidden"
+        style={{ background: "hsl(var(--background))" }}
+      >
+        <div aria-hidden data-tauri-drag-region className="absolute inset-x-0 top-0 h-12 drag-region" />
 
         {/* Same hero glow so the two auth steps feel like one flow */}
         <div
@@ -643,10 +668,7 @@ export default function App() {
 
   /* ── Render ─────────────────────────────────────────────────────────────── */
   return (
-    <div
-      data-tauri-drag-region
-      className="flex h-screen w-screen overflow-hidden bg-background"
-    >
+    <div className="flex h-screen w-screen overflow-hidden bg-background">
 
       {/* ── Sidebar — full height left column ────────── */}
       <Sidebar
@@ -680,13 +702,7 @@ export default function App() {
         />
 
         {/* ── The "mat" — elevated content surface ─────── */}
-        {/* `data-tauri-drag-region` on the padding wrapper so the strip
-            of floor visible AROUND the rounded mat is draggable — gives
-            the user a generous edge to grab the window from. */}
-        <main
-          data-tauri-drag-region
-          className="flex-1 overflow-hidden p-3 pt-2"
-        >
+        <main className="flex-1 overflow-hidden p-3 pt-2">
           <div className="h-full rounded-2xl overflow-hidden" style={{ background: "hsl(var(--surface-2))" }}>
             {activeView === "dashboard" && (
               <DashboardView
@@ -698,13 +714,14 @@ export default function App() {
                 statusPhase={statusPhase}
                 liveText={liveText}
                 pendingEdits={pendingEdits}
+                onDownloadSuccess={handleDownloadSuccess}
                 onResolvePending={async (id, action) => {
                   await resolvePendingEdit(id, action);
                   setPendingEdits((prev) => prev.filter((e) => e.id !== id));
                 }}
               />
             )}
-            {activeView === "history"    && <HistoryView />}
+            {activeView === "history"    && <HistoryView onDownloadSuccess={handleDownloadSuccess} />}
             {activeView === "vocabulary" && <VocabularyView />}
             {activeView === "insights"   && <InsightsView snapshot={snapshotWithHistory} />}
             {/* Settings is now a modal — opened via setSettingsOpen */}
@@ -764,6 +781,14 @@ export default function App() {
             } catch { /* non-critical */ }
           } : undefined}
           onDismiss={() => setVocabToast(null)}
+        />
+      )}
+
+      {/* ── Download success toast (bottom-center) ─── */}
+      {downloadToast && !retryToast && !editToast && !vocabToast && (
+        <DownloadSuccessToast
+          filename={downloadToast.filename}
+          onDismiss={() => setDownloadToast(null)}
         />
       )}
 

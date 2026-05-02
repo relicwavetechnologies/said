@@ -318,6 +318,32 @@ export async function getRecordingAudioUrl(
   }
 }
 
+/** Return WAV bytes for a recording. Keeps authenticated audio reads in Tauri. */
+export async function getRecordingAudioBytes(id: string): Promise<Uint8Array | null> {
+  if (!isTauriRuntime()) return null;
+  try {
+    const bytes = await tauriInvoke<number[] | Uint8Array>(
+      "get_recording_audio_bytes", { id }
+    );
+    return bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  } catch {
+    return null;
+  }
+}
+
+/** Save a recording WAV to the user's Downloads folder. Returns the saved path. */
+export async function downloadRecordingAudio(
+  id: string,
+  filename: string
+): Promise<string | null> {
+  if (!isTauriRuntime()) return null;
+  try {
+    return await tauriInvoke<string>("download_recording_audio", { id, filename });
+  } catch {
+    return null;
+  }
+}
+
 /** Submit edit feedback so the backend can learn from user corrections. */
 export async function submitEditFeedback(
   recordingId: string,

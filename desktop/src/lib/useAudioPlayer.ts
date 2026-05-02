@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getRecordingAudioUrl } from "@/lib/invoke";
+import { getRecordingAudioBytes } from "@/lib/invoke";
 
 /**
  * Shared audio-playback hook for recording rows. Returns the currently-playing
@@ -46,21 +46,15 @@ export function useAudioPlayer() {
       blobUrlRef.current = null;
     }
 
-    const ep = await getRecordingAudioUrl(recordingId);
-    if (!ep) return;
-
     try {
-      const res = await fetch(ep.url, {
-        headers: { Authorization: `Bearer ${ep.secret}` },
-      });
-      if (!res.ok) return;
-      const blob  = await res.blob();
+      const bytes = await getRecordingAudioBytes(recordingId);
+      if (!bytes) return;
+
+      const blob  = new Blob([bytes], { type: "audio/wav" });
       const url   = URL.createObjectURL(blob);
       const audio = new Audio(url);
       audioRef.current   = audio;
       blobUrlRef.current = url;
-      setPlayingId(recordingId);
-      audio.play();
       audio.onended = () => {
         setPlayingId(null);
         if (blobUrlRef.current) {
@@ -69,8 +63,15 @@ export function useAudioPlayer() {
         }
         audioRef.current = null;
       };
+      await audio.play();
+      setPlayingId(recordingId);
     } catch {
       setPlayingId(null);
+      audioRef.current = null;
+      if (blobUrlRef.current) {
+        URL.revokeObjectURL(blobUrlRef.current);
+        blobUrlRef.current = null;
+      }
     }
   }, [playingId]);
 

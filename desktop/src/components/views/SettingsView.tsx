@@ -4,15 +4,15 @@ import { cn } from "@/lib/utils";
 import {
   Shield, Cpu, Key, Info, Wifi, Check, Bot, Sparkles, Zap,
   Languages, MessageSquareText, Loader2, Cloud, LogIn, LogOut, RefreshCw, UserPlus,
-  TestTube, Eye, EyeOff, Bell,
+  Eye, EyeOff, Bell,
 } from "lucide-react";
 import type { AppSnapshot, CloudStatus, OpenAIStatus, Preferences } from "@/types";
 import {
   cloudLogin, cloudLogout, cloudSignup, getCloudStatus,
-  getPreferences, patchPreferences, diagnoseAx,
+  getPreferences, patchPreferences,
   getOpenAIStatus, initiateOpenAIOAuth, disconnectOpenAI,
-  requestNotifications, checkNotificationPermission, isTauriRuntime,
-  type AxDiagnostics, type NotifPermission,
+  requestNotifications, checkNotificationPermission,
+  type NotifPermission,
 } from "@/lib/invoke";
 
 // ── Tone presets ──────────────────────────────────────────────────────────────
@@ -95,7 +95,6 @@ export type SettingsSection =
   | "permissions"
   | "api-keys"
   | "account"
-  | "diagnostics"
   | "about";
 
 export const SETTINGS_SECTIONS: { id: SettingsSection; label: string }[] = [
@@ -103,7 +102,6 @@ export const SETTINGS_SECTIONS: { id: SettingsSection; label: string }[] = [
   { id: "permissions", label: "Permissions"   },
   { id: "api-keys",    label: "API keys"      },
   { id: "account",     label: "Account"       },
-  { id: "diagnostics", label: "Diagnostics"   },
   { id: "about",       label: "About"         },
 ];
 
@@ -141,10 +139,8 @@ export function SettingsView({
   const axGranted  = snapshot?.accessibility_granted    ?? false;
   const imGranted  = snapshot?.input_monitoring_granted ?? false;
 
-  const [notifPerm,      setNotifPerm]      = useState<NotifPermission>("unknown");
-  const [notifBusy,      setNotifBusy]      = useState(false);
-  const [notifTestLog,   setNotifTestLog]   = useState<string>("");
-  const [notifCountdown, setNotifCountdown] = useState(0);
+  const [notifPerm, setNotifPerm] = useState<NotifPermission>("unknown");
+  const [notifBusy, setNotifBusy] = useState(false);
   const axSupported = snapshot?.auto_paste_supported    ?? false;
 
   // ── Prefs state ─────────────────────────────────────────────────────────────
@@ -180,26 +176,6 @@ export function SettingsView({
   const [cloudBusy,    setCloudBusy]    = useState(false);
   const [cloudError,   setCloudError]   = useState("");
 
-  // ── AX diagnostic state ────────────────────────────────────────────────────
-  const [axCountdown, setAxCountdown] = useState<number>(0);
-  const [axBusy,      setAxBusy]      = useState(false);
-  const [axReport,    setAxReport]    = useState<AxDiagnostics | null>(null);
-
-  async function runAxDiagnostic() {
-    setAxReport(null);
-    setAxBusy(true);
-    // Visible 5-second countdown so the user can switch apps
-    for (let s = 5; s > 0; s--) {
-      setAxCountdown(s);
-      await new Promise((r) => setTimeout(r, 1000));
-    }
-    setAxCountdown(0);
-    // The Rust side waits 0 seconds (we already counted in the UI)
-    const report = await diagnoseAx(0);
-    setAxReport(report);
-    setAxBusy(false);
-  }
-
   useEffect(() => {
     let alive = true;
     const refresh = () => {
@@ -219,54 +195,22 @@ export function SettingsView({
     };
   }, []);
 
+  // Permissions section "Allow / Open Settings" handler — requests notification
+  // permission. macOS only shows the prompt once; if denied, the user must
+  // toggle it in System Settings.
   async function handleNotifTest() {
     setNotifBusy(true);
-    setNotifTestLog("Checking permission…");
-
-    const current = await checkNotificationPermission();
-    setNotifTestLog(`Current permission: ${current}`);
-
-    if (current !== "granted") {
-      setNotifTestLog(`Permission is "${current}" — requesting…`);
-      const result = await requestNotifications();
-      setNotifPerm(result);
-      setNotifTestLog(`After request: ${result}`);
-
-      if (result !== "granted") {
-        const hint = result === "denied"
-          ? "Denied — open System Settings → Notifications → Said and enable it there."
-          : `Unexpected state: ${result}`;
-        setNotifTestLog(`${result === "denied" ? "❌" : "⚠️"} ${hint}`);
-        setNotifBusy(false);
+    try {
+      const current = await checkNotificationPermission();
+      if (current === "granted") {
+        setNotifPerm("granted");
         return;
       }
-    } else {
-      setNotifPerm("granted");
+      const result = await requestNotifications();
+      setNotifPerm(result);
+    } finally {
+      setNotifBusy(false);
     }
-
-    // macOS suppresses notifications from the frontmost app.
-    // Give the user 3 seconds to switch to another app, then fire.
-    setNotifTestLog("✅ Permission granted — switching focus, fire in 3s…\n(switch to any other app now!)");
-    for (let s = 3; s > 0; s--) {
-      setNotifCountdown(s);
-      await new Promise((r) => setTimeout(r, 1000));
-    }
-    setNotifCountdown(0);
-
-    setNotifTestLog("🔔 Firing notification now…");
-    try {
-      if (isTauriRuntime()) {
-        const { sendNotification } = await import("@tauri-apps/plugin-notification");
-        await sendNotification({
-          title: "Said — Test ✓",
-          body: "It works! Notifications are set up correctly.",
-        });
-      }
-      setNotifTestLog("✅ sendNotification() called — check your notification banner or Notification Center.");
-    } catch (err) {
-      setNotifTestLog(`❌ sendNotification threw: ${String(err)}`);
-    }
-    setNotifBusy(false);
   }
 
   useEffect(() => {
@@ -787,111 +731,6 @@ export function SettingsView({
         </div>
         </Show>
 
-        {/* ── AX field-reading diagnostic ───────────────── */}
-        <Show when={isOn("diagnostics")}>
-        <Section title="Field-Reading Diagnostic">
-          <Row
-            icon={<TestTube size={16} />}
-            label="Test which AX method works on a focused app"
-            description={
-              axBusy && axCountdown > 0
-                ? `Switch focus to your target app NOW — sampling in ${axCountdown}s…`
-                : axBusy
-                ? "Reading focused field via 5 methods…"
-                : "Click Run, then switch focus to any text field within 5 seconds. Tells you which of 5 reading techniques works in that app."
-            }
-            action={
-              <button
-                onClick={runAxDiagnostic}
-                disabled={axBusy}
-                className="text-[12px] font-semibold px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1"
-                style={{
-                  background: axBusy ? "hsl(var(--surface-4))" : "hsl(var(--primary))",
-                  color: axBusy ? "hsl(var(--muted-foreground))" : "hsl(var(--primary-foreground))",
-                  cursor: axBusy ? "not-allowed" : "pointer",
-                }}
-              >
-                {axBusy
-                  ? (axCountdown > 0 ? `${axCountdown}…` : "Reading…")
-                  : "Run"}
-              </button>
-            }
-            last
-          />
-          {axReport && (
-            <div
-              className="px-5 py-4 border-t"
-              style={{ borderColor: "hsl(var(--surface-4))" }}
-            >
-              <div className="text-[12px] mb-3 leading-relaxed">
-                <span className="text-muted-foreground">App:</span>{" "}
-                <span className="font-medium text-foreground">
-                  {axReport.app_name ?? "?"} (pid={axReport.app_pid ?? "?"})
-                </span>{" "}
-                <span className="text-muted-foreground">· role:</span>{" "}
-                <span className="font-medium text-foreground">
-                  {axReport.element_role ?? "?"}
-                </span>
-              </div>
-              <div className="space-y-2">
-                {axReport.methods.map((m) => {
-                  // Method 6 (clipboard) is the universal fallback — highlight it amber
-                  const isClipboard = m.method === "6_clipboard";
-                  return (
-                    <div
-                      key={m.method}
-                      className="text-[11px] leading-snug rounded-md p-2"
-                      style={{
-                        background: m.ok
-                          ? isClipboard
-                            ? "hsl(38 80% 14%)"          // amber tint for clipboard
-                            : "hsl(var(--chip-lime-bg))"
-                          : "hsl(var(--surface-4))",
-                        color: m.ok
-                          ? isClipboard
-                            ? "hsl(38 90% 70%)"
-                            : "hsl(var(--chip-lime-fg))"
-                          : "hsl(var(--muted-foreground))",
-                      }}
-                    >
-                      <div className="font-semibold mb-0.5">
-                        {m.ok ? "✓" : "✗"} {m.label}
-                        {isClipboard && m.ok && (
-                          <span className="ml-2 font-normal opacity-70">
-                            (fallback — briefly selects all)
-                          </span>
-                        )}
-                      </div>
-                      {m.ok && m.text != null && (
-                        <div
-                          className="font-mono text-[10px] mt-1 max-h-20 overflow-auto"
-                          style={{ color: "hsl(var(--foreground))" }}
-                        >
-                          {m.text.length === 0 ? "(empty string)" : m.text}
-                        </div>
-                      )}
-                      {m.err && (
-                        <div className="font-mono text-[10px] mt-1 opacity-70">
-                          {m.err}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-              <details className="mt-3">
-                <summary className="text-[11px] text-muted-foreground cursor-pointer select-none">
-                  AX attributes available on focused element ({axReport.attributes.length})
-                </summary>
-                <div className="font-mono text-[10px] mt-2 text-muted-foreground leading-relaxed">
-                  {axReport.attributes.join(", ")}
-                </div>
-              </details>
-            </div>
-          )}
-        </Section>
-        </Show>
-
         {/* ── API Keys ──────────────────────────────────── */}
         <Show when={isOn("api-keys")}>
         <div className="mb-7">
@@ -1310,73 +1149,6 @@ export function SettingsView({
             </div>
           )}
         </Section>
-        </Show>
-
-        {/* ── Notification test (temp debug) ───────────── */}
-        <Show when={isOn("diagnostics")}>
-        <div className="mb-7">
-          <p className="section-label px-1 mb-2.5">Notification Debug</p>
-          <div className="panel p-5 space-y-3">
-            <div className="flex items-center gap-3">
-              <div
-                className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 text-muted-foreground"
-                style={{ background: "hsl(var(--surface-4))" }}
-              >
-                <Bell size={16} />
-              </div>
-              <div className="flex-1">
-                <p className="text-[13px] font-medium text-foreground">Test Notifications</p>
-                <p className="text-[12px] text-muted-foreground">
-                  Current permission:{" "}
-                  <span
-                    className="font-semibold"
-                    style={{
-                      color: notifPerm === "granted"
-                        ? "hsl(var(--chip-lime-fg))"
-                        : notifPerm === "denied"
-                        ? "hsl(0 75% 65%)"
-                        : "hsl(var(--muted-foreground))",
-                    }}
-                  >
-                    {notifPerm}
-                  </span>
-                </p>
-              </div>
-              <button
-                disabled={notifBusy}
-                onClick={handleNotifTest}
-                className="text-[12px] font-semibold px-4 py-2 rounded-lg transition-colors flex items-center gap-1.5 disabled:opacity-50"
-                style={{ background: "hsl(var(--primary))", color: "hsl(var(--primary-foreground))" }}
-              >
-                {notifCountdown > 0
-                  ? <>{notifCountdown}s — switch apps!</>
-                  : notifBusy
-                  ? <><Loader2 size={12} className="animate-spin" /> Working…</>
-                  : <><Bell size={12} /> Send Test</>
-                }
-              </button>
-            </div>
-
-            {notifTestLog && (
-              <div
-                className="rounded-lg px-3 py-2.5 font-mono text-[11px] leading-relaxed whitespace-pre-wrap"
-                style={{ background: "hsl(var(--surface-4))", color: "hsl(var(--foreground))" }}
-              >
-                {notifTestLog}
-              </div>
-            )}
-
-            {notifPerm === "denied" && (
-              <p
-                className="text-[11px] leading-relaxed rounded-lg px-3 py-2.5"
-                style={{ background: "hsl(38 80% 12%)", color: "hsl(38 90% 70%)" }}
-              >
-                macOS only shows the permission dialog once. Since it was denied, you must enable it manually:{" "}
-                <strong>System Settings → Notifications → Said → Allow Notifications</strong>
-              </p>
-            )}
-          </div>
-        </div>
         </Show>
 
         {/* ── About ────────────────────────────────────── */}

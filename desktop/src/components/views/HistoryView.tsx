@@ -1,10 +1,26 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Clock, Copy, Play, Pause, Trash2, MoreHorizontal, Check, Search, X } from "lucide-react";
+import { Clock, Copy, Play, Pause, Trash2, MoreHorizontal, Check, Search, X, Download } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { groupHistory } from "@/types";
 import type { Recording } from "@/types";
-import { deleteRecording, listHistory } from "@/lib/invoke";
+import { deleteRecording, listHistory, downloadRecordingAudio as saveRecordingAudio } from "@/lib/invoke";
 import { useAudioPlayer } from "@/lib/useAudioPlayer";
+
+// ── Download helper ───────────────────────────────────────────────────────────
+
+/** Build a friendly filename: "said-2026-05-03-1430-12-words.wav". */
+function audioFilename(recording: Recording): string {
+  const d     = new Date(recording.timestamp_ms);
+  const pad   = (n: number) => String(n).padStart(2, "0");
+  const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
+  return `said-${stamp}-${recording.word_count}-words.wav`;
+}
+
+/** Ask Tauri to save the WAV to Downloads. Returns the saved path on success. */
+async function downloadRecordingAudio(recording: Recording): Promise<string | null> {
+  if (!recording.audio_id) return null;
+  return await saveRecordingAudio(recording.id, audioFilename(recording));
+}
 
 // ── Context menu ──────────────────────────────────────────────────────────────
 
@@ -13,12 +29,13 @@ interface MenuProps {
   playingId:   string | null;
   onPlay:      () => void;
   onCopy:      () => void;
+  onDownload:  () => void;
   onDelete:    () => void;
   onClose:     () => void;
   anchorRef:   React.RefObject<HTMLButtonElement | null>;
 }
 
-function RowMenu({ recording, playingId, onPlay, onCopy, onDelete, onClose, anchorRef }: MenuProps) {
+function RowMenu({ recording, playingId, onPlay, onCopy, onDownload, onDelete, onClose, anchorRef }: MenuProps) {
   const menuRef  = useRef<HTMLDivElement>(null);
   const isPlaying = playingId === recording.id;
   const hasAudio  = !!recording.audio_id;
@@ -79,6 +96,7 @@ function RowMenu({ recording, playingId, onPlay, onCopy, onDelete, onClose, anch
         !hasAudio,
       )}
       {item(<Copy size={13} />, "Copy text", onCopy)}
+      {item(<Download size={13} />, "Download audio", onDownload, false, !hasAudio)}
       <div className="my-1 mx-1 border-t" style={{ borderColor: "hsl(var(--surface-3))" }} />
       {item(<Trash2 size={13} />, "Delete", onDelete, true)}
     </div>
@@ -92,18 +110,55 @@ interface RowProps {
   playingId:   string | null;
   onPlay:      (r: Recording) => void;
   onDelete:    (r: Recording) => void;
+  onDownloadSuccess?: (path: string) => void;
 }
 
-function HistoryRow({ recording, playingId, onPlay, onDelete }: RowProps) {
-  const [menuOpen, setMenuOpen]   = useState(false);
-  const [copied,   setCopied]     = useState(false);
+// Word-count threshold above which a recording is collapsed with a Read-more
+const TRUNCATE_WORD_LIMIT = 30;
+
+function HistoryRow({ recording, playingId, onPlay, onDelete, onDownloadSuccess }: RowProps) {
+  const [menuOpen,    setMenuOpen]    = useState(false);
+  const [copied,      setCopied]      = useState(false);
+  const [expanded,    setExpanded]    = useState(false);
+  const [downloading, setDownloading] = useState(false);
   const btnRef = useRef<HTMLButtonElement>(null);
+
+  async function handleDownload() {
+    if (!recording.audio_id || downloading) return;
+    setDownloading(true);
+    try {
+      const savedPath = await downloadRecordingAudio(recording);
+      if (savedPath) onDownloadSuccess?.(savedPath);
+    } finally {
+      setDownloading(false);
+    }
+  }
 
   const time = new Date(recording.timestamp_ms).toLocaleTimeString([], {
     hour: "2-digit", minute: "2-digit",
   });
 
   const isPlaying = playingId === recording.id;
+
+  // Truncate long polished text — split on whitespace, keep the first N words
+  const fullText  = recording.polished ?? "";
+  const wordParts = fullText.split(/(\s+)/);   // keep delimiters so re-join preserves spacing
+  const wordCount = recording.word_count ?? fullText.trim().split(/\s+/).filter(Boolean).length;
+  const isLong    = wordCount > TRUNCATE_WORD_LIMIT;
+  // Collect tokens until we've kept TRUNCATE_WORD_LIMIT non-whitespace tokens
+  let kept = 0;
+  let cutIdx = wordParts.length;
+  for (let i = 0; i < wordParts.length; i++) {
+    if (wordParts[i].trim().length > 0) {
+      kept += 1;
+      if (kept >= TRUNCATE_WORD_LIMIT) {
+        cutIdx = i + 1;
+        break;
+      }
+    }
+  }
+  const truncatedText = wordParts.slice(0, cutIdx).join("").trimEnd();
+  const displayText   = !isLong || expanded ? fullText : truncatedText;
 
   function handleCopy() {
     navigator.clipboard.writeText(recording.polished ?? recording.transcript ?? "");
@@ -128,7 +183,35 @@ function HistoryRow({ recording, playingId, onPlay, onDelete }: RowProps) {
       {/* Content */}
       <div className="flex-1 min-w-0">
         <p className="text-[14px] text-foreground leading-relaxed">
-          {recording.polished || (
+          {fullText ? (
+            <>
+              {displayText}
+              {isLong && !expanded && (
+                <>
+                  <span className="text-muted-foreground">… </span>
+                  <button
+                    onClick={() => setExpanded(true)}
+                    className="text-[12.5px] font-semibold transition-colors"
+                    style={{ color: "hsl(var(--primary))" }}
+                  >
+                    Read more
+                  </button>
+                </>
+              )}
+              {isLong && expanded && (
+                <>
+                  {" "}
+                  <button
+                    onClick={() => setExpanded(false)}
+                    className="text-[12.5px] font-semibold transition-colors"
+                    style={{ color: "hsl(var(--muted-foreground))" }}
+                  >
+                    Show less
+                  </button>
+                </>
+              )}
+            </>
+          ) : (
             <span className="italic text-muted-foreground">—</span>
           )}
         </p>
@@ -200,6 +283,7 @@ function HistoryRow({ recording, playingId, onPlay, onDelete }: RowProps) {
               playingId={playingId}
               onPlay={() => onPlay(recording)}
               onCopy={handleCopy}
+              onDownload={handleDownload}
               onDelete={() => onDelete(recording)}
               onClose={() => setMenuOpen(false)}
               anchorRef={btnRef}
@@ -213,7 +297,7 @@ function HistoryRow({ recording, playingId, onPlay, onDelete }: RowProps) {
 
 // ── Main view ─────────────────────────────────────────────────────────────────
 
-export function HistoryView() {
+export function HistoryView({ onDownloadSuccess }: { onDownloadSuccess?: (path: string) => void }) {
   const [recordings, setRecordings] = useState<Recording[]>([]);
   const [query,      setQuery]      = useState("");
   const { playingId, play, stop }   = useAudioPlayer();
@@ -346,6 +430,7 @@ export function HistoryView() {
                         playingId={playingId}
                         onPlay={handlePlay}
                         onDelete={handleDelete}
+                        onDownloadSuccess={onDownloadSuccess}
                       />
                     </React.Fragment>
                   );

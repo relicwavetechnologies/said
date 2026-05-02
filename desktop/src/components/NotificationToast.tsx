@@ -1,5 +1,5 @@
 import React, { useEffect } from "react";
-import { X, RotateCcw, Check, Sparkles, BookOpen, Star, Undo2, History } from "lucide-react";
+import { X, RotateCcw, Check, Sparkles, BookOpen, Star, Undo2, History, Download } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 // ── Retry Toast ───────────────────────────────────────────────────────────────
@@ -89,6 +89,57 @@ export function RetryToast({
           <X size={11} />
         </button>
       </div>
+    </div>
+  );
+}
+
+// ── Download Success Toast ───────────────────────────────────────────────────
+
+interface DownloadSuccessToastProps {
+  filename:  string;
+  onDismiss: () => void;
+}
+
+export function DownloadSuccessToast({ filename, onDismiss }: DownloadSuccessToastProps) {
+  useEffect(() => {
+    const t = setTimeout(onDismiss, 4000);
+    return () => clearTimeout(t);
+  }, [onDismiss]);
+
+  return (
+    <div
+      className="fixed bottom-5 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 px-4 py-3 rounded-2xl shadow-xl max-w-sm"
+      style={{
+        background:  "hsl(var(--surface-3))",
+        border:      "1px solid hsl(var(--border))",
+        boxShadow:   "0 8px 32px hsl(0 0% 0% / 0.28)",
+        animation:   "fadeIn 0.18s ease-out",
+      }}
+    >
+      <span
+        className="w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0"
+        style={{ background: "hsl(var(--chip-mint-bg))", color: "hsl(var(--chip-mint-fg))" }}
+      >
+        <Download size={12} strokeWidth={2.5} />
+      </span>
+
+      <div className="flex-1 min-w-0">
+        <p className="text-[12px] font-semibold text-foreground leading-tight">
+          Download complete
+        </p>
+        <p className="text-[11px] text-muted-foreground leading-tight mt-0.5 truncate" title={filename}>
+          Saved {filename} to Downloads.
+        </p>
+      </div>
+
+      <button
+        onClick={onDismiss}
+        title="Dismiss"
+        className="w-6 h-6 rounded-lg flex items-center justify-center transition-colors opacity-50 hover:opacity-100 flex-shrink-0"
+        style={{ background: "hsl(var(--surface-4))" }}
+      >
+        <X size={11} />
+      </button>
     </div>
   );
 }

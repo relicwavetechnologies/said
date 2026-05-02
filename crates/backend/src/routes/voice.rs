@@ -19,8 +19,8 @@ use axum::{
     extract::{Multipart, State},
     http::StatusCode,
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse,
+        sse::{Event, KeepAlive, Sse},
     },
 };
 use serde_json::json;
@@ -57,10 +57,14 @@ pub fn cleanup_old_audio() {
         .checked_sub(std::time::Duration::from_secs(86_400))
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
-    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let Ok(meta) = entry.metadata() else { continue };
-        let Ok(modified) = meta.modified() else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
         if modified < cutoff {
             let _ = std::fs::remove_file(entry.path());
             debug!("[voice] deleted old audio {}", entry.path().display());
@@ -69,33 +73,38 @@ pub fn cleanup_old_audio() {
 }
 
 use crate::{
+    AppState,
     embedder::gemini,
-    llm::{gateway, gemini_direct, groq, openai_codex, prompt::{build_system_prompt_with_vocab, build_user_message}},
-    stt::deepgram,
+    llm::{
+        gateway, gemini_direct, groq, openai_codex,
+        prompt::{build_system_prompt_with_vocab, build_user_message},
+    },
     store::{
-        history::{insert_recording, InsertRecording},
-        openai_oauth,
-        stt_replacements,
+        history::{InsertRecording, insert_recording},
+        openai_oauth, stt_replacements,
         vectors::retrieve_similar,
         vocabulary,
     },
-    AppState,
+    stt::deepgram,
 };
 
-pub async fn polish(
-    State(state): State<AppState>,
-    mut multipart: Multipart,
-) -> impl IntoResponse {
+pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> impl IntoResponse {
     // ── Extract multipart fields ───────────────────────────────────────────────
-    let mut wav_data:       Vec<u8>         = Vec::new();
-    let mut target_app:     Option<String>  = None;
-    let mut pre_transcript: Option<String>  = None;  // P5: from Deepgram WS
+    let mut wav_data: Vec<u8> = Vec::new();
+    let mut target_app: Option<String> = None;
+    let mut pre_transcript: Option<String> = None; // P5: from Deepgram WS
 
     while let Ok(Some(field)) = multipart.next_field().await {
         match field.name() {
-            Some("audio")          => { wav_data      = field.bytes().await.unwrap_or_default().to_vec(); }
-            Some("target_app")     => { target_app    = field.text().await.ok(); }
-            Some("pre_transcript") => { pre_transcript = field.text().await.ok().filter(|s| !s.is_empty()); }
+            Some("audio") => {
+                wav_data = field.bytes().await.unwrap_or_default().to_vec();
+            }
+            Some("target_app") => {
+                target_app = field.text().await.ok();
+            }
+            Some("pre_transcript") => {
+                pre_transcript = field.text().await.ok().filter(|s| !s.is_empty());
+            }
             _ => {}
         }
     }
@@ -106,17 +115,30 @@ pub async fn polish(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    // Save audio to disk (1-day retention) — fire-and-forget so the response
-    // stream opens without waiting for the filesystem write (~10–20 ms saved).
+    // Save audio to disk (1-day retention) before exposing audio_id in history.
+    // This costs only a few ms, and prevents UI play/download buttons from
+    // pointing at a WAV file that failed to save.
     let audio_id = Uuid::new_v4().to_string();
-    if !wav_data.is_empty() {
-        let aid  = audio_id.clone();
+    let saved_audio_id = if !wav_data.is_empty() {
+        let aid = audio_id.clone();
         let data = wav_data.clone();
-        tokio::task::spawn_blocking(move || { save_audio(&aid, &data); });
-    }
+        match tokio::task::spawn_blocking(move || save_audio(&aid, &data).is_some()).await {
+            Ok(true) => Some(audio_id.clone()),
+            Ok(false) => {
+                warn!("[voice] failed to save audio");
+                None
+            }
+            Err(e) => {
+                warn!("[voice] audio save task failed: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let user_id = state.default_user_id.as_str().to_string();
-    let pool    = state.pool.clone();
+    let pool = state.pool.clone();
 
     let http_client = state.http_client.clone();
 
@@ -125,7 +147,7 @@ pub async fn polish(
     // run concurrently so total wait ≈ max(each) instead of their sum (~8 ms saved).
     let vocab_task = {
         let pool_c = pool.clone();
-        let uid_c  = user_id.clone();
+        let uid_c = user_id.clone();
         tokio::task::spawn_blocking(move || vocabulary::top_term_strings(&pool_c, &uid_c, 100))
     };
     let (prefs_opt, (word_corrections, stt_replacement_rules), vocab_terms) = tokio::join!(
@@ -135,10 +157,10 @@ pub async fn polish(
     );
 
     // ── Build SSE stream ───────────────────────────────────────────────────────
-    let audio_id_ref = audio_id.clone();
+    let audio_id_ref = saved_audio_id.clone();
     let stream = async_stream::stream! {
         let total_start = Instant::now();
-        let aid = audio_id_ref.as_str(); // available for error payloads
+        let aid = audio_id_ref.as_deref(); // available for error payloads
 
         // 1. Load prefs (already fetched above — just unwrap here)
         let prefs = match prefs_opt {
@@ -376,7 +398,8 @@ pub async fn polish(
         let recording_id = Uuid::new_v4().to_string();
         let word_count   = llm_result.polished.split_whitespace().count() as i64;
 
-        // 7. Persist recording (fire-and-forget)
+        // 7. Persist recording before emitting `done`, so the UI refresh that
+        // follows the done event can see both the row and its audio_id.
         {
             let pool2   = pool.clone();
             let id2     = recording_id.clone();
@@ -389,8 +412,8 @@ pub async fn polish(
             let t_ms    = transcribe_ms;
             let e_ms    = embed_ms;
             let p_ms    = llm_result.polish_ms as i64;
-            let aid2    = audio_id.clone();
-            tokio::spawn(async move {
+            let aid2    = saved_audio_id.clone();
+            let inserted = tokio::task::spawn_blocking(move || {
                 insert_recording(&pool2, InsertRecording {
                     id: &id2, user_id: &uid2,
                     transcript: &t2, polished: &p2,
@@ -402,9 +425,12 @@ pub async fn polish(
                     polish_ms:     Some(p_ms),
                     target_app:    ta2.as_deref(),
                     source:        "voice",
-                    audio_id:      Some(&aid2),
-                });
-            });
+                    audio_id:      aid2.as_deref(),
+                }).is_some()
+            }).await.unwrap_or(false);
+            if !inserted {
+                warn!("[voice] failed to insert recording history row");
+            }
         }
 
         debug!("[voice] done — {total_ms}ms total, {word_count} words, {examples_used} RAG examples");
@@ -446,13 +472,17 @@ fn strip_confidence_markers(s: &str) -> String {
             let mut inner = String::new();
             let mut found_close = false;
             for ic in chars.by_ref() {
-                if ic == ']' { found_close = true; break; }
+                if ic == ']' {
+                    found_close = true;
+                    break;
+                }
                 inner.push(ic);
             }
             if found_close {
                 if let Some(qpos) = inner.rfind('?') {
                     let after_q = &inner[qpos + 1..];
-                    if after_q.ends_with('%') && after_q[..after_q.len() - 1].parse::<f64>().is_ok() {
+                    if after_q.ends_with('%') && after_q[..after_q.len() - 1].parse::<f64>().is_ok()
+                    {
                         // Valid confidence marker — emit just the word part
                         result.push_str(&inner[..qpos]);
                         continue;
