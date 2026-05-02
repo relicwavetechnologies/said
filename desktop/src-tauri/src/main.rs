@@ -1155,23 +1155,23 @@ async fn run_voice_polish_sse(
             api::PolishEvent::Error { message, audio_id } => {
                 let human = humanize_error(&message);
                 let _ = app_clone.emit("voice-error", serde_json::json!({
-                    "message":  human,
+                    "message":  human.clone(),
                     "audio_id": audio_id,
                 }));
-                // Bounce the dock icon — macOS's standard "look at me" signal
-                // that doesn't steal focus or interrupt typing.  The in-app
-                // toast (History · Retry · Dismiss) is the actual interactive
-                // surface; the user sees it when they bring Said back into
-                // focus naturally.
+                // Native macOS banner — informational only.  In dev mode the
+                // osascript path can't attach action buttons (those require a
+                // bundled .app with a registered UNNotificationCategory), so
+                // the banner simply tells the user something went wrong and
+                // they switch to Said when ready.  The in-app toast carries
+                // the actual History / Retry buttons.
                 //
-                // We deliberately DO NOT call notify_macos here: osascript
-                // banners are attributed to Script Editor, so clicking them
-                // opens Script Editor instead of Said — confusing UX with no
-                // workaround short of a properly bundled .app.
-                if let Some(w) = app_clone.get_webview_window("main") {
-                    use tauri::UserAttentionType;
-                    let _ = w.request_user_attention(Some(UserAttentionType::Critical));
-                }
+                // No auto-focus, no dock bounce — per user preference.  The
+                // banner is the only attention signal; the user controls when
+                // to bring Said forward.
+                notify_macos(
+                    "Said couldn't finish that recording",
+                    &format!("{human}  Open Said to retry or view history."),
+                );
             }
         }
     })
