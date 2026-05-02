@@ -817,7 +817,7 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
             };
 
             let transcript = dg_stream::stream_to_deepgram(chunk_recv, &deepgram_key, &language).await;
-            tracing::debug!(
+            tracing::info!(
                 "[dg_stream] pre-transcript result: {}",
                 transcript.as_deref().unwrap_or("<none>")
             );
@@ -874,14 +874,32 @@ fn do_finish_recording(
         // In practice the WS path takes ~1.5-2 s from Caps Lock release to final
         // transcript (CloseStream + Deepgram finalize + 300ms endpointing window).
         // If it still doesn't arrive, we fall through to the normal HTTP STT path.
+        // Estimate recording duration from WAV size:
+        // 16kHz × 16-bit × mono = 32,000 bytes/sec, plus 44 byte WAV header
+        let wav_duration_s = (wav.len().saturating_sub(44)) as f64 / 32_000.0;
+
         let pre_transcript: Option<String> = if let Some(rx) = transcript_rx {
             match tokio::time::timeout(std::time::Duration::from_secs(4), rx).await {
                 Ok(Ok(t)) if !t.is_empty() => {
-                    tracing::debug!("[finish] WS pre-transcript ready ({} chars): {t:?}", t.len());
-                    Some(t)
+                    // Quality gate: reject suspiciously short transcripts.
+                    // Typical Hindi/English speech: ~2 words/second.
+                    // If we get fewer than 1 word per 2 seconds of audio,
+                    // the WS likely returned a partial — fall back to HTTP STT.
+                    let word_count = t.split_whitespace().count();
+                    let expected_min_words = (wav_duration_s / 2.0).max(1.0) as usize;
+                    if word_count < expected_min_words && wav_duration_s > 3.0 {
+                        tracing::warn!(
+                            "[finish] WS transcript too short: {} words for {:.1}s recording (expected ≥{}) — falling back to HTTP STT. transcript={t:?}",
+                            word_count, wav_duration_s, expected_min_words
+                        );
+                        None
+                    } else {
+                        tracing::info!("[finish] ✓ WS pre-transcript ready ({} chars, {} words, {:.1}s audio): {t:?}", t.len(), word_count, wav_duration_s);
+                        Some(t)
+                    }
                 }
                 Ok(_) => {
-                    tracing::debug!("[finish] WS transcript empty — using HTTP STT");
+                    tracing::info!("[finish] WS transcript empty — falling back to HTTP STT");
                     None
                 }
                 Err(_) => {
@@ -950,6 +968,17 @@ async fn run_voice_polish_sse(
     let typed_any2   = typed_any.clone();
     let token_count  = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let token_count2 = token_count.clone();
+    let fail_count   = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fail_count2  = fail_count.clone();
+
+    tracing::info!(
+        "[pipeline] → sending to backend: wav={}KB pre_transcript={}",
+        wav.len() / 1024,
+        pre_transcript.as_ref().map(|t| {
+            let truncated: String = t.chars().take(80).collect();
+            if truncated.len() < t.len() { format!("\"{truncated}…\"") } else { format!("\"{t}\"") }
+        }).unwrap_or_else(|| "none (will use HTTP STT)".into()),
+    );
 
     let done = api::stream_voice_polish(&ep, wav, target_app, pre_transcript, move |event| {
         match &event {
@@ -966,14 +995,29 @@ async fn run_voice_polish_sse(
                         }
                         let _ = n;
                     }
-                    Ok(false) => { /* AX not granted — will fall back to paste() below */ }
-                    Err(e)   => tracing::warn!("[main] type_text error: {e}"),
+                    Ok(false) => {
+                        fail_count2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        fail_count2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!("[main] type_text error: {e}");
+                    }
                 }
             }
             api::PolishEvent::Status { phase, transcript } => {
+                tracing::info!("[pipeline] status: phase={phase} transcript={transcript:?}");
                 let _ = app_clone.emit("voice-status", serde_json::json!({ "phase": phase, "transcript": transcript }));
             }
             api::PolishEvent::Done(done) => {
+                tracing::info!(
+                    "[pipeline] ✓ done: {} chars, model={}, latency: stt={}ms embed={}ms polish={}ms total={}ms",
+                    done.polished.len(),
+                    done.model_used,
+                    done.latency_ms.transcribe,
+                    done.latency_ms.embed,
+                    done.latency_ms.polish,
+                    done.latency_ms.total,
+                );
                 let _ = app_clone.emit("voice-done", done);
             }
             api::PolishEvent::Error { message, audio_id } => {
@@ -983,11 +1027,26 @@ async fn run_voice_polish_sse(
     })
     .await?;
 
-    let n_typed = token_count.load(std::sync::atomic::Ordering::Relaxed);
+    let n_typed  = token_count.load(std::sync::atomic::Ordering::Relaxed);
+    let n_failed = fail_count.load(std::sync::atomic::Ordering::Relaxed);
     if typed_any.load(std::sync::atomic::Ordering::Relaxed) {
-        tracing::info!("[main] GAP-2: word-by-word complete — {n_typed} token(s) typed directly");
+        if n_failed > 0 {
+            // Some tokens typed, some failed — AX partially worked (user switched app?).
+            // Do a full clipboard paste to ensure completeness.
+            tracing::warn!(
+                "[main] word-by-word partial: {n_typed} ok, {n_failed} failed — clipboard paste for safety"
+            );
+            if !done.polished.is_empty() {
+                // Select-all and replace to avoid duplicating the partial text
+                if let Err(e) = paster::paste(&done.polished) {
+                    tracing::warn!("[main] safety paste failed: {e}");
+                }
+            }
+        } else {
+            tracing::info!("[main] word-by-word complete — {n_typed} token(s) typed directly");
+        }
     } else {
-        // AX not available — fall back to clipboard paste
+        // AX not available at all — fall back to clipboard paste
         tracing::info!("[main] AX not granted — falling back to clipboard paste ({} chars)", done.polished.len());
         if !done.polished.is_empty() {
             if let Err(e) = paster::paste(&done.polished) {
@@ -1672,14 +1731,28 @@ fn main() {
         .append(true)
         .open(&log_path)
         .expect("cannot open said.log");
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,voice_polish_hotkey=debug,voice_polish_paster=debug".into()),
-        )
-        .with_ansi(false)   // no colour codes in the file
-        .with_writer(std::sync::Mutex::new(log_file))
-        .init();
+    // Two tracing layers: log file (always) + stderr (for `cargo run` visibility).
+    {
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::fmt;
+
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "info,voice_polish_hotkey=debug,voice_polish_paster=debug".into());
+
+        let file_layer = fmt::layer()
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(log_file));
+
+        let stderr_layer = fmt::layer()
+            .with_ansi(true)
+            .with_writer(std::io::stderr);
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(file_layer)
+            .with(stderr_layer)
+            .init();
+    }
     tracing::info!("[main] said desktop starting — log file: {log_path}");
 
     // 3. Shared state

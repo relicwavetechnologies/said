@@ -19,7 +19,7 @@ reqwest  = { workspace = true, features = ["blocking"] }
 futures  = "0.3"
 bytes    = "1"
 tracing  = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 
 # WebSocket client for Deepgram live streaming (P5)
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }

@@ -296,36 +296,46 @@ export function InsightsView({ snapshot }: InsightsViewProps) {
               <button className="hover:text-foreground transition-colors">›</button>
             </div>
 
-            {/* Grid */}
+            {/* Grid — proper week × weekday calendar:
+                · each column = one week (oldest → newest, left → right)
+                · each row    = one weekday (Sun…Sat)
+                · cells anchored to the most-recent Sunday so columns align */}
             <div
               className="grid gap-1"
               style={{ gridTemplateColumns: `36px repeat(${COL_COUNT}, 1fr)` }}
             >
-              {DAYS.map((day, dayOfWeek) => (
-                <React.Fragment key={day}>
-                  <span className="text-[10px] text-muted-foreground flex items-center">{day}</span>
-                  {Array.from({ length: COL_COUNT }, (_, col) => {
-                    const daysAgo   = COL_COUNT - 1 - col;
-                    const cellDay   = todayUnixDay - daysAgo;
-                    const cellDow   = new Date(cellDay * 86_400_000).getDay();
-                    const isVisible = cellDow === dayOfWeek;
-                    const isCurrent = isVisible && daysAgo === 0;
-                    const cellWords = isVisible ? (dayMap.get(cellDay) ?? 0) : 0;
-                    const level     = isVisible ? wordCountToLevel(cellWords) : 0;
-                    return (
-                      <span
-                        key={col}
-                        className={cn(
-                          "aspect-square rounded-[3px]",
-                          !isVisible && "opacity-0 pointer-events-none",
-                          isCurrent ? "heat-current" : `heat-${level}`
-                        )}
-                        title={isVisible && cellWords > 0 ? `${cellWords} words` : undefined}
-                      />
-                    );
-                  })}
-                </React.Fragment>
-              ))}
+              {(() => {
+                const todayDate    = new Date(todayUnixDay * 86_400_000);
+                const todayDow     = todayDate.getDay();
+                const lastSundayIx = todayUnixDay - todayDow;
+
+                return DAYS.map((day, dayOfWeek) => (
+                  <React.Fragment key={day}>
+                    <span className="text-[10px] text-muted-foreground flex items-center">{day}</span>
+                    {Array.from({ length: COL_COUNT }, (_, col) => {
+                      const weeksAgo  = COL_COUNT - 1 - col;
+                      const cellDay   = lastSundayIx - weeksAgo * 7 + dayOfWeek;
+                      const isFuture  = cellDay > todayUnixDay;
+                      const isCurrent = cellDay === todayUnixDay;
+                      const cellWords = isFuture ? 0 : (dayMap.get(cellDay) ?? 0);
+                      const level     = isFuture ? 0 : wordCountToLevel(cellWords);
+                      return (
+                        <span
+                          key={col}
+                          className={cn(
+                            "aspect-square rounded-[3px]",
+                            isCurrent ? "heat-current" : `heat-${level}`
+                          )}
+                          style={{ opacity: isFuture ? 0.3 : 1 }}
+                          title={!isFuture && cellWords > 0
+                            ? `${cellWords} words on ${new Date(cellDay * 86_400_000).toLocaleDateString("en-US", { month: "short", day: "numeric" })}`
+                            : undefined}
+                        />
+                      );
+                    })}
+                  </React.Fragment>
+                ));
+              })()}
             </div>
 
             {/* Legend */}
