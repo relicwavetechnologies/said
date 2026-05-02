@@ -1,13 +1,15 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Bell, LogOut, LogIn, User, Sparkles, BookOpen, Star, X as XIcon } from "lucide-react";
+import { Bell, LogOut, LogIn, User, Sparkles, BookOpen, Star, AlertCircle } from "lucide-react";
 import type { AppSnapshot } from "@/types";
 import { ThemeToggle } from "@/components/ThemeToggle";
+import { BrandMark } from "@/components/BrandMark";
 import type { Theme } from "@/lib/useTheme";
 import {
   cloudLogout,
   getCloudStatus,
   onVocabToast,
   onPendingEditsChanged,
+  onVoiceError,
 } from "@/lib/invoke";
 
 // ── Notification log entry ───────────────────────────────────────────────────
@@ -65,14 +67,17 @@ function NotifDropdown({
         animation: "fadeIn 0.15s ease-out",
       }}
     >
-      {/* Header */}
+      {/* Header — Said brand mark + label */}
       <div
         className="flex items-center justify-between px-4 py-3 border-b"
         style={{ borderColor: "hsl(var(--surface-3))" }}
       >
-        <span className="text-[12px] font-bold uppercase tracking-[0.12em] text-muted-foreground">
-          Notifications
-        </span>
+        <div className="flex items-center gap-2">
+          <BrandMark size={18} idSuffix="notif-header" />
+          <span className="text-[12px] font-bold uppercase tracking-[0.12em] text-muted-foreground">
+            Notifications
+          </span>
+        </div>
         {entries.length > 0 && (
           <button
             onClick={onClear}
@@ -86,10 +91,11 @@ function NotifDropdown({
       {/* List */}
       <div className="max-h-96 overflow-y-auto">
         {entries.length === 0 ? (
-          <div className="px-5 py-10 text-center">
-            <p className="text-[13px] text-muted-foreground">You're all caught up.</p>
-            <p className="text-[11px] text-muted-foreground mt-1 opacity-70">
-              Notifications about learned words and recording issues land here.
+          <div className="px-5 py-10 text-center flex flex-col items-center gap-2">
+            <BrandMark size={28} idSuffix="notif-empty" className="opacity-50" />
+            <p className="text-[13px] text-muted-foreground mt-1">You're all caught up.</p>
+            <p className="text-[11px] text-muted-foreground opacity-70 max-w-[220px] leading-relaxed">
+              Learning updates and recording issues will land here.
             </p>
           </div>
         ) : (
@@ -121,7 +127,7 @@ function NotifDropdown({
                   }}
                 >
                   {n.kind === "error" ? (
-                    <XIcon size={11} strokeWidth={2.5} />
+                    <AlertCircle size={11} strokeWidth={2.4} />
                   ) : n.kind === "vocab-starred" ? (
                     <Star size={11} fill="currentColor" />
                   ) : n.kind === "vocab-removed" ? (
@@ -316,7 +322,21 @@ export function Topbar({ snapshot: _snapshot, theme, toggleTheme, onLoginClick }
       // review" inside the panel).
     });
 
-    return () => { unsubVocab(); unsubPending(); };
+    // Voice errors (empty recording, transcription failures, etc.) — these
+    // already fire a transient retry toast; mirror them into the in-app log
+    // so the user sees a history when they open the bell.
+    const unsubError = onVoiceError((message, audioId) => {
+      const empty = /no\s*(speech|audio)|empty|too short/i.test(message);
+      push({
+        kind:  "error",
+        title: empty ? "Nothing recorded" : "Recording didn't make it",
+        body:  empty
+          ? "We didn't catch any speech. Try again — speak a little closer to the mic."
+          : message || (audioId ? "We saved the audio so you can retry it." : "Try again in a moment."),
+      });
+    });
+
+    return () => { unsubVocab(); unsubPending(); unsubError(); };
   }, []);
 
   const unreadCount = notifs.filter((n) => !n.read).length;
