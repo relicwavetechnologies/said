@@ -26,6 +26,8 @@ const LOW_CONFIDENCE_THRESHOLD: f64 = 0.85;
 ///
 /// - `chunk_recv.rx` is closed (channel disconnected) by `AudioRecorder::stop()`.
 /// - `language`: pass an empty string for auto-detect / Hindi default.
+/// - `keyterms`: words/phrases to boost recognition for (the "right" spellings from
+///   user's correction history). Appended as `&keyterm=` params (Nova-3 only).
 ///
 /// Returns `None` if WS connection fails or Deepgram returns no transcript.
 pub async fn stream_to_deepgram(
@@ -41,6 +43,26 @@ pub async fn stream_to_deepgram(
 
     let lang = if language.is_empty() || language == "auto" { "hi" } else { language };
 
+    // Endpointing: how long Deepgram waits after silence before marking speech_final.
+    // - multi mode:  100ms — Deepgram's recommended value for code-switching; shorter
+    //   checkpoints help the model handle language switches cleanly.
+    // - hi / en etc: 500ms — Hindi speech has longer natural inter-word pauses;
+    //   300ms (old default) was causing premature sentence splits.
+    let endpointing = if lang == "multi" { 100 } else { 500 };
+
+    // Build keyterm params — cap at 80 terms (well under Deepgram's 500-token limit)
+    let keyterm_params: String = keyterms
+        .iter()
+        .take(80)
+        .map(|k| format!("&keyterm={}", k.replace(' ', "+")))
+        .collect();
+
+    if !keyterms.is_empty() {
+        info!("[dg_stream] {} keyterm(s) for STT boost: {:?}", keyterms.len(), &keyterms[..keyterms.len().min(5)]);
+    }
+
+    info!("[dg_stream] lang={lang} endpointing={endpointing}ms");
+
     // Deepgram WS URL with encoding parameters for raw i16 PCM at 16 kHz.
     // utterance_end_ms=1000: Deepgram emits UtteranceEnd ~1 s after speech stops,
     // which lets us break the drain loop immediately instead of waiting the full window.
@@ -52,14 +74,14 @@ pub async fn stream_to_deepgram(
         "wss://api.deepgram.com/v1/listen\
          ?model=nova-3\
          &language={lang}\
-         &smart_format=true\
          &punctuate=true\
          &encoding=linear16\
          &sample_rate={SAMPLE_RATE}\
          &channels=1\
          &interim_results=true\
-         &endpointing=300\
-         &utterance_end_ms=1000"
+         &endpointing={endpointing}\
+         &utterance_end_ms=1000\
+         {keyterm_params}"
     );
     let bias_count = keyterms.iter().filter(|t| !t.trim().is_empty()).count().min(100);
     for term in keyterms.iter().take(100) {

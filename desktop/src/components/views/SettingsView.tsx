@@ -31,10 +31,11 @@ type ToneKey = (typeof TONE_PRESETS)[number]["key"];
 // ── Language options ──────────────────────────────────────────────────────────
 
 const LANGUAGES = [
-  { key: "auto", label: "Auto-detect" },
-  { key: "hi",   label: "Hindi / Hinglish" },
-  { key: "en",   label: "English" },
-  { key: "en-IN",label: "English (India)" },
+  { key: "auto",  label: "Auto-detect" },
+  { key: "hi",    label: "Hindi / Hinglish" },
+  { key: "multi", label: "Hindi + English (code-switching)" },
+  { key: "en",    label: "English" },
+  { key: "en-IN", label: "English (India)" },
 ];
 
 // ── Sub-components ────────────────────────────────────────────────────────────
@@ -585,7 +586,7 @@ export function SettingsView({
               <div className="flex-1">
                 <p className="text-[13px] font-medium text-foreground mb-1">Transcription Language</p>
                 <p className="text-[12px] text-muted-foreground">
-                  Sent to Deepgram for speech recognition
+                  Use "code-switching" if you mix Hindi and English mid-sentence
                 </p>
               </div>
               <select

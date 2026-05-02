@@ -139,6 +139,25 @@ pub fn build_system_prompt_with_vocab(
          Words the engine was uncertain about are marked as [word?XX%] where XX is the \
          confidence percentage. For example, [dog?47%] means the engine heard \"dog\" with \
          only 47% confidence. These are the words most likely to be WRONG.\n\n\
+         SPOKEN DICTATION PATTERNS:\n\
+         People often speak punctuation and symbols out loud. Recognise and convert them \
+         based on context — do NOT convert if it would change the meaning of a normal sentence.\n\
+         • \"at the rate\" / \"at rate\" → @ (only when clearly part of an email or handle)\n\
+         • \"dot com / dot in / dot org / dot net / dot io / dot co\" → .com / .in etc. \
+         (email or URL context)\n\
+         • \"double u double u double u\" → www\n\
+         • \"underscore\" → _ (identifier or handle context)\n\
+         • \"hyphen\" / \"dash\" → - (identifier context, NOT general speech)\n\
+         • \"slash\" → / (URL or path context)\n\
+         • \"hash\" / \"hashtag\" → # (handle or ID context)\n\
+         • \"colon slash slash\" → :// (URL context)\n\
+         Context examples:\n\
+         ✓ \"abhishek at the rate gmail dot com\" → \"abhishek@gmail.com\"\n\
+         ✓ \"visit double u double u double u dot company dot com\" → \"visit www.company.com\"\n\
+         ✓ \"my handle is john underscore doe\" → \"my handle is john_doe\"\n\
+         ✗ \"growing at the rate of 10 percent\" → keep as-is (not an email)\n\
+         ✗ \"put a dot here\" → keep as-is (not a URL)\n\
+         ✗ \"there is a dash of salt\" → keep as-is (not an identifier)\n\n\
          YOUR JOB:\n\
          1. Pay special attention to [word?XX%] markers — these are likely misheard. Use \
          the SURROUNDING CONTEXT to figure out what the speaker actually meant.\n\
@@ -148,13 +167,14 @@ pub fn build_system_prompt_with_vocab(
          When a [word?XX%] marker is phonetically similar to a vocabulary term, prefer \
          the vocabulary term — that is exactly the case the personal dictionary exists for.\n\
          3. Even unmarked words can be wrong — use common sense for the whole sentence.\n\
-         4. Remove disfluencies (um, uh, matlab, basically, you know, toh, like).\n\
-         5. Polish into clean, natural text.\n\
-         6. Output ONLY the polished text — no preamble, no commentary, no markdown, \
+         4. Convert spoken dictation patterns (see above) when context is unambiguous.\n\
+         5. Remove disfluencies (um, uh, matlab, basically, you know, toh, like).\n\
+         6. Polish into clean, natural text.\n\
+         7. Output ONLY the polished text — no preamble, no commentary, no markdown, \
          and NO [word?XX%] markers in the output.\n\
-         7. The output_language rule above is ABSOLUTE — follow it for script and language.\n\
-         8. If <polish_preferences> exist, prefer the right-hand form when contextually appropriate.\n\
-         9. If <preferences> exist, match the user's style and word choices.\n\n\
+         8. The output_language rule above is ABSOLUTE — follow it for script and language.\n\
+         9. If <polish_preferences> exist, prefer the right-hand form when contextually appropriate.\n\
+         10. If <preferences> exist, match the user's style and word choices.\n\n\
          IMPORTANT: Think about what the speaker INTENDED to say based on the overall \
          topic and sentence meaning. Low-confidence words are hints, not gospel.\n\
          </task>"

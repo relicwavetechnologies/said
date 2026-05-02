@@ -101,6 +101,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/v1/recordings/:id/audio", get(routes::history::audio))
         .route("/v1/preferences",     get(routes::prefs::get_prefs))
         .route("/v1/preferences",     patch(routes::prefs::patch_prefs))
+        .route("/v1/corrections",     get(routes::prefs::get_corrections))
         // Cloud auth bridge — store/clear cloud token, query cloud status
         .route("/v1/cloud/token",     axum::routing::put(routes::cloud::store_token))
         .route("/v1/cloud/token",     axum::routing::delete(routes::cloud::clear_token))

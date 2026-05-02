@@ -55,8 +55,7 @@ pub struct TranscriptResult {
 /// Send WAV audio bytes to Deepgram and return the top transcript.
 /// `language` defaults to `"hi"` (Hindi/Hinglish) if empty.
 /// `keyterms` are personal-vocabulary terms that Deepgram should bias toward
-/// (Nova-3 keyterm prompting; falls back to the older `keywords=` parameter
-/// for legacy models).  Pass an empty slice for no biasing.
+/// (Nova-3 keyterm prompting).  Pass an empty slice for no biasing.
 pub async fn transcribe(
     client:   &Client,
     api_key:  &str,
@@ -66,11 +65,11 @@ pub async fn transcribe(
 ) -> Result<TranscriptResult, String> {
     let lang = if language.is_empty() || language == "auto" { "hi" } else { language };
 
-    // Build URL with one repeated `keyterm=` parameter per personal vocabulary
-    // term.  URL-encoded; we cap at 100 to stay under Deepgram's request size
-    // limits (caller should already have limited).
+    // Build URL — smart_format intentionally omitted: it mangles numbers into
+    // times/dates/phones (e.g. "2305" → "2 03:05") which breaks dictation of
+    // email addresses, IDs, and numbers in Hindi context.
     let mut url = format!(
-        "{DEEPGRAM_URL}?model=nova-3&language={lang}&smart_format=true&punctuate=true"
+        "{DEEPGRAM_URL}?model=nova-3&language={lang}&punctuate=true"
     );
     let bias_count = keyterms.len().min(100);
     for term in keyterms.iter().take(100) {

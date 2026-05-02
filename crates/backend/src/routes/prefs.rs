@@ -3,13 +3,28 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use serde::Serialize;
 use tracing::info;
 
 use crate::{
-    store::prefs::{PrefsUpdate, Preferences},
+    store::{corrections, prefs::{PrefsUpdate, Preferences}},
     AppState,
     get_prefs_cached, invalidate_prefs_cache,
 };
+
+/// GET /v1/corrections — returns the "right" words from the user's correction
+/// history as a flat list of strings, ready for use as Deepgram keyterms.
+pub async fn get_corrections(State(state): State<AppState>) -> Json<CorrectionsResponse> {
+    let user_id = state.default_user_id.clone();
+    let all = corrections::load_all(&state.pool, &user_id);
+    let keyterms: Vec<String> = all.into_iter().map(|c| c.right).collect();
+    Json(CorrectionsResponse { keyterms })
+}
+
+#[derive(Serialize)]
+pub struct CorrectionsResponse {
+    pub keyterms: Vec<String>,
+}
 
 pub async fn get_prefs(State(state): State<AppState>) -> Result<Json<Preferences>, StatusCode> {
     let user_id = state.default_user_id.clone();

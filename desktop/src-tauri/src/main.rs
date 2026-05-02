@@ -816,7 +816,7 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
             }
             tracing::debug!("[dg_stream] API key present ({} chars)", deepgram_key.len());
 
-            // Fetch language + personal vocabulary in parallel from local
+// Fetch language + personal vocabulary in parallel from local
             // backend (127.0.0.1, <30 ms combined). Vocab terms become Deepgram
             // `keyterm=` biases — the single most important learning signal,
             // applied at the source rather than post-hoc.
@@ -1649,7 +1649,12 @@ async fn watch_for_edit(
 
     // Garbage check: if user_kept shares zero words with polished it's likely
     // a UI placeholder (e.g. Slack's "Type / for commands") that leaked through.
-    if !shares_word_overlap(&user_kept, &polished) {
+    //
+    // Exception: format transformations like "abhishek at the rate gmail dot com"
+    // → "abhishek@gmail.com" produce no word overlap but ARE valid corrections.
+    // Detect these by checking if user_kept looks like an email, URL, handle, or
+    // other compact identifier format — let those through to the classifier.
+    if !shares_word_overlap(&user_kept, &polished) && !is_format_transformation(&user_kept) {
         tracing::info!(
             "[edit-watch] user_kept has no word overlap with polished — garbage, skipping. kept={:?}",
             user_kept.chars().take(40).collect::<String>()
@@ -1715,6 +1720,33 @@ async fn watch_for_edit(
 /// Returns true if `candidate` shares at least one significant word (>3 chars,
 /// case-insensitive ASCII) with `reference`.  Used to detect when the app has
 /// cleared its text field (e.g. Slack post-send shows "Type / for commands").
+/// Returns true if `text` looks like a format-transformed value — an email,
+/// URL, handle, phone number, or similar compact identifier.  These are valid
+/// corrections that the word-overlap garbage gate would otherwise discard,
+/// because "abhishek@gmail.com" shares no whitespace-delimited tokens with
+/// "Abhishek at the rate gmail dot com."
+fn is_format_transformation(text: &str) -> bool {
+    let t = text.trim();
+    // Email address: something@something.tld
+    if t.contains('@') && t.contains('.') && !t.contains(' ') {
+        return true;
+    }
+    // URL: starts with http/https/www or contains ://
+    if t.starts_with("http://") || t.starts_with("https://") || t.starts_with("www.") || t.contains("://") {
+        return true;
+    }
+    // Handle / username: starts with @ or contains _ with no spaces
+    if t.starts_with('@') || (t.contains('_') && !t.contains(' ') && t.len() < 40) {
+        return true;
+    }
+    // Phone number: mostly digits, spaces/dashes/dots/parens, 7+ chars
+    let digits: usize = t.chars().filter(|c| c.is_ascii_digit()).count();
+    if digits >= 7 && t.chars().all(|c| c.is_ascii_digit() || " -.+()\u{00A0}".contains(c)) {
+        return true;
+    }
+    false
+}
+
 fn shares_word_overlap(candidate: &str, reference: &str) -> bool {
     let ref_words: std::collections::HashSet<String> = reference
         .split_whitespace()

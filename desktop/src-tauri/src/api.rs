@@ -378,6 +378,20 @@ pub async fn patch_preferences(
         .map_err(|e| format!("parse prefs failed: {e} — raw: {}", &text[..text.len().min(200)]))
 }
 
+/// Fetch the user's correction keyterms (right-hand words from word_corrections table).
+/// Used to boost Deepgram STT recognition for words the user frequently corrects.
+pub async fn get_correction_keyterms(ep: &BackendEndpoint) -> Vec<String> {
+    #[derive(serde::Deserialize)]
+    struct Resp { keyterms: Vec<String> }
+    let url = format!("{}/v1/corrections", ep.url);
+    let Ok(resp) = Client::new()
+        .get(&url)
+        .header("Authorization", ep.bearer())
+        .send()
+        .await else { return vec![] };
+    resp.json::<Resp>().await.map(|b| b.keyterms).unwrap_or_default()
+}
+
 // ── History ───────────────────────────────────────────────────────────────────
 
 pub async fn get_history(ep: &BackendEndpoint, limit: i64) -> Result<Vec<Recording>, String> {
