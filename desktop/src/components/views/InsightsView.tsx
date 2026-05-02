@@ -24,18 +24,24 @@ function WpmGauge({ wpm }: { wpm: number }) {
   return (
     <div className="flex flex-col items-center mt-4">
       <svg width="140" height="80" viewBox="0 0 140 80">
-        {/* Track */}
+        <defs>
+          <linearGradient id="wpmGrad" x1="0" y1="0" x2="140" y2="0" gradientUnits="userSpaceOnUse">
+            <stop offset="0%"   stopColor="hsl(var(--accent-violet))" />
+            <stop offset="100%" stopColor="hsl(var(--primary))" />
+          </linearGradient>
+        </defs>
+        {/* Track — uses muted-foreground so visible in both modes */}
         <path
           d={`M ${cx - r},${cy} A ${r},${r} 0 0 1 ${cx + r},${cy}`}
           strokeWidth="8" fill="none"
-          stroke="hsl(var(--surface-4))"
+          stroke="hsl(var(--muted-foreground) / 0.18)"
           strokeLinecap="round"
         />
-        {/* Fill */}
+        {/* Fill — violet → mint gradient */}
         <path
           d={`M ${cx - r},${cy} A ${r},${r} 0 0 1 ${cx + r},${cy}`}
           strokeWidth="8" fill="none"
-          stroke="hsl(var(--primary))"
+          stroke="url(#wpmGrad)"
           strokeLinecap="round"
           strokeDasharray={circumference}
           strokeDashoffset={dashOffset}
@@ -120,17 +126,26 @@ export function InsightsView({ snapshot }: InsightsViewProps) {
 
         {/* ── Header ──────────────────────────────── */}
         <div className="mb-7">
-          <h1 className="text-[28px] font-bold tracking-tight text-foreground leading-tight">
+          <h1 className="text-[24px] font-bold tracking-tight text-foreground leading-tight">
             Insights
           </h1>
-          <p className="text-[13px] text-muted-foreground mt-1">Your recording analytics</p>
+          <p className="text-[12.5px] text-muted-foreground mt-1 flex items-center gap-2">
+            <span
+              className="inline-block w-1.5 h-1.5 rounded-full"
+              style={{
+                background: "hsl(var(--accent-violet))",
+                boxShadow:  "0 0 8px hsl(var(--accent-violet) / 0.5)",
+              }}
+            />
+            Your recording analytics · {history.length} session{history.length === 1 ? "" : "s"}
+          </p>
         </div>
 
         {/* ── Top grid: 3 cols ─────────────────────── */}
         <div className="grid grid-cols-3 gap-4 mb-4">
 
           {/* WPM gauge */}
-          <div className="tile p-5">
+          <div className="panel p-5">
             <div className="text-[32px] font-bold tracking-tight text-foreground leading-none tabular-nums">
               {wpm || "—"}
             </div>
@@ -145,7 +160,7 @@ export function InsightsView({ snapshot }: InsightsViewProps) {
           </div>
 
           {/* Sessions card */}
-          <div className="tile p-5">
+          <div className="panel p-5">
             <div className="text-[32px] font-bold tracking-tight text-foreground leading-none tabular-nums">
               {history.length}
             </div>
@@ -164,18 +179,38 @@ export function InsightsView({ snapshot }: InsightsViewProps) {
           </div>
 
           {/* Total words */}
-          <div className="tile p-5">
+          <div
+            className="panel p-5 relative overflow-hidden"
+            style={{
+              background:
+                "linear-gradient(135deg, hsl(var(--surface-3)) 0%, hsl(var(--surface-3)) 60%, hsl(var(--accent-violet) / 0.10) 100%)",
+            }}
+          >
             <div
-              className="text-[32px] font-bold tracking-tight leading-none tabular-nums"
-              style={{ color: "hsl(var(--chip-lime-fg))" }}
+              aria-hidden
+              className="absolute pointer-events-none"
+              style={{
+                right: -60, bottom: -60, width: 180, height: 180, borderRadius: "50%",
+                background: "radial-gradient(circle, hsl(var(--accent-violet) / 0.20) 0%, transparent 70%)",
+              }}
+            />
+            <div
+              className="relative font-bold tracking-tight leading-none tabular-nums"
+              style={{
+                fontSize: 32,
+                background: "linear-gradient(135deg, hsl(var(--foreground)) 0%, hsl(var(--accent-violet)) 100%)",
+                WebkitBackgroundClip: "text",
+                WebkitTextFillColor: "transparent",
+                backgroundClip: "text",
+              }}
             >
               {words.toLocaleString()}
             </div>
-            <div className="section-label mt-2 mb-4">Total words dictated</div>
+            <div className="section-label mt-2 mb-4 relative">Total words dictated</div>
             <div className="mt-2" />
-            <div className="text-[13px] text-foreground">Desktop</div>
-            <div className="text-[11px] text-muted-foreground mt-0.5 tabular-nums">
-              {words.toLocaleString()} words
+            <div className="text-[13px] text-foreground relative">Desktop · macOS</div>
+            <div className="text-[11px] text-muted-foreground mt-0.5 tabular-nums relative">
+              {words.toLocaleString()} polished words across {history.length} session{history.length === 1 ? "" : "s"}
             </div>
           </div>
         </div>
@@ -184,7 +219,7 @@ export function InsightsView({ snapshot }: InsightsViewProps) {
         <div className="grid grid-cols-2 gap-4">
 
           {/* Usage chart */}
-          <div className="tile p-5">
+          <div className="panel p-5">
             <div className="flex items-baseline justify-between mb-5">
               <h2 className="text-[14px] font-semibold text-foreground">Model usage</h2>
               <span className="section-label">{history.length} sessions</span>
@@ -272,9 +307,9 @@ export function InsightsView({ snapshot }: InsightsViewProps) {
                   {Array.from({ length: COL_COUNT }, (_, col) => {
                     const daysAgo   = COL_COUNT - 1 - col;
                     const cellDay   = todayUnixDay - daysAgo;
-                    const cellDow   = cellDay % 7;
+                    const cellDow   = new Date(cellDay * 86_400_000).getDay();
                     const isVisible = cellDow === dayOfWeek;
-                    const isCurrent = col === COL_COUNT - 1 && dayOfWeek === new Date().getDay();
+                    const isCurrent = isVisible && daysAgo === 0;
                     const cellWords = isVisible ? (dayMap.get(cellDay) ?? 0) : 0;
                     const level     = isVisible ? wordCountToLevel(cellWords) : 0;
                     return (

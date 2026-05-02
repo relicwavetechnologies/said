@@ -26,6 +26,7 @@ export interface HistoryItem {
   transcribe_ms: number;
   embed_ms: number;
   polish_ms: number;
+  audio_id: string | null;
 }
 
 export interface AppSnapshot {

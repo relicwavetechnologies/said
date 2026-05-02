@@ -3,123 +3,187 @@
 @tailwind utilities;
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   THEME VARIABLES
-   --surface-1 (deepest, sidebar/page) → --surface-2 (mat) → --surface-3 (tile)
-   In dark mode, ascending lightness as you elevate.
-   In light mode, descending grayness (mat is off-white, tiles are pure white).
+   GLASSMORPHISM THEME — cyan / black / white
+   ───────────────────────────────────────────────────────────────────────────
+   Dark : deep navy floor + frosted translucent glass panels + cyan accent
+   Light: cool lavender floor + pure white panels + black active pills
    ═══════════════════════════════════════════════════════════════════════════ */
 
 @layer base {
-  /* ── DARK (default) ──────────────────────────────────────────────────── */
+  /* ── DARK (default) — deep navy + mint + violet ─────────────────────── */
   :root {
-    --background:           240 6% 4%;
-    --foreground:           0 0% 98%;
-    --card:                 240 5% 10%;
-    --card-foreground:      0 0% 98%;
-    --popover:              240 5% 12%;
-    --popover-foreground:   0 0% 98%;
+    --background:           235 30% 8%;        /* deep navy-violet floor */
+    --foreground:           0 0% 96%;
+    --card:                 235 24% 12%;
+    --card-foreground:      0 0% 96%;
+    --popover:              235 24% 13%;
+    --popover-foreground:   0 0% 96%;
 
-    --primary:              73 80% 67%;       /* lime #cdf065 */
-    --primary-foreground:   240 6% 4%;
+    --primary:              105 75% 68%;       /* mint green */
+    --primary-foreground:   235 30% 8%;
 
-    --secondary:            240 4% 13%;
-    --secondary-foreground: 0 0% 90%;
-    --muted:                240 4% 11%;
-    --muted-foreground:     240 5% 60%;
+    --accent-violet:        258 80% 70%;       /* secondary highlight */
+    --accent-violet-soft:   258 80% 70% / 0.18;
 
-    --accent:               73 80% 67%;
-    --accent-foreground:    240 6% 4%;
+    --secondary:            235 18% 18%;
+    --secondary-foreground: 0 0% 92%;
+    --muted:                235 18% 14%;
+    --muted-foreground:     230 10% 58%;
 
-    --destructive:          0 75% 60%;
+    --accent:               105 75% 68%;
+    --accent-foreground:    235 30% 8%;
+
+    --destructive:          354 80% 62%;
     --destructive-foreground: 0 0% 98%;
 
-    --border:               240 4% 14%;
-    --input:                240 4% 14%;
-    --ring:                 73 80% 67%;
-    --radius:               0.875rem;
+    --border:               235 18% 20%;
+    --input:                235 18% 16%;
+    --ring:                 105 75% 68%;
+    --radius:               1rem;
 
-    --recording:            0 80% 62%;
+    --recording:            354 84% 62%;
 
-    /* ── Surface hierarchy (semantic) ───────────────────────────────── */
-    --surface-1:            240 6% 4%;        /* sidebar / page / topbar  */
-    --surface-2:            240 5% 8%;        /* the mat                  */
-    --surface-3:            240 5% 10%;       /* tiles / cards            */
-    --surface-4:            240 5% 13%;       /* chips / icon backplates  */
-    --surface-hover:        240 5% 13%;       /* row hover                */
+    /* ── Surface hierarchy — solid panels, subtle hierarchy ──────────── */
+    --surface-1:            235 30% 8%;        /* page floor                       */
+    --surface-2:            235 24% 11%;       /* the mat (light lift)             */
+    --surface-3:            235 22% 13%;       /* primary card surface             */
+    --surface-4:            235 18% 18%;       /* chips / icon backplates          */
+    --surface-hover:        235 20% 16%;
 
-    /* ── Pill active (inverted neutral) ─────────────────────────────── */
-    --pill-active-bg:       0 0% 96%;
-    --pill-active-fg:       240 6% 5%;
+    /* ── Glass tokens (kept for occasional use) ──────────────────────── */
+    --glass-bg:             235 24% 12% / 0.62;
+    --glass-bg-strong:      235 22% 14% / 0.85;
+    --glass-stroke:         0 0% 100% / 0.06;
+    --glass-stroke-strong:  0 0% 100% / 0.10;
+    --glass-highlight:      0 0% 100% / 0.04;
+
+    /* ── Pill active (inverted neutral — pure white pill on dark) ────── */
+    --pill-active-bg:       0 0% 98%;
+    --pill-active-fg:       235 30% 8%;
 
     /* ── Chip / accent backgrounds + text (legible on dark) ─────────── */
-    --chip-lime-bg:         73 80% 67% / 0.12;
-    --chip-lime-fg:         73 80% 75%;
-    --chip-blue-bg:         217 90% 60% / 0.12;
-    --chip-blue-fg:         217 90% 75%;
-    --chip-amber-bg:        38 90% 60% / 0.12;
-    --chip-amber-fg:        38 90% 75%;
-    --chip-red-bg:          0 75% 60% / 0.12;
-    --chip-red-fg:          0 75% 75%;
+    --chip-mint-bg:         105 75% 68% / 0.16;
+    --chip-mint-fg:         105 80% 75%;
+    --chip-violet-bg:       258 80% 70% / 0.18;
+    --chip-violet-fg:       258 90% 82%;
+    --chip-cyan-bg:         105 75% 68% / 0.16;       /* legacy → mint */
+    --chip-cyan-fg:         105 80% 75%;
+    --chip-blue-bg:         217 80% 65% / 0.16;
+    --chip-blue-fg:         217 80% 78%;
+    --chip-amber-bg:        38 90% 60% / 0.16;
+    --chip-amber-fg:        38 90% 72%;
+    --chip-red-bg:          354 80% 62% / 0.16;
+    --chip-red-fg:          354 85% 75%;
 
-    --heat-0:               240 5% 13%;
-    --shadow-tile:          0 0 0 0 transparent;
+    /* legacy lime alias → maps to mint */
+    --chip-lime-bg:         105 75% 68% / 0.16;
+    --chip-lime-fg:         105 80% 75%;
+
+    --heat-0:               220 20% 16%;
+
+    /* Shadows — minimal, just enough lift */
+    --shadow-tile:
+      0 1px 0 hsl(0 0% 100% / 0.04) inset;
+    --shadow-glass:
+      0 1px 0 hsl(0 0% 100% / 0.06) inset,
+      0 10px 30px hsl(235 50% 2% / 0.45);
+    --shadow-pop:
+      0 24px 60px hsl(235 50% 2% / 0.65);
+
+    /* Very subtle violet wash on the floor — barely there */
+    --mesh-bg:
+      radial-gradient(60% 50% at 100% 0%,  hsl(258 70% 50% / 0.10) 0%, transparent 65%),
+      radial-gradient(50% 40% at 0% 100%,  hsl(105 70% 45% / 0.05) 0%, transparent 65%);
 
     --sidebar-width:        232px;
     --topbar-height:        56px;
   }
 
-  /* ── LIGHT ─────────────────────────────────────────────────────────── */
+  /* ── LIGHT — cool lavender floor + pure white tiles + black active ── */
   [data-theme="light"] {
-    --background:           30 8% 88%;        /* warm gray floor (sidebar/topbar) */
-    --foreground:           73 18% 12%;       /* warm deep olive text  */
+    --background:           220 18% 92%;       /* cool lavender-gray floor */
+    --foreground:           220 28% 12%;
     --card:                 0 0% 100%;
-    --card-foreground:      73 18% 12%;
+    --card-foreground:      220 28% 12%;
     --popover:              0 0% 100%;
-    --popover-foreground:   73 18% 12%;
+    --popover-foreground:   220 28% 12%;
 
-    --primary:              73 78% 52%;       /* slightly deeper lime for white */
-    --primary-foreground:   240 8% 8%;
+    --primary:              160 70% 38%;       /* deeper mint-teal for white bg */
+    --primary-foreground:   0 0% 100%;
 
-    --secondary:            30 6% 90%;
-    --secondary-foreground: 240 8% 18%;
-    --muted:                30 6% 92%;
-    --muted-foreground:     240 5% 42%;
+    --accent-violet:        258 70% 52%;       /* deeper violet for white bg */
+    --accent-violet-soft:   258 70% 52% / 0.14;
 
-    --accent:               73 78% 52%;
-    --accent-foreground:    240 8% 8%;
+    --secondary:            220 14% 96%;
+    --secondary-foreground: 220 28% 18%;
+    --muted:                220 14% 94%;
+    --muted-foreground:     220 10% 42%;
 
-    --destructive:          0 75% 50%;
+    --accent:               160 70% 38%;
+    --accent-foreground:    0 0% 100%;
+
+    --destructive:          354 78% 50%;
     --destructive-foreground: 0 0% 100%;
 
-    --border:               30 6% 86%;
-    --input:                30 6% 86%;
-    --ring:                 73 78% 52%;
+    --border:               220 14% 88%;
+    --input:                220 14% 90%;
+    --ring:                 160 70% 38%;
 
-    --recording:            0 80% 55%;
+    --recording:            354 78% 52%;
 
     /* ── Surface hierarchy (light) ─────────────────────────────────── */
-    --surface-1:            30 8% 88%;        /* sidebar / page bg (warm gray) */
-    --surface-2:            0 0% 100%;        /* mat (pure white)              */
-    --surface-3:            0 0% 100%;        /* tile (pure white + shadow)    */
-    --surface-4:            30 6% 92%;        /* chip / icon backplate         */
-    --surface-hover:        30 6% 92%;        /* hover (sits between floor & white) */
+    --surface-1:            220 18% 92%;       /* sidebar / page floor */
+    --surface-2:            0 0% 100%;         /* mat (pure white)      */
+    --surface-3:            0 0% 100%;         /* tile (pure white + shadow) */
+    --surface-4:            220 12% 88%;       /* chip / backplate / chart track — DARKER for visibility */
+    --surface-hover:        220 14% 96%;
 
-    /* Pill active = deep olive (same hue as lime, dark + desat) */
-    --pill-active-bg:       73 22% 24%;
-    --pill-active-fg:       73 30% 96%;
+    /* ── Glass tokens (light) ──────────────────────────────────────── */
+    --glass-bg:             0 0% 100% / 0.65;
+    --glass-bg-strong:      0 0% 100% / 0.85;
+    --glass-stroke:         220 28% 25% / 0.07;
+    --glass-stroke-strong:  220 28% 25% / 0.12;
+    --glass-highlight:      0 0% 100% / 0.65;
+
+    /* Pill active = black (Twisty + Codename "Best deal" pattern) */
+    --pill-active-bg:       220 28% 12%;
+    --pill-active-fg:       0 0% 100%;
 
     /* Chip colors (legible on white) */
-    --chip-lime-bg:         73 78% 50% / 0.18;
-    --chip-lime-fg:         73 70% 25%;
-    --chip-blue-bg:         217 80% 55% / 0.15;
+    --chip-mint-bg:         160 65% 42% / 0.16;
+    --chip-mint-fg:         160 70% 22%;
+    --chip-violet-bg:       258 70% 52% / 0.14;
+    --chip-violet-fg:       258 80% 38%;
+    --chip-cyan-bg:         160 65% 42% / 0.16;     /* legacy → mint */
+    --chip-cyan-fg:         160 70% 22%;
+    --chip-blue-bg:         217 80% 55% / 0.13;
     --chip-blue-fg:         217 75% 35%;
-    --chip-amber-bg:        38 90% 50% / 0.20;
-    --chip-amber-fg:        28 80% 28%;
-    --chip-red-bg:          0 75% 50% / 0.15;
-    --chip-red-fg:          0 75% 38%;
+    --chip-amber-bg:        38 90% 50% / 0.18;
+    --chip-amber-fg:        28 80% 30%;
+    --chip-red-bg:          354 78% 50% / 0.13;
+    --chip-red-fg:          354 78% 38%;
 
-    --heat-0:               30 6% 90%;
-    --shadow-tile:          0 1px 0 hsl(240 8% 12% / 0.04), 0 1px 2px hsl(240 8% 12% / 0.04);
+    /* legacy lime alias */
+    --chip-lime-bg:         160 65% 42% / 0.16;
+    --chip-lime-fg:         160 70% 22%;
+
+    --heat-0:               220 14% 92%;
+
+    --shadow-tile:
+      0 1px 0 hsl(220 28% 25% / 0.04) inset,
+      0 1px 2px hsl(220 28% 20% / 0.04),
+      0 8px 24px hsl(220 28% 20% / 0.06);
+    --shadow-glass:
+      0 1px 0 hsl(0 0% 100% / 0.6) inset,
+      0 12px 40px hsl(220 28% 20% / 0.10);
+    --shadow-pop:
+      0 24px 60px hsl(220 28% 20% / 0.18);
+
+    /* Soft mesh on light floor — barely-there cyan + lavender wash */
+    --mesh-bg:
+      radial-gradient(55% 40% at 8% 0%,  hsl(190 90% 60% / 0.10) 0%, transparent 60%),
+      radial-gradient(50% 40% at 100% 6%, hsl(260 70% 65% / 0.08) 0%, transparent 60%),
+      radial-gradient(60% 50% at 50% 100%, hsl(200 70% 70% / 0.06) 0%, transparent 60%);
   }
 
   * {
@@ -130,7 +194,17 @@
     height: 100%;
     background: hsl(var(--background));
     color: hsl(var(--foreground));
-    transition: background-color 0.2s ease, color 0.2s ease;
+    transition: background-color 0.25s ease, color 0.25s ease;
+  }
+
+  /* Page-level decoration: very subtle radial mesh behind everything */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background: var(--mesh-bg);
   }
 
   body {
@@ -174,17 +248,52 @@
   .drag-region  { -webkit-app-region: drag; }
   .no-drag      { -webkit-app-region: no-drag; }
 
-  /* ── Tile (card surface) ──────────────────────────────────────────── */
+  /* ── Glass surface utilities ───────────────────────────────────────
+     Use .glass on cards/panels for the smart-home aesthetic.
+     .glass-strong is more opaque (use for content-heavy panels).
+     ─────────────────────────────────────────────────────────────── */
+  .glass {
+    background: hsl(var(--glass-bg));
+    backdrop-filter: blur(22px) saturate(140%);
+    -webkit-backdrop-filter: blur(22px) saturate(140%);
+    box-shadow:
+      inset 0 0 0 1px hsl(var(--glass-stroke)),
+      var(--shadow-glass);
+  }
+  .glass-strong {
+    background: hsl(var(--glass-bg-strong));
+    backdrop-filter: blur(28px) saturate(160%);
+    -webkit-backdrop-filter: blur(28px) saturate(160%);
+    box-shadow:
+      inset 0 0 0 1px hsl(var(--glass-stroke-strong)),
+      var(--shadow-glass);
+  }
+
+  /* ── Tile (card surface) — solid panel with subtle inner highlight ── */
   .tile {
     background: hsl(var(--surface-3));
     border-radius: var(--radius);
     box-shadow: var(--shadow-tile);
   }
+  .tile-glass {
+    border-radius: var(--radius);
+    background: hsl(var(--surface-3));
+    box-shadow:
+      inset 0 1px 0 hsl(0 0% 100% / 0.04),
+      0 1px 2px hsl(235 50% 2% / 0.20);
+  }
+  /* Panel — same as tile but with slightly larger radius for hero panels */
+  .panel {
+    background: hsl(var(--surface-3));
+    border-radius: 20px;
+    box-shadow:
+      inset 0 1px 0 hsl(0 0% 100% / 0.04);
+  }
 
   /* ── Sidebar nav item ──────────────────────────────────────────────── */
   .nav-item {
-    @apply flex items-center gap-2.5 w-full px-3 py-2 rounded-lg text-[13px] font-medium
-           transition-colors duration-100 text-left;
+    @apply flex items-center gap-2.5 w-full px-3 py-2 rounded-xl text-[13px] font-medium
+           transition-all duration-150 text-left;
     color: hsl(var(--muted-foreground));
     cursor: pointer;
   }
@@ -193,9 +302,10 @@
     color: hsl(var(--foreground));
   }
   .nav-item.active {
-    background: hsl(var(--surface-hover));
+    background: hsl(var(--glass-bg-strong));
     color: hsl(var(--foreground));
     font-weight: 600;
+    box-shadow: inset 0 0 0 1px hsl(var(--glass-stroke-strong));
   }
   .nav-item.disabled {
     @apply opacity-30 cursor-not-allowed pointer-events-none;
@@ -206,13 +316,15 @@
     background: hsl(var(--primary));
     color: hsl(var(--primary-foreground));
     @apply inline-flex items-center gap-2 px-4 py-2 rounded-full text-[13px] font-semibold
-           transition-all duration-100;
+           transition-all duration-150;
+    box-shadow: 0 4px 14px hsl(var(--primary) / 0.30);
   }
-  .btn-primary:hover  { filter: brightness(1.06); }
+  .btn-primary:hover  { filter: brightness(1.08); box-shadow: 0 6px 20px hsl(var(--primary) / 0.40); }
   .btn-primary:active { filter: brightness(0.94); }
   .btn-primary:disabled {
     background: hsl(var(--surface-4));
     color: hsl(var(--muted-foreground));
+    box-shadow: none;
     cursor: not-allowed;
   }
 
@@ -230,7 +342,7 @@
   /* ── Filter pills ─────────────────────────────────────────────────── */
   .pill {
     @apply inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-[12px] font-medium
-           transition-all duration-100 cursor-pointer whitespace-nowrap;
+           transition-all duration-150 cursor-pointer whitespace-nowrap;
     color: hsl(var(--muted-foreground));
     background: hsl(var(--surface-4));
   }
@@ -242,6 +354,7 @@
     background: hsl(var(--pill-active-bg));
     color: hsl(var(--pill-active-fg));
     font-weight: 600;
+    box-shadow: 0 4px 12px hsl(var(--pill-active-bg) / 0.25);
   }
 
   /* ── Chips ─────────────────────────────────────────────────────────── */
@@ -251,7 +364,8 @@
     color: hsl(var(--muted-foreground));
     background: hsl(var(--surface-4));
   }
-  .chip-lime  { color: hsl(var(--chip-lime-fg));  background: hsl(var(--chip-lime-bg));  }
+  .chip-cyan  { color: hsl(var(--chip-cyan-fg));  background: hsl(var(--chip-cyan-bg));  }
+  .chip-lime  { color: hsl(var(--chip-cyan-fg));  background: hsl(var(--chip-cyan-bg));  } /* legacy */
   .chip-blue  { color: hsl(var(--chip-blue-fg));  background: hsl(var(--chip-blue-bg));  }
   .chip-amber { color: hsl(var(--chip-amber-fg)); background: hsl(var(--chip-amber-bg)); }
   .chip-red   { color: hsl(var(--chip-red-fg));   background: hsl(var(--chip-red-bg));   }
@@ -269,7 +383,7 @@
     @apply inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-md
            tabular-nums;
   }
-  .badge-done    { @apply badge chip-lime;  }
+  .badge-done    { @apply badge chip-cyan;  }
   .badge-prog    { @apply badge chip-blue;  }
   .badge-urgent  { @apply badge chip-red;   }
   .badge-medium  { @apply badge chip-amber; }
@@ -277,21 +391,27 @@
 
   /* ── Recording orb pulse ─────────────────────────────────────────── */
   .orb-recording { animation: pulse-orb 1.4s ease-in-out infinite; }
+  .orb-glow      { box-shadow: 0 0 20px hsl(var(--primary) / 0.55); }
 
-  /* ── Heatmap cells ───────────────────────────────────────────────── */
+  /* ── Heatmap cells (mint ramp) ───────────────────────────────────── */
   .heat-0       { background: hsl(var(--heat-0)); }
-  .heat-1       { background: hsl(73 60% 50%); }
-  .heat-2       { background: hsl(73 70% 60%); }
-  .heat-3       { background: hsl(73 75% 65%); }
-  .heat-4       { background: hsl(73 80% 67%); }
+  .heat-1       { background: hsl(140 50% 32%); }
+  .heat-2       { background: hsl(130 60% 45%); }
+  .heat-3       { background: hsl(120 70% 55%); }
+  .heat-4       { background: hsl(110 80% 65%); }
   .heat-current {
-    background: hsl(73 80% 67% / 0.18);
+    background: hsl(105 75% 68% / 0.25);
     box-shadow: inset 0 0 0 1.5px hsl(var(--primary));
   }
+  /* Light mode override — darker mints since bg is white */
+  [data-theme="light"] .heat-1 { background: hsl(160 60% 75%); }
+  [data-theme="light"] .heat-2 { background: hsl(150 65% 60%); }
+  [data-theme="light"] .heat-3 { background: hsl(140 70% 45%); }
+  [data-theme="light"] .heat-4 { background: hsl(130 75% 35%); }
 
   /* ── Input fields ────────────────────────────────────────────────── */
   .input {
-    @apply w-full text-sm rounded-lg px-3 py-2.5 transition-colors;
+    @apply w-full text-sm rounded-xl px-3 py-2.5 transition-colors;
     background: hsl(var(--surface-4));
     color: hsl(var(--foreground));
     border: 1px solid transparent;
@@ -301,6 +421,7 @@
     outline: none;
     background: hsl(var(--surface-hover));
     border-color: hsl(var(--primary) / 0.5);
+    box-shadow: 0 0 0 3px hsl(var(--primary) / 0.12);
   }
 
   /* ── Section heading label ──────────────────────────────────────── */
@@ -319,6 +440,13 @@
     vertical-align: text-bottom;
     animation: caret 0.9s steps(1) infinite;
   }
+
+  /* ── Cyan glow utility (for ambient accent) ─────────────────────── */
+  .cyan-glow {
+    background: radial-gradient(closest-side, hsl(var(--primary) / 0.45) 0%, transparent 70%);
+    filter: blur(14px);
+    pointer-events: none;
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -332,4 +460,14 @@
 
 @keyframes caret {
   50% { opacity: 0; }
+}
+
+@keyframes shimmer {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(100%);  }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0);   }
 }

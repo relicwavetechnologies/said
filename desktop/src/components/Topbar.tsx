@@ -16,14 +16,17 @@ export function Topbar({ snapshot, theme, toggleTheme }: TopbarProps) {
   return (
     <header
       className="flex items-center gap-3 h-[var(--topbar-height)] px-5 flex-shrink-0 drag-region"
-      style={{ background: "hsl(var(--background))" }}
+      style={{ background: "transparent" }}
     >
-      {/* Search */}
+      {/* Search — glass treatment */}
       <div
-        className="flex items-center gap-2.5 rounded-lg px-3.5 py-2 w-72 no-drag cursor-text transition-colors"
+        className="flex items-center gap-2.5 rounded-full px-3.5 py-1.5 w-72 no-drag cursor-text transition-colors"
         style={{
-          background: "hsl(var(--surface-4))",
+          background: "hsl(var(--glass-bg))",
           color:      "hsl(var(--muted-foreground))",
+          backdropFilter: "blur(20px) saturate(140%)",
+          WebkitBackdropFilter: "blur(20px) saturate(140%)",
+          boxShadow: "inset 0 0 0 1px hsl(var(--glass-stroke))",
         }}
       >
         <Search size={13} className="flex-shrink-0 opacity-70" />
@@ -48,15 +51,17 @@ export function Topbar({ snapshot, theme, toggleTheme }: TopbarProps) {
 
         {/* Notification bell */}
         <button
-          className="w-8 h-8 flex items-center justify-center rounded-lg transition-colors"
+          className="w-8 h-8 flex items-center justify-center rounded-full transition-colors"
           style={{ color: "hsl(var(--muted-foreground))" }}
           onMouseEnter={(e) => {
-            e.currentTarget.style.background = "hsl(var(--surface-hover))";
+            e.currentTarget.style.background = "hsl(var(--glass-bg))";
             e.currentTarget.style.color      = "hsl(var(--foreground))";
+            e.currentTarget.style.backdropFilter = "blur(20px)";
           }}
           onMouseLeave={(e) => {
             e.currentTarget.style.background = "transparent";
             e.currentTarget.style.color      = "hsl(var(--muted-foreground))";
+            e.currentTarget.style.backdropFilter = "none";
           }}
         >
           <Bell size={14} />
@@ -68,6 +73,7 @@ export function Topbar({ snapshot, theme, toggleTheme }: TopbarProps) {
           style={{
             background: "hsl(var(--primary) / 0.18)",
             color:      "hsl(var(--primary))",
+            boxShadow:  "inset 0 0 0 1px hsl(var(--primary) / 0.30)",
           }}
           title={snapshot?.current_mode_label ?? "Mode"}
         >

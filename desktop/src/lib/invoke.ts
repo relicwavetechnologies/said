@@ -292,6 +292,12 @@ export async function requestInputMonitoring(): Promise<void> {
   }
 }
 
+/** Retry a recording by re-submitting its saved WAV. Result is auto-pasted. */
+export async function retryRecording(audioId: string): Promise<void> {
+  if (!isTauriRuntime()) return;
+  await tauriInvoke("retry_recording", { audioId });
+}
+
 /** Delete a recording (SQLite row + WAV file). */
 export async function deleteRecording(id: string): Promise<void> {
   if (!isTauriRuntime()) return;

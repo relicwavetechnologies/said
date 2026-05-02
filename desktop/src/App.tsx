@@ -1,11 +1,12 @@
 import React, { useEffect, useState, useCallback } from "react";
 import { X, Mic } from "lucide-react";
 import { Sidebar } from "@/components/Sidebar";
+import { InviteTeamModal } from "@/components/InviteTeamModal";
+import { SettingsModal } from "@/components/SettingsModal";
 import { Topbar } from "@/components/Topbar";
 import { DashboardView } from "@/components/views/DashboardView";
 import { HistoryView } from "@/components/views/HistoryView";
 import { InsightsView } from "@/components/views/InsightsView";
-import { SettingsView } from "@/components/views/SettingsView";
 import {
   invoke,
   listHistory,
@@ -66,6 +67,7 @@ function recordingToHistoryItem(r: Recording): HistoryItem {
     transcribe_ms:     r.transcribe_ms ?? 0,
     embed_ms:          r.embed_ms ?? 0,
     polish_ms:         r.polish_ms ?? 0,
+    audio_id:          r.audio_id,
   };
 }
 
@@ -79,6 +81,8 @@ export default function App() {
   const [busy,        setBusy]        = useState(false);
   const [errorBanner, setErrorBanner] = useState<string>("");
   const [activeView,  setActiveView]  = useState<ActiveView>("dashboard");
+  const [inviteOpen,  setInviteOpen]  = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   // ── Retry toast ───────────────────────────────────────────────────────────
   const [retryToast, setRetryToast] = useState<{ message: string; audioId: string } | null>(null);
@@ -250,7 +254,7 @@ export default function App() {
     const unsubPending = onPendingEditsChanged(refreshPending);
 
     // Tray menu → navigate to Settings
-    const unsubNav = onNavSettings(() => setActiveView("settings"));
+    const unsubNav = onNavSettings(() => setSettingsOpen(true));
 
     // Tray "Reconnect OpenAI…" — browser already opened by Rust; start polling
     const unsubReconnect = onOpenAIReconnectInitiated(() => {
@@ -355,6 +359,11 @@ export default function App() {
 
   // ── Navigation ─────────────────────────────────────────────────────────────
   const handleViewChange = useCallback((view: string) => {
+    // Settings is now a modal — intercept the route and open the modal instead
+    if (view === "settings") {
+      setSettingsOpen(true);
+      return;
+    }
     if (VALID_VIEWS.includes(view as ActiveView)) {
       setActiveView(view as ActiveView);
       // Refresh history when user opens the history tab
@@ -524,6 +533,19 @@ export default function App() {
         activeView={activeView}
         onViewChange={handleViewChange}
         busy={busy}
+        onOpenInvite={() => setInviteOpen(true)}
+      />
+
+      {/* ── Invite team modal (overlays everything) ────── */}
+      <InviteTeamModal open={inviteOpen} onClose={() => setInviteOpen(false)} />
+
+      {/* ── Settings modal (replaces the old Settings route) ── */}
+      <SettingsModal
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        snapshot={snapshotWithHistory}
+        onAccessibility={handleAccessibility}
+        onInputMonitoring={handleInputMonitoring}
       />
 
       {/* ── Right column: topbar + content ───────────── */}
@@ -552,13 +574,7 @@ export default function App() {
             )}
             {activeView === "history"  && <HistoryView />}
             {activeView === "insights" && <InsightsView snapshot={snapshotWithHistory} />}
-            {activeView === "settings" && (
-              <SettingsView
-                snapshot={snapshotWithHistory}
-                onAccessibility={handleAccessibility}
-                onInputMonitoring={handleInputMonitoring}
-              />
-            )}
+            {/* Settings is now a modal — opened via setSettingsOpen */}
           </div>
         </main>
       </div>

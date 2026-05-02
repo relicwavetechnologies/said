@@ -42,8 +42,14 @@ const LANGUAGES = [
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div className="mb-7">
-      <p className="section-label px-1 mb-2.5">{title}</p>
-      <div className="tile overflow-hidden">
+      <p className="section-label px-1 mb-2.5 flex items-center gap-2">
+        <span
+          className="inline-block w-1 h-1 rounded-full"
+          style={{ background: "hsl(var(--accent-violet))" }}
+        />
+        {title}
+      </p>
+      <div className="panel overflow-hidden">
         {children}
       </div>
     </div>
@@ -62,8 +68,11 @@ function Row({
   return (
     <div className="flex items-center gap-4 px-5 py-4">
       <div
-        className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 text-muted-foreground"
-        style={{ background: "hsl(var(--surface-4))" }}
+        className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0"
+        style={{
+          background: "hsl(var(--surface-4))",
+          color:      "hsl(var(--accent-violet))",
+        }}
       >
         {icon}
       </div>
@@ -78,17 +87,56 @@ function Row({
   );
 }
 
+// ── Section routing (used by SettingsModal) ───────────────────────────────────
+
+export type SettingsSection =
+  | "writing"
+  | "permissions"
+  | "api-keys"
+  | "account"
+  | "diagnostics"
+  | "about";
+
+export const SETTINGS_SECTIONS: { id: SettingsSection; label: string }[] = [
+  { id: "writing",     label: "Writing style" },
+  { id: "permissions", label: "Permissions"   },
+  { id: "api-keys",    label: "API keys"      },
+  { id: "account",     label: "Account"       },
+  { id: "diagnostics", label: "Diagnostics"   },
+  { id: "about",       label: "About"         },
+];
+
+function Show({ when, children }: { when: boolean; children: React.ReactNode }) {
+  return when ? <>{children}</> : null;
+}
+
 // ── Props ──────────────────────────────────────────────────────────────────────
 
 interface SettingsViewProps {
   snapshot:          AppSnapshot | null;
   onAccessibility:   () => void;
   onInputMonitoring: () => void;
+  /** When provided, only the matching section renders (modal mode). */
+  activeSection?:    SettingsSection;
+  /** Hide the page header entirely (modal mode renders its own). */
+  hideHeader?:       boolean;
+  /** Skip the page paddings + ScrollArea wrapper (modal already provides them). */
+  embedded?:         boolean;
 }
 
 // ── View ───────────────────────────────────────────────────────────────────────
 
-export function SettingsView({ snapshot, onAccessibility, onInputMonitoring }: SettingsViewProps) {
+export function SettingsView({
+  snapshot,
+  onAccessibility,
+  onInputMonitoring,
+  activeSection,
+  hideHeader,
+  embedded,
+}: SettingsViewProps) {
+  // Helper — true when the section should render (no filter = render all)
+  const showAll = !activeSection;
+  const isOn    = (id: SettingsSection) => showAll || activeSection === id;
   const axGranted  = snapshot?.accessibility_granted    ?? false;
   const imGranted  = snapshot?.input_monitoring_granted ?? false;
 
@@ -334,35 +382,50 @@ export function SettingsView({ snapshot, onAccessibility, onInputMonitoring }: S
 
   const tone = (prefs?.tone_preset ?? "neutral") as ToneKey;
 
-  return (
-    <ScrollArea className="h-full">
-      <div className="p-6 pb-10 max-w-2xl mx-auto">
+  // Inner content that gets either wrapped in ScrollArea (full view) or rendered
+  // bare (modal embeds it inside its own scroll container).
+  const inner = (
+    <>
 
         {/* ── Header ───────────────────────────────────── */}
-        <div className="mb-6 flex items-start justify-between gap-4">
+        <Show when={!hideHeader}>
+        <div className="mb-6 flex items-end justify-between gap-4">
           <div>
-            <h1 className="text-2xl font-bold tracking-tight text-foreground">Settings</h1>
-            <p className="text-sm text-muted-foreground mt-0.5">
-              Preferences are saved automatically
+            <h1 className="text-[24px] font-bold tracking-tight text-foreground leading-tight">
+              Settings
+            </h1>
+            <p className="text-[12.5px] text-muted-foreground mt-1 flex items-center gap-2">
+              <span
+                className="inline-block w-1.5 h-1.5 rounded-full"
+                style={{
+                  background: saving ? "hsl(var(--accent-violet))" : "hsl(var(--primary))",
+                  boxShadow:  saving
+                    ? "0 0 8px hsl(var(--accent-violet) / 0.6)"
+                    : "0 0 8px hsl(var(--primary) / 0.5)",
+                }}
+              />
+              {saving ? "Saving preferences…" : "Preferences saved automatically"}
             </p>
           </div>
           {saving && (
-            <div className="flex items-center gap-1.5 text-xs text-muted-foreground mt-1">
+            <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-1">
               <Loader2 size={13} className="animate-spin" />
               Saving…
             </div>
           )}
           {saveError && (
-            <p className="text-xs text-red-500 mt-1">{saveError}</p>
+            <p className="text-xs mb-1" style={{ color: "hsl(354 78% 60%)" }}>{saveError}</p>
           )}
         </div>
+        </Show>
 
         {/* ── Tone & Persona ───────────────────────────── */}
+        <Show when={isOn("writing")}>
         <div className="mb-7">
           <p className="section-label px-1 mb-2.5">Writing Style</p>
 
           {/* Tone pill grid */}
-          <div className="tile p-4 mb-3">
+          <div className="panel p-4 mb-3">
             <p className="text-[12px] font-semibold text-foreground mb-3">Tone Preset</p>
             <div className="grid grid-cols-3 gap-2">
               {TONE_PRESETS.map((t) => {
@@ -390,7 +453,7 @@ export function SettingsView({ snapshot, onAccessibility, onInputMonitoring }: S
           </div>
 
           {/* Custom persona textarea */}
-          <div className={cn("tile p-4 transition-all", tone !== "custom" && "opacity-60")}>
+          <div className={cn("panel p-4 transition-all", tone !== "custom" && "opacity-60")}>
             <div className="flex items-center gap-2 mb-2">
               <MessageSquareText size={14} className="text-muted-foreground" />
               <p className="text-[12px] font-semibold text-foreground">Custom Persona Instructions</p>
@@ -508,8 +571,10 @@ export function SettingsView({ snapshot, onAccessibility, onInputMonitoring }: S
             </div>
           </div>
         </Section>
+        </Show>
 
         {/* ── Permissions ──────────────────────────────── */}
+        <Show when={isOn("permissions")}>
         <div className="mb-7">
           <p className="section-label px-1 mb-2.5">Permissions</p>
 
@@ -532,7 +597,7 @@ export function SettingsView({ snapshot, onAccessibility, onInputMonitoring }: S
             </div>
           )}
 
-          <div className="tile overflow-hidden">
+          <div className="panel overflow-hidden">
             {/* Row 1: Accessibility */}
             <div className="flex items-center gap-4 px-5 py-4">
               <div
@@ -685,8 +750,10 @@ export function SettingsView({ snapshot, onAccessibility, onInputMonitoring }: S
             </div>
           </div>
         </div>
+        </Show>
 
         {/* ── AX field-reading diagnostic ───────────────── */}
+        <Show when={isOn("diagnostics")}>
         <Section title="Field-Reading Diagnostic">
           <Row
             icon={<TestTube size={16} />}
@@ -788,11 +855,13 @@ export function SettingsView({ snapshot, onAccessibility, onInputMonitoring }: S
             </div>
           )}
         </Section>
+        </Show>
 
         {/* ── API Keys ──────────────────────────────────── */}
+        <Show when={isOn("api-keys")}>
         <div className="mb-7">
           <p className="section-label px-1 mb-2.5">API Keys</p>
-          <div className="tile p-5 space-y-4">
+          <div className="panel p-5 space-y-4">
             <p className="text-[12px] text-muted-foreground leading-relaxed">
               Keys are stored locally in SQLite — they never leave your Mac.
               Enter each key once; you only need to re-enter to change it.
@@ -944,14 +1013,16 @@ export function SettingsView({ snapshot, onAccessibility, onInputMonitoring }: S
             </>
           )}
         </Section>
+        </Show>
 
         {/* ── OpenAI Account ────────────────────────────── */}
+        <Show when={isOn("account")}>
         <div className="mb-7">
           <p className="section-label px-1 mb-2.5">OpenAI Account</p>
 
           {openAIStatus?.connected ? (
             /* ── Connected state ──────────────────────── */
-            <div className="tile p-5 space-y-4">
+            <div className="panel p-5 space-y-4">
               {/* Status row */}
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2.5">
@@ -995,7 +1066,7 @@ export function SettingsView({ snapshot, onAccessibility, onInputMonitoring }: S
             </div>
           ) : (
             /* ── Not connected state ──────────────────── */
-            <div className="tile p-5 space-y-4">
+            <div className="panel p-5 space-y-4">
               <div className="flex items-start gap-3">
                 <div
                   className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 mt-0.5"
@@ -1134,11 +1205,13 @@ export function SettingsView({ snapshot, onAccessibility, onInputMonitoring }: S
             </div>
           )}
         </Section>
+        </Show>
 
         {/* ── Notification test (temp debug) ───────────── */}
+        <Show when={isOn("diagnostics")}>
         <div className="mb-7">
           <p className="section-label px-1 mb-2.5">Notification Debug</p>
-          <div className="tile p-5 space-y-3">
+          <div className="panel p-5 space-y-3">
             <div className="flex items-center gap-3">
               <div
                 className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 text-muted-foreground"
@@ -1199,8 +1272,10 @@ export function SettingsView({ snapshot, onAccessibility, onInputMonitoring }: S
             )}
           </div>
         </div>
+        </Show>
 
         {/* ── About ────────────────────────────────────── */}
+        <Show when={isOn("about")}>
         <Section title="About">
           <Row
             icon={<Info size={16} />}
@@ -1209,7 +1284,16 @@ export function SettingsView({ snapshot, onAccessibility, onInputMonitoring }: S
             last
           />
         </Section>
+        </Show>
 
+    </>
+  );
+
+  if (embedded) return inner;
+  return (
+    <ScrollArea className="h-full">
+      <div className="p-6 pb-10 max-w-2xl mx-auto">
+        {inner}
       </div>
     </ScrollArea>
   );

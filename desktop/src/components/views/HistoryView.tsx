@@ -1,61 +1,10 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Clock, Copy, Play, Pause, Trash2, Tag, MoreHorizontal, Check } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { groupHistory } from "@/types";
 import type { Recording } from "@/types";
-import { deleteRecording, getRecordingAudioUrl, listHistory } from "@/lib/invoke";
-
-// ── Audio player hook ─────────────────────────────────────────────────────────
-
-function useAudioPlayer() {
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const [playingId, setPlayingId] = useState<string | null>(null);
-
-  const play = useCallback(async (recordingId: string, audioId: string | null) => {
-    if (!audioId) return;
-
-    // Stop existing
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current = null;
-    }
-    if (playingId === recordingId) {
-      setPlayingId(null);
-      return;
-    }
-
-    const ep = await getRecordingAudioUrl(recordingId);
-    if (!ep) return;
-
-    // Fetch audio bytes with bearer token → blob URL
-    try {
-      const res = await fetch(ep.url, {
-        headers: { Authorization: `Bearer ${ep.secret}` },
-      });
-      if (!res.ok) return;
-      const blob = await res.blob();
-      const url  = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-      audioRef.current = audio;
-      setPlayingId(recordingId);
-      audio.play();
-      audio.onended = () => {
-        setPlayingId(null);
-        URL.revokeObjectURL(url);
-      };
-    } catch {
-      setPlayingId(null);
-    }
-  }, [playingId]);
-
-  const stop = useCallback(() => {
-    audioRef.current?.pause();
-    audioRef.current = null;
-    setPlayingId(null);
-  }, []);
-
-  return { playingId, play, stop };
-}
+import { deleteRecording, listHistory } from "@/lib/invoke";
+import { useAudioPlayer } from "@/lib/useAudioPlayer";
 
 // ── Context menu ──────────────────────────────────────────────────────────────
 
