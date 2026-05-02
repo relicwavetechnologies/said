@@ -30,7 +30,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["app"],
     "icon": [
       "icons/icon.icns",
       "icons/icon_32x32.png",
@@ -43,7 +43,8 @@
     ],
     "macOS": {
       "minimumSystemVersion": "13.0",
-      "infoPlist": "Info.plist"
+      "infoPlist": "Info.plist",
+      "signingIdentity": "-"
     }
   }
 }

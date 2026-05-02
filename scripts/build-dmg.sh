@@ -1,0 +1,167 @@
+#!/bin/bash
+# Build a release DMG of Said.app with a stable ad-hoc signature.
+#
+# The ad-hoc signature is what lets macOS TCC track the app by bundle ID
+# instead of binary hash, so granted permissions (Input Monitoring,
+# Accessibility, Microphone) survive future rebuilds. Without it, every
+# `tauri build` produces a new cdhash and TCC silently drops the grant.
+#
+# This wrapper also pre-cleans the read-write DMG state that Tauri's
+# bundle_dmg.sh routinely leaves attached after a previous run, which
+# is the cause of the recurring "failed to run bundle_dmg.sh" error.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DESKTOP_DIR="$REPO_ROOT/desktop"
+TAURI_DIR="$DESKTOP_DIR/src-tauri"
+BUNDLE_DIR="$REPO_ROOT/target/release/bundle"
+APP_PATH="$BUNDLE_DIR/macos/Said.app"
+SIDECAR_SRC="$REPO_ROOT/target/release/polish-backend"
+SIDECAR_DEST="$TAURI_DIR/binaries/polish-backend-aarch64-apple-darwin"
+BUNDLE_ID="com.voicepolish.desktop"
+
+bold='\033[1m'; green='\033[0;32m'; yellow='\033[1;33m'; red='\033[0;31m'; nc='\033[0m'
+step()  { echo -e "\n${bold}▶ $*${nc}"; }
+ok()    { echo -e "  ${green}✓ $*${nc}"; }
+warn()  { echo -e "  ${yellow}⚠ $*${nc}"; }
+fail()  { echo -e "\n  ${red}✗ $*${nc}\n"; exit 1; }
+
+export PATH="$HOME/.cargo/bin:$PATH"
+
+# ── Pre-clean: undo whatever Tauri's bundle_dmg.sh left attached ─────────────
+step "Pre-clean: detach stale Said volumes & temp DMGs"
+
+# Detach any volume mounted with the product name (read-only finalized DMGs
+# the user mounted, plus any read-write working DMG still attached from a
+# prior failed run).
+for vol in "/Volumes/Said" "/Volumes/Said 1" "/Volumes/Said 2"; do
+  if mount | grep -q "on $vol "; then
+    hdiutil detach "$vol" -force 2>/dev/null || true
+    ok "detached $vol"
+  fi
+done
+
+# Detach any read-write working image Tauri left attached. Those have the
+# tell-tale name rw.<pid>.<product>_<version>_<arch>.dmg
+while IFS= read -r dev; do
+  [ -n "$dev" ] || continue
+  hdiutil detach "$dev" -force 2>/dev/null || true
+  ok "detached $dev (stale rw image)"
+done < <(hdiutil info | awk '/image-path.*rw\.[0-9]+\.Said/ {p=1} p && /^\/dev\/disk[0-9]+\t/ {print $1; p=0}')
+
+# Remove the temp files themselves.
+rm -f "$BUNDLE_DIR"/macos/rw.*.Said_*.dmg 2>/dev/null || true
+ok "pre-clean done"
+
+# ── Build the Rust sidecar ────────────────────────────────────────────────────
+step "Build polish-backend (release)"
+cd "$REPO_ROOT"
+# Bust the Cargo fingerprint cache for the binary entry point.
+touch crates/backend/src/main.rs
+cargo build -p polish-backend --release
+ok "polish-backend built"
+
+step "Sync sidecar to Tauri externalBin slot"
+mkdir -p "$TAURI_DIR/binaries"
+cp "$SIDECAR_SRC" "$SIDECAR_DEST"
+chmod +x "$SIDECAR_DEST"
+ok "synced to $SIDECAR_DEST"
+
+# ── Tauri build ──────────────────────────────────────────────────────────────
+step "Run tauri build"
+cd "$DESKTOP_DIR"
+[ -d node_modules ] || npm install
+npm run tauri:build
+ok "tauri build finished"
+
+# ── Post-verify: ensure deep ad-hoc signature ────────────────────────────────
+step "Re-sign deep (ad-hoc) and verify"
+
+[ -d "$APP_PATH" ] || fail ".app not found at $APP_PATH"
+
+# Strip quarantine so future user-side `xattr -dr com.apple.quarantine` is
+# unnecessary for local testing.
+xattr -cr "$APP_PATH" 2>/dev/null || true
+
+# Re-sign deep — Tauri's `signingIdentity: "-"` does sign the outer bundle,
+# but historically does not reliably deep-sign embedded sidecar binaries
+# (tauri-apps/tauri#11992). Doing it ourselves guarantees the sidecar carries
+# a matching ad-hoc signature so TCC sees a single coherent bundle.
+codesign --force --deep --sign - "$APP_PATH" 2>&1 | sed 's/^/  /'
+
+# Verify
+codesign --verify --deep --strict --verbose=2 "$APP_PATH" 2>&1 | sed 's/^/  /'
+
+ACTUAL_ID=$(codesign -dv "$APP_PATH" 2>&1 | awk -F= '/^Identifier=/ {print $2}')
+[ "$ACTUAL_ID" = "$BUNDLE_ID" ] \
+  || fail "bundle id mismatch — expected $BUNDLE_ID got $ACTUAL_ID"
+ok "outer bundle: Identifier=$ACTUAL_ID, signature=adhoc"
+
+# Tauri strips the target triple when injecting externalBin into the bundle —
+# the file inside Contents/MacOS is `polish-backend`, not the triple-suffixed
+# source name.
+EMBEDDED_BACKEND="$APP_PATH/Contents/MacOS/polish-backend"
+[ -x "$EMBEDDED_BACKEND" ] || fail "embedded sidecar not found at $EMBEDDED_BACKEND"
+codesign --verify --strict "$EMBEDDED_BACKEND"
+ok "embedded sidecar signed: $(codesign -dv "$EMBEDDED_BACKEND" 2>&1 | awk -F= '/^Identifier=/ {print $2}')"
+
+# ── Build the DMG ourselves with plain hdiutil ───────────────────────────────
+#
+# We don't use Tauri's DMG target because its bundle_dmg.sh shells out to
+# osascript to drive Finder for cosmetic icon layout, which fails
+# non-deterministically on recent macOS (tauri-apps/tauri#3055,
+# community#163491). A plain `hdiutil create -srcfolder` with an /Applications
+# symlink is what users actually need: drag-to-install, signature intact.
+step "Build DMG with hdiutil"
+
+STAGING="$BUNDLE_DIR/dmg-staging"
+DMG_OUT="$BUNDLE_DIR/dmg/Said_0.1.0_aarch64.dmg"
+VOLNAME="Said"
+
+# Ensure no leftover staging from a prior run.
+rm -rf "$STAGING" "$DMG_OUT"
+mkdir -p "$STAGING" "$BUNDLE_DIR/dmg"
+
+# Stage: just the .app + an /Applications symlink. Drag the icon onto the
+# symlink and macOS does the install.
+cp -R "$APP_PATH" "$STAGING/Said.app"
+ln -s /Applications "$STAGING/Applications"
+
+# UDZO = compressed read-only DMG, the standard distribution format.
+# -volname names the mounted volume; we use the product name so the user
+# sees /Volumes/Said. We don't need -mountrandom because we never mount.
+hdiutil create \
+  -volname "$VOLNAME" \
+  -srcfolder "$STAGING" \
+  -ov \
+  -format UDZO \
+  -fs HFS+ \
+  "$DMG_OUT" >/dev/null
+
+rm -rf "$STAGING"
+
+[ -f "$DMG_OUT" ] || fail "hdiutil create did not produce $DMG_OUT"
+ok "DMG: $DMG_OUT ($(du -h "$DMG_OUT" | cut -f1 | xargs))"
+
+# Verify the DMG is openable end-to-end. We attach + detach to make sure
+# the volume mounts cleanly and the .app inside still satisfies its DR.
+step "Verify DMG mounts cleanly and signature still validates"
+ATTACH_OUT=$(hdiutil attach -nobrowse -readonly "$DMG_OUT")
+echo "$ATTACH_OUT" | sed 's/^/  /'
+DMG_DEV=$(echo "$ATTACH_OUT" | awk '/\/dev\/disk[0-9]+s[0-9]+/ && /\/Volumes\// {print $1; exit}')
+DMG_VOL=$(echo "$ATTACH_OUT" | awk '/\/Volumes\// {for (i=3;i<=NF;i++) printf "%s%s", $i, (i<NF?" ":""); print ""; exit}')
+codesign --verify --deep --strict --verbose=2 "$DMG_VOL/Said.app" 2>&1 | sed 's/^/  /'
+hdiutil detach "$DMG_DEV" -force >/dev/null
+ok "DMG verified — Said.app inside is correctly signed and mounts cleanly"
+
+# ── Output ───────────────────────────────────────────────────────────────────
+step "Done"
+echo "  app: $APP_PATH"
+echo "  dmg: $DMG_OUT"
+echo ""
+echo "  Install for testing:"
+echo "    open '$DMG_OUT'   # then drag Said.app to /Applications"
+echo "  or directly:"
+echo "    rm -rf /Applications/Said.app && cp -R '$APP_PATH' /Applications/Said.app && open /Applications/Said.app"
+echo ""
