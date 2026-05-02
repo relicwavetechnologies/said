@@ -2,16 +2,30 @@
 //!
 //! Sends an invite email via Resend (https://resend.com).
 //!
-//! Configuration (env vars on the backend host):
-//!   RESEND_API_KEY  — required. Issue at resend.com/api-keys.
-//!   RESEND_FROM     — optional. Defaults to "Said <onboarding@resend.dev>"
-//!                     which works without DNS setup but lands in spam more often.
-//!                     Set to "Said <hello@yourdomain.com>" once you've verified
-//!                     a domain in Resend.
+//! Configuration — two ways, runtime env wins over build-time:
 //!
-//! When RESEND_API_KEY is missing, returns 503 with body
-//! `{ "error": "email_not_configured" }` so the desktop client can fall
+//!   1. Build-time bake (ship-with-binary):
+//!        RESEND_API_KEY=re_xxx pnpm tauri build
+//!      The key is read at *compile* time via `option_env!` and baked
+//!      into the sidecar binary. No env needed at runtime.
+//!      ⚠️  The key is extractable from the binary by anyone with the .app
+//!      — fine for shipping to friends, NOT safe for public distribution.
+//!
+//!   2. Runtime env (server / dev):
+//!        RESEND_API_KEY=re_xxx ./polish-backend
+//!      Useful if you later move the backend off-device.
+//!
+//!   RESEND_FROM is optional. Defaults to "Said <onboarding@resend.dev>"
+//!   which works without DNS but lands in spam more often. Once you've
+//!   verified a domain in Resend, set it to "Said <hello@yourdomain.com>".
+//!
+//! When neither source provides a key, returns 503 with body
+//! `{ "error": "email_not_configured" }` so the desktop client falls
 //! back to opening the user's mail app via `mailto:`.
+
+/// Build-time key (baked in if RESEND_API_KEY was set during `cargo build`).
+const BUILD_TIME_KEY:  Option<&str> = option_env!("RESEND_API_KEY");
+const BUILD_TIME_FROM: Option<&str> = option_env!("RESEND_FROM");
 
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
@@ -51,10 +65,16 @@ pub async fn send(
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid_email" })));
     }
 
-    let api_key = match std::env::var("RESEND_API_KEY") {
-        Ok(k) if !k.trim().is_empty() => k,
-        _ => {
-            warn!("[invite] RESEND_API_KEY not set — returning email_not_configured");
+    // Runtime env wins; otherwise fall back to the build-time bake.
+    let api_key = std::env::var("RESEND_API_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| BUILD_TIME_KEY.map(str::to_string).filter(|s| !s.trim().is_empty()));
+
+    let api_key = match api_key {
+        Some(k) => k,
+        None => {
+            warn!("[invite] no RESEND_API_KEY (build-time or runtime) — returning email_not_configured");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({ "error": "email_not_configured" })),
@@ -63,7 +83,10 @@ pub async fn send(
     };
 
     let from = std::env::var("RESEND_FROM")
-        .unwrap_or_else(|_| "Said <onboarding@resend.dev>".into());
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| BUILD_TIME_FROM.map(str::to_string).filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| "Said <onboarding@resend.dev>".into());
 
     let payload = json!({
         "from":    from,

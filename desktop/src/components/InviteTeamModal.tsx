@@ -217,17 +217,35 @@ export function InviteTeamModal({ open, onClose }: Props) {
             </div>
           )}
 
-          {/* Send — uses .btn-primary so glow + hover match the rest of the app */}
+          {/* Send — black pill, white text. Minimal and quiet so the heart
+              + headline stay the focal point. Hover lifts the inset stroke. */}
           <button
             onClick={handleSend}
             disabled={!canSend || submitting || submitted}
-            className="btn-primary mt-4 w-full justify-center py-3 rounded-xl"
+            className="mt-4 w-full inline-flex items-center justify-center gap-2 py-3 rounded-xl font-semibold transition-all duration-150"
             style={{
-              fontSize: 13.5,
-              ...(submitted ? {
-                background: "hsl(var(--primary))",
-                color:      "hsl(var(--primary-foreground))",
-              } : {}),
+              fontSize:   13.5,
+              background: !canSend && !submitted
+                ? "hsl(0 0% 12%)"
+                : "hsl(0 0% 6%)",
+              color: !canSend && !submitted
+                ? "hsl(var(--muted-foreground))"
+                : "hsl(var(--foreground))",
+              boxShadow: !canSend && !submitted
+                ? "inset 0 0 0 1px hsl(var(--surface-4))"
+                : "inset 0 0 0 1px hsl(0 0% 100% / 0.08), 0 4px 14px hsl(0 0% 0% / 0.45)",
+              cursor: !canSend || submitting || submitted ? "default" : "pointer",
+              opacity: !canSend && !submitted ? 0.85 : 1,
+            }}
+            onMouseEnter={(e) => {
+              if (!canSend || submitted) return;
+              e.currentTarget.style.boxShadow =
+                "inset 0 0 0 1px hsl(0 0% 100% / 0.14), 0 6px 20px hsl(0 0% 0% / 0.55)";
+            }}
+            onMouseLeave={(e) => {
+              if (!canSend || submitted) return;
+              e.currentTarget.style.boxShadow =
+                "inset 0 0 0 1px hsl(0 0% 100% / 0.08), 0 4px 14px hsl(0 0% 0% / 0.45)";
             }}
           >
             {submitting ? (
@@ -248,14 +266,12 @@ export function InviteTeamModal({ open, onClose }: Props) {
             )}
           </button>
 
-          {/* Footnote — tiny muted hint */}
+          {/* Footnote — tiny muted hint, one line */}
           <p
-            className="text-[11px] text-center mt-5 leading-relaxed"
+            className="text-[11px] text-center mt-5"
             style={{ color: "hsl(var(--muted-foreground))", opacity: 0.7 }}
           >
-            We'll send a short note from Said.
-            <br />
-            No account needed for them.
+            A short note from Said. No account needed.
           </p>
         </div>
       </div>
