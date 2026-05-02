@@ -35,6 +35,44 @@ use voice_polish_hotkey as hotkey;
 ///
 /// `initial` is the text we pasted.  Events are filtered to those that arrived
 /// after `since`.  Returns `None` only if reconstruction is truly unreliable
+/// Show a macOS native notification.
+///
+/// `tauri-plugin-notification` uses `mac-notification-sys`, which requires the
+/// calling process to live inside a proper `.app` bundle with a registered
+/// bundle identifier.  In `tauri dev` we run the raw debug binary directly
+/// (`target/debug/voice-polish-desktop`) — the Cocoa call still returns OK,
+/// but macOS silently refuses to display the banner.
+///
+/// `osascript` always works because AppleScript executes inside Apple's
+/// bundled Script Editor process, which has notification permission by
+/// default.  We use it as the primary path in dev, the Tauri plugin in
+/// release.  The function is non-blocking-ish — osascript spawn returns in
+/// ~50 ms; we don't wait for the child.
+#[cfg(target_os = "macos")]
+fn notify_macos(title: &str, body: &str) {
+    use std::process::{Command, Stdio};
+
+    // AppleScript string literals: backslash-escape `\` and `"`.
+    let title_esc = title.replace('\\', "\\\\").replace('"', "\\\"");
+    let body_esc  = body .replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(
+        r#"display notification "{body_esc}" with title "{title_esc}""#
+    );
+
+    match Command::new("osascript")
+        .arg("-e").arg(&script)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(_)  => tracing::info!("[notify] osa sent: {title}"),
+        Err(e) => tracing::warn!("[notify] osascript spawn failed: {e}"),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn notify_macos(_title: &str, _body: &str) {}
+
 /// (Cmd+Z, Cmd+X).  Mouse clicks are handled by trying every possible cursor
 /// position and picking the candidate that preserves the most surrounding text
 /// (i.e., the smallest local edit).
@@ -1259,23 +1297,11 @@ async fn add_vocabulary_term(
     api::add_vocabulary_term(&ep, &term).await?;
     let _ = app.emit("vocabulary-changed", ());
 
-    // Native macOS notification — confirms STT will now bias toward this term.
-    // Mirrors the auto-promote notification path so the UX is consistent
-    // whether the term was learned automatically or added manually.
-    use tauri_plugin_notification::NotificationExt;
-    match app.notification()
-        .builder()
-        .title("Said vocabulary")
-        .body(&format!("Added \"{term}\" — biasing STT on the next recording"))
-        .show()
-    {
-        Ok(_)  => tracing::info!("[notify] vocab add notification sent: {term}"),
-        Err(e) => tracing::warn!(
-            "[notify] FAILED to send vocab add notification: {e}. \
-             macOS permission likely not granted. \
-             Open System Settings → Notifications → Said and enable."
-        ),
-    }
+    // Native macOS notification (osascript-backed for dev-mode reliability).
+    notify_macos(
+        "Said vocabulary",
+        &format!("Added \"{term}\" — biasing STT on the next recording"),
+    );
     Ok(())
 }
 
@@ -1304,16 +1330,10 @@ async fn star_vocabulary_term(
     // Lightweight confirmation toast for star/unstar — only on STAR (positive
     // affirmation), not on unstar (silent).
     if starred {
-        use tauri_plugin_notification::NotificationExt;
-        match app.notification()
-            .builder()
-            .title("Said vocabulary")
-            .body(&format!("Pinned \"{term}\" — protected from automatic demotion"))
-            .show()
-        {
-            Ok(_)  => tracing::info!("[notify] vocab star notification sent: {term}"),
-            Err(e) => tracing::warn!("[notify] FAILED to send vocab star notification: {e}"),
-        }
+        notify_macos(
+            "Said vocabulary",
+            &format!("Pinned \"{term}\" — protected from automatic demotion"),
+        );
     }
     Ok(starred)
 }
@@ -1728,15 +1748,7 @@ async fn watch_for_edit(
                         "POLISH_ERROR" => "Said updated a polish rule",
                         _              => "Said learned from your edit",
                     };
-                    use tauri_plugin_notification::NotificationExt;
-                    match app.notification().builder().title(title).body(&resp.reason).show() {
-                        Ok(_)  => tracing::info!("[notify] sent: {title} — {}", resp.reason),
-                        Err(e) => tracing::warn!(
-                            "[notify] FAILED to send notification: {e}. \
-                             macOS permission likely not granted. \
-                             Open System Settings → Notifications → Said and enable."
-                        ),
-                    }
+                    notify_macos(title, &resp.reason);
                 }
 
                 if resp.learned || resp.pending_id.is_some() {
