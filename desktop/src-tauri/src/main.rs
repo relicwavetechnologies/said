@@ -1263,11 +1263,19 @@ async fn add_vocabulary_term(
     // Mirrors the auto-promote notification path so the UX is consistent
     // whether the term was learned automatically or added manually.
     use tauri_plugin_notification::NotificationExt;
-    let _ = app.notification()
+    match app.notification()
         .builder()
         .title("Said vocabulary")
         .body(&format!("Added \"{term}\" — biasing STT on the next recording"))
-        .show();
+        .show()
+    {
+        Ok(_)  => tracing::info!("[notify] vocab add notification sent: {term}"),
+        Err(e) => tracing::warn!(
+            "[notify] FAILED to send vocab add notification: {e}. \
+             macOS permission likely not granted. \
+             Open System Settings → Notifications → Said and enable."
+        ),
+    }
     Ok(())
 }
 
@@ -1297,11 +1305,15 @@ async fn star_vocabulary_term(
     // affirmation), not on unstar (silent).
     if starred {
         use tauri_plugin_notification::NotificationExt;
-        let _ = app.notification()
+        match app.notification()
             .builder()
             .title("Said vocabulary")
             .body(&format!("Pinned \"{term}\" — protected from automatic demotion"))
-            .show();
+            .show()
+        {
+            Ok(_)  => tracing::info!("[notify] vocab star notification sent: {term}"),
+            Err(e) => tracing::warn!("[notify] FAILED to send vocab star notification: {e}"),
+        }
     }
     Ok(starred)
 }
@@ -1717,11 +1729,14 @@ async fn watch_for_edit(
                         _              => "Said learned from your edit",
                     };
                     use tauri_plugin_notification::NotificationExt;
-                    let _ = app.notification()
-                        .builder()
-                        .title(title)
-                        .body(&resp.reason)
-                        .show();
+                    match app.notification().builder().title(title).body(&resp.reason).show() {
+                        Ok(_)  => tracing::info!("[notify] sent: {title} — {}", resp.reason),
+                        Err(e) => tracing::warn!(
+                            "[notify] FAILED to send notification: {e}. \
+                             macOS permission likely not granted. \
+                             Open System Settings → Notifications → Said and enable."
+                        ),
+                    }
                 }
 
                 if resp.learned || resp.pending_id.is_some() {
