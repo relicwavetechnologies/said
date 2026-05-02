@@ -167,7 +167,7 @@
     --chip-lime-bg:         160 65% 42% / 0.16;
     --chip-lime-fg:         160 70% 22%;
 
-    --heat-0:               220 14% 92%;
+    --heat-0:               220 13% 88%;       /* visible empty cell on white */
 
     --shadow-tile:
       0 1px 0 hsl(220 28% 25% / 0.04) inset,

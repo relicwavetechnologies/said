@@ -657,12 +657,14 @@ export function ActivityHeatmap({
         ))}
       </div>
 
-      {/* Heatmap grid */}
+      {/* Heatmap grid — rows use `auto` so cells take their aspect-ratio
+          height from the column width (1fr rows would collapse to 0 in a
+          container with no explicit height) */}
       <div
         className="grid"
         style={{
           gridTemplateColumns: `repeat(${COLS}, minmax(0, 1fr))`,
-          gridTemplateRows:    `repeat(${ROWS}, minmax(0, 1fr))`,
+          gridTemplateRows:    `repeat(${ROWS}, auto)`,
           gridAutoFlow:        "column",
           columnGap: 4,
           rowGap:    4,
@@ -684,10 +686,11 @@ export function ActivityHeatmap({
             <span
               key={i}
               title={tip}
-              className={`rounded-full ${isToday ? "heat-current" : `heat-${level}`}`}
+              className={`block rounded-full ${isToday ? "heat-current" : `heat-${level}`}`}
               style={{
                 aspectRatio: "1 / 1",
-                opacity: future ? 0.3 : 1,
+                width:       "100%",
+                opacity:     future ? 0.3 : 1,
               }}
             />
           );

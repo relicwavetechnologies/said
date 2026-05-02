@@ -434,13 +434,17 @@ fn tray_polish_message(app: &tauri::AppHandle, tone: &str) {
         }
     };
 
-    // Grab selection before spawning — must happen on the main thread
-    // so the focused window hasn't changed.
+    // Read the selected text.  This is called from a spawned thread (not the
+    // CGEventTap thread) so the Cmd+C fallback can work.
+    tracing::info!("[tray_polish] reading selected text for tone={tone}...");
     let selected = paster::read_selected_text();
     let text = match selected {
-        Some(t) if !t.trim().is_empty() => t,
+        Some(t) if !t.trim().is_empty() => {
+            tracing::info!("[tray_polish] got {} chars of selected text", t.len());
+            t
+        }
         _ => {
-            tracing::warn!("[tray_polish] no text selected");
+            tracing::warn!("[tray_polish] no text selected — make sure text is highlighted before pressing Option+N");
             return;
         }
     };
@@ -1453,6 +1457,16 @@ async fn watch_for_edit(
         return;
     }
 
+    // ── Meaningful edit gate ──────────────────────────────────────────────────
+    // Filter out whitespace-only, case-only, punctuation-only, and AX-jitter
+    // diffs that are NOT real user edits.
+    if !is_meaningful_edit(&polished, &user_kept) {
+        tracing::info!(
+            "[edit-watch] edit not meaningful for {recording_id} — skipping notification"
+        );
+        return;
+    }
+
     // ── 1. Store as pending edit in the backend ────────────────────────────────
     tracing::info!("[edit-watch] storing pending edit for {recording_id}");
     let ep_opt = back_arc.lock().ok().and_then(|g| g.clone());
@@ -1526,6 +1540,91 @@ fn extract_kept(polished: &str, post_paste: &str, last_val: &str) -> String {
 
     // Prefix changed — return full field value as a fallback.
     last_val.to_string()
+}
+
+/// Returns true only if `user_kept` is *meaningfully* different from `polished`.
+///
+/// Filters out false positives caused by:
+/// - Whitespace-only changes (trailing newline, extra space)
+/// - Case-only changes (auto-capitalize)
+/// - Smart-punctuation substitutions (smart quotes, em-dashes, ellipsis)
+/// - AX read jitter (< 3 character differences)
+fn is_meaningful_edit(polished: &str, user_kept: &str) -> bool {
+    let p = normalize_for_diff(polished);
+    let k = normalize_for_diff(user_kept);
+
+    if p == k {
+        tracing::info!("[edit-gate] normalized texts identical — not meaningful");
+        return false;
+    }
+
+    // Character-level distance: if < 3 chars different after normalization,
+    // it's likely AX jitter or a trivial auto-correction, not a user edit.
+    let char_diff = simple_char_distance(&p, &k);
+    if char_diff < 3 {
+        tracing::info!(
+            "[edit-gate] char distance {char_diff} < 3 — AX jitter, not meaningful"
+        );
+        return false;
+    }
+
+    // Word-level check: at least 1 alphanumeric word must actually differ.
+    let p_words: Vec<&str> = p.split_whitespace().collect();
+    let k_words: Vec<&str> = k.split_whitespace().collect();
+    let max_len = p_words.len().max(k_words.len());
+    let mut word_diffs = 0usize;
+    for i in 0..max_len {
+        let pw = p_words.get(i).copied().unwrap_or("");
+        let kw = k_words.get(i).copied().unwrap_or("");
+        if pw != kw && (pw.chars().any(|c| c.is_alphanumeric())
+                     || kw.chars().any(|c| c.is_alphanumeric()))
+        {
+            word_diffs += 1;
+        }
+    }
+
+    if word_diffs == 0 {
+        tracing::info!(
+            "[edit-gate] no alphanumeric word diffs — punctuation/formatting only, not meaningful"
+        );
+        return false;
+    }
+
+    tracing::info!(
+        "[edit-gate] {word_diffs} word(s) changed, char_diff={char_diff} — meaningful edit"
+    );
+    true
+}
+
+/// Normalize text for edit comparison: collapse whitespace, lowercase,
+/// replace common Unicode punctuation variants with ASCII equivalents.
+fn normalize_for_diff(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+        .replace('\u{201c}', "\"") // left double smart quote
+        .replace('\u{201d}', "\"") // right double smart quote
+        .replace('\u{2018}', "'")  // left single smart quote
+        .replace('\u{2019}', "'")  // right single smart quote / apostrophe
+        .replace('\u{2014}', "-")  // em-dash
+        .replace('\u{2013}', "-")  // en-dash
+        .replace('\u{2026}', "...") // ellipsis
+        .replace('\u{00a0}', " ")  // non-breaking space
+}
+
+/// Simple positional character distance (diff chars at same index + length diff).
+fn simple_char_distance(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let min_len = a_chars.len().min(b_chars.len());
+    let mut diff = a_chars.len().abs_diff(b_chars.len());
+    for i in 0..min_len {
+        if a_chars[i] != b_chars[i] {
+            diff += 1;
+        }
+    }
+    diff
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -1702,9 +1801,15 @@ fn main() {
 
                     // ── Option+1..5 tone shortcuts ─────────────────────────────
                     // Select text in any app, press Option+N to polish with a preset tone.
+                    //
+                    // IMPORTANT: the callback runs on the CGEventTap's CFRunLoop thread.
+                    // We MUST NOT call read_selected_text() on that thread — its Cmd+C
+                    // fallback posts synthetic key events that queue behind the running
+                    // callback and never reach the target app.  Spawning a new thread
+                    // lets the tap callback return immediately so the run-loop is unblocked.
                     let app_shortcut = app.handle().clone();
                     hotkey::register_shortcut_callback(Arc::new(move |n: u8| {
-                        let tone = match n {
+                        let tone: &str = match n {
                             1 => "professional",
                             2 => "casual",
                             3 => "concise",
@@ -1712,7 +1817,14 @@ fn main() {
                             5 => "custom",
                             _ => return,
                         };
-                        tray_polish_message(&app_shortcut, tone);
+                        let app_clone = app_shortcut.clone();
+                        let tone_owned = tone.to_string();
+                        std::thread::spawn(move || {
+                            // Small delay to let the tap callback return and the
+                            // CFRunLoop process queued events before we try Cmd+C.
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            tray_polish_message(&app_clone, &tone_owned);
+                        });
                     }));
 
                     // ── Ctrl+Cmd+V — paste latest stored result ─────────────────
