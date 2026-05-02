@@ -73,7 +73,6 @@ use crate::{
     llm::{gateway, gemini_direct, groq, openai_codex, prompt::{build_system_prompt_with_vocab, build_user_message}},
     stt::deepgram,
     store::{
-        corrections,
         history::{insert_recording, InsertRecording},
         openai_oauth,
         stt_replacements,

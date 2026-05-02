@@ -27,7 +27,6 @@ use crate::{
         prompt::{build_system_prompt_with_vocab, build_tray_system_prompt, build_user_message},
     },
     store::{
-        corrections,
         history::{insert_recording, InsertRecording},
         openai_oauth,
         vectors::retrieve_similar,
