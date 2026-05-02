@@ -938,26 +938,7 @@ fn do_finish_recording(
             None
         };
 
-        // Hard 6 s timeout on the backend SSE call.
-        //
-        // Recording duration does NOT affect this timeout — the WS streams
-        // audio in real-time, so by Caps Lock release Deepgram has already
-        // processed the speech.  The 4 s WS wait above is a separate budget.
-        // What remains is: embed (~300 ms) + LLM TTFT (~400 ms) + token
-        // streaming (~1-3 s) — well under 6 s when healthy.
-        //
-        // Worst case from Caps Lock release: 4 s (WS) + 6 s (SSE) = 10 s,
-        // after which state is forced back to Idle automatically.
-        let result = match tokio::time::timeout(
-            std::time::Duration::from_secs(6),
-            run_voice_polish_sse(&back_arc2, wav, None, pre_transcript, &app2),
-        ).await {
-            Ok(r)  => r,
-            Err(_) => {
-                tracing::error!("[pipeline] backend SSE timed out after 6 s — forcing recovery to Idle");
-                Err("Request timed out — please try again.".to_string())
-            }
-        };
+        let result = run_voice_polish_sse(&back_arc2, wav, None, pre_transcript, &app2).await;
 
         // Spawn edit-watcher immediately after paste (non-blocking).
         // Capture watch_start NOW — before the spawn — so the ring
@@ -1237,12 +1218,25 @@ async fn get_pending_edits(
 
 #[tauri::command]
 async fn resolve_pending_edit(
-    backend: State<'_, BackendState>,
-    id:      String,
-    action:  String,
+    backend:   State<'_, BackendState>,
+    hot_cache: State<'_, HotPathCache>,
+    id:        String,
+    action:    String,
 ) -> Result<(), String> {
     let ep = get_endpoint(&backend)?;
-    api::resolve_pending_edit(&ep, &id, &action).await
+    let result = api::resolve_pending_edit(&ep, &id, &action).await;
+    // "approve" promotes a term into vocabulary — refresh cache immediately.
+    if result.is_ok() && action == "approve" {
+        let arc = Arc::clone(&hot_cache.0);
+        let ep2 = ep.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Ok(terms) = api::get_vocabulary_terms(&ep2).await {
+                tracing::info!("[hot_cache] refreshed after pending-edit approval ({} terms)", terms.len());
+                arc.write().await.keyterms = terms;
+            }
+        });
+    }
+    result
 }
 
 // ── Vocabulary management commands ────────────────────────────────────────────
@@ -2030,6 +2024,33 @@ fn main() {
                             let mut c = hot.0.write().await;
                             c.language = language;
                             c.keyterms = keyterms;
+                        });
+
+                        // ── Periodic cache refresh every 5 minutes ────────────
+                        // Belt-and-suspenders: even if an event-driven refresh
+                        // fails (network blip, task panic), the cache catches up
+                        // within 5 minutes.
+                        let ep2   = handle.endpoint();
+                        let app_h = app.handle().clone();
+                        tauri::async_runtime::spawn(async move {
+                            let mut interval = tokio::time::interval(
+                                std::time::Duration::from_secs(300)
+                            );
+                            interval.tick().await; // skip the immediate first tick
+                            loop {
+                                interval.tick().await;
+                                match api::get_vocabulary_terms(&ep2).await {
+                                    Ok(terms) => {
+                                        tracing::debug!(
+                                            "[hot_cache] periodic refresh — {} term(s)", terms.len()
+                                        );
+                                        app_h.state::<HotPathCache>().0.write().await.keyterms = terms;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("[hot_cache] periodic refresh failed: {e}");
+                                    }
+                                }
+                            }
                         });
                     }
                     Err(e) => {

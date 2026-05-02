@@ -31,24 +31,21 @@ impl AppState {
 // ── DesktopApp ────────────────────────────────────────────────────────────────
 
 pub struct DesktopApp {
-    pub state:              AppState,
-    pub recorder:           AudioRecorder,
-    pub last_result:        Option<ProcessSummary>,
-    pub last_error:         Option<String>,
-    pub recording_started:  Option<Instant>,
-    /// Set when state enters Processing; used to detect stale hangs.
-    pub processing_started: Option<Instant>,
+    pub state:             AppState,
+    pub recorder:          AudioRecorder,
+    pub last_result:       Option<ProcessSummary>,
+    pub last_error:        Option<String>,
+    pub recording_started: Option<Instant>,
 }
 
 impl DesktopApp {
     pub fn new() -> Self {
         Self {
-            state:              AppState::Idle,
-            recorder:           AudioRecorder::new(),
-            last_result:        None,
-            last_error:         None,
-            recording_started:  None,
-            processing_started: None,
+            state:             AppState::Idle,
+            recorder:          AudioRecorder::new(),
+            last_result:       None,
+            last_error:        None,
+            recording_started: None,
         }
     }
 
@@ -87,25 +84,7 @@ impl DesktopApp {
     /// Begin recording. Returns the snapshot for the UI.
     pub fn start_recording(&mut self) -> Result<AppSnapshot, String> {
         if self.state == AppState::Processing {
-            // If the pipeline has been stuck in Processing for >15 s, it has
-            // almost certainly hung (backend stall, SSE timeout, task panic).
-            // Force-reset to Idle so the next Caps Lock press starts fresh
-            // instead of being silently swallowed forever.
-            // 12 s = 4 s (WS timeout) + 6 s (SSE timeout) + 2 s slack.
-            // If we're still in Processing after that, the task has hung.
-            let stale = self.processing_started
-                .map(|t| t.elapsed().as_secs() >= 12)
-                .unwrap_or(true);   // no timestamp = definitely stale
-            if stale {
-                tracing::warn!(
-                    "[state] Processing stuck for ≥12 s — force-resetting to Idle for recovery"
-                );
-                self.state              = AppState::Idle;
-                self.processing_started = None;
-                self.last_error         = Some("Previous request timed out — restarted automatically.".into());
-            } else {
-                return Err("still processing previous recording".into());
-            }
+            return Err("still processing previous recording".into());
         }
         self.recorder.start()?;
         self.state             = AppState::Recording;
@@ -122,25 +101,22 @@ impl DesktopApp {
         if self.state != AppState::Recording {
             return Err("not recording".into());
         }
-        self.state              = AppState::Processing;
-        self.processing_started = Some(Instant::now());
+        self.state = AppState::Processing;
         self.recorder
             .stop()
             .ok_or_else(|| "no audio captured".to_string())
     }
 
     pub fn finish_ok(&mut self, result: ProcessSummary) -> AppSnapshot {
-        self.state              = AppState::Idle;
-        self.processing_started = None;
-        self.last_result        = Some(result);
-        self.last_error         = None;
+        self.state       = AppState::Idle;
+        self.last_result = Some(result);
+        self.last_error  = None;
         self.snapshot()
     }
 
     pub fn finish_err(&mut self, err: String) -> AppSnapshot {
-        self.state              = AppState::Idle;
-        self.processing_started = None;
-        self.last_error         = Some(err);
+        self.state      = AppState::Idle;
+        self.last_error = Some(err);
         self.snapshot()
     }
 }
