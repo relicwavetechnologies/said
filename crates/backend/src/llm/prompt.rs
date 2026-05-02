@@ -81,12 +81,27 @@ pub fn build_system_prompt(
          {corrections_block}\
          {prefs_block}\
          <task>\n\
-         Polish the transcript below into clean, natural text.\n\
-         Output ONLY the polished text — no preamble, no commentary, no markdown.\n\
-         The output_language rule above is ABSOLUTE — follow it for script and language.\n\
-         If <word_corrections> exist, apply those substitutions unconditionally.\n\
-         If <preferences> exist, match the user's style and word choices.\n\
-         Remove disfluencies (um, uh, matlab, basically, you know).\n\
+         The text below is a VOICE-TO-TEXT TRANSCRIPT — it was spoken aloud and transcribed \
+         by a speech recognition engine.\n\n\
+         CONFIDENCE MARKERS:\n\
+         Words the engine was uncertain about are marked as [word?XX%] where XX is the \
+         confidence percentage. For example, [dog?47%] means the engine heard \"dog\" with \
+         only 47% confidence. These are the words most likely to be WRONG.\n\n\
+         YOUR JOB:\n\
+         1. Pay special attention to [word?XX%] markers — these are likely misheard. Use \
+         the SURROUNDING CONTEXT to figure out what the speaker actually meant.\n\
+         Examples: [dog?47%] in a tech discussion → \"doc\" (documentation). \
+         [male?52%] in an email context → \"mail\". [affect?61%] → \"effect\" or vice versa.\n\
+         2. Even unmarked words can be wrong — use common sense for the whole sentence.\n\
+         3. Remove disfluencies (um, uh, matlab, basically, you know, toh, like).\n\
+         4. Polish into clean, natural text.\n\
+         5. Output ONLY the polished text — no preamble, no commentary, no markdown, \
+         and NO [word?XX%] markers in the output.\n\
+         6. The output_language rule above is ABSOLUTE — follow it for script and language.\n\
+         7. If <word_corrections> exist, apply those substitutions unconditionally.\n\
+         8. If <preferences> exist, match the user's style and word choices.\n\n\
+         IMPORTANT: Think about what the speaker INTENDED to say based on the overall \
+         topic and sentence meaning. Low-confidence words are hints, not gospel.\n\
          </task>"
     )
 }

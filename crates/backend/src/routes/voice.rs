@@ -157,13 +157,21 @@ pub async fn polish(
         let http_client = Client::new();
 
         // 2. Transcribe (skip if pre_transcript supplied by Tauri WS pipeline)
-        let (stt_transcript, stt_confidence, transcribe_ms) = if let Some(t) = pre_transcript {
-            // P5: Tauri already had a transcript from Deepgram WS — skip HTTP STT
+        //
+        // Two transcripts are maintained:
+        //   stt_transcript — plain text (for storage, display, embedding)
+        //   enriched_transcript — same text but with [word?XX%] markers on
+        //                         low-confidence words (sent to the LLM only)
+        let (stt_transcript, enriched_transcript, stt_confidence, transcribe_ms) = if let Some(t) = pre_transcript {
+            // P5: Tauri already had a transcript from Deepgram WS — skip HTTP STT.
+            // The WS path sends an enriched transcript (with [word?XX%] markers)
+            // as-is.  It contains both the plain words and the confidence markers.
             info!("[voice] using pre-transcript ({} chars) — STT step skipped", t.len());
-            // Use owned `t` directly — no borrow across the yield suspension point
             let status_data = json!({"phase": "polishing", "transcript": &t}).to_string();
             yield Ok(Event::default().event("status").data(status_data));
-            (t, 0.95_f64, 0_i64)
+            // Strip markers for the plain version (used in DB/embedding)
+            let plain = strip_confidence_markers(&t);
+            (plain, t, 0.95_f64, 0_i64)
         } else {
             // Normal path: send WAV to Deepgram HTTP batch API
             yield Ok(Event::default().event("status")
@@ -173,10 +181,13 @@ pub async fn polish(
             match deepgram::transcribe(&http_client, &deepgram_key, wav_data, &prefs.language).await {
                 Ok(r) => {
                     let ms = t_start.elapsed().as_millis() as i64;
-                    info!("[voice] transcript in {ms}ms: {}", r.transcript);
+                    info!("[voice] transcript in {ms}ms ({} uncertain words): {}", r.uncertain_count, r.transcript);
+                    if r.uncertain_count > 0 {
+                        info!("[voice] enriched for LLM: {}", r.enriched_transcript);
+                    }
                     yield Ok(Event::default().event("status")
                         .data(json!({"phase": "polishing", "transcript": r.transcript}).to_string()));
-                    (r.transcript, r.confidence, ms)
+                    (r.transcript, r.enriched_transcript, r.confidence, ms)
                 }
                 Err(e) => {
                     warn!("[voice] STT error: {e}");
@@ -202,7 +213,9 @@ pub async fn polish(
         // Build prompt skeleton concurrently while embedding runs
         // (RAG examples will be injected once the embedding is available)
         let model = voice_polish_core::resolve_model(&prefs.selected_model).to_string();
-        let user_message = build_user_message(&stt_transcript);
+        // Send the ENRICHED transcript to the LLM (with [word?XX%] markers)
+        // so it knows which words to scrutinize for context-based correction.
+        let user_message = build_user_message(&enriched_transcript);
 
         // 3. Wait for embedding result (P2: overlapped with prompt prep above)
         let embedding  = embed_task.await.unwrap_or(None);
@@ -367,4 +380,44 @@ pub async fn polish(
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// Strip `[word?XX%]` confidence markers from an enriched transcript
+/// to recover the plain text (for DB storage, embedding, display).
+fn strip_confidence_markers(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '[' {
+            // Try to parse [word?XX%] — extract just the word
+            let mut inner = String::new();
+            let mut found_close = false;
+            for ic in chars.by_ref() {
+                if ic == ']' { found_close = true; break; }
+                inner.push(ic);
+            }
+            if found_close {
+                if let Some(qpos) = inner.rfind('?') {
+                    let after_q = &inner[qpos + 1..];
+                    if after_q.ends_with('%') && after_q[..after_q.len() - 1].parse::<f64>().is_ok() {
+                        // Valid confidence marker — emit just the word part
+                        result.push_str(&inner[..qpos]);
+                        continue;
+                    }
+                }
+                // Not a valid marker — emit the brackets and content as-is
+                result.push('[');
+                result.push_str(&inner);
+                result.push(']');
+            } else {
+                result.push('[');
+                result.push_str(&inner);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
 }

@@ -18,6 +18,9 @@ use tokio_tungstenite::{
 use tracing::{debug, info, warn};
 use voice_polish_recorder::{resample_to_16k, ChunkReceiver, SAMPLE_RATE};
 
+/// Confidence threshold — words below this get [word?XX%] markers for the LLM.
+const LOW_CONFIDENCE_THRESHOLD: f64 = 0.85;
+
 /// Resample raw audio chunks from the microphone, send them to Deepgram via WS,
 /// and return the final transcript once the stream is closed.
 ///
@@ -172,15 +175,11 @@ pub async fn stream_to_deepgram(
                                     .as_str().unwrap_or("");
                                 info!("[dg_stream] ← Results is_final={is_f} speech_final={sp_f} transcript={t:?}");
 
-                                // Capture ALL is_final=true segments — not just speech_final.
-                                // Each is_final covers a distinct audio chunk; speech_final
-                                // only fires after endpointing silence (300ms).  Without this,
-                                // continuous speech produces 0 parts during streaming and the
-                                // entire transcript comes from a single drain speech_final
-                                // (often just the LAST segment, losing everything before it).
+                                // Capture ALL is_final=true segments with confidence markers.
                                 if is_f && !t.is_empty() {
-                                    info!("[dg_stream] captured is_final segment: {t:?} (speech_final={sp_f})");
-                                    transcript_parts.push(t.to_string());
+                                    let enriched = enrich_from_words(&v["channel"]["alternatives"][0]["words"]);
+                                    info!("[dg_stream] captured is_final segment: {enriched:?} (speech_final={sp_f})");
+                                    transcript_parts.push(enriched);
                                 }
                             } else {
                                 info!("[dg_stream] ← server msg type={msg_type}");
@@ -264,10 +263,11 @@ pub async fn stream_to_deepgram(
                             .as_str().unwrap_or("");
                         info!("[dg_stream] ← drain Results is_final={is_f} speech_final={sp_f} transcript={t:?}");
 
-                        // Capture any is_final fragment (same rule as main loop)
+                        // Capture any is_final fragment with confidence markers
                         if is_f && !t.is_empty() {
-                            info!("[dg_stream] drain captured: {t:?} (speech_final={sp_f})");
-                            transcript_parts.push(t.to_string());
+                            let enriched = enrich_from_words(&v["channel"]["alternatives"][0]["words"]);
+                            info!("[dg_stream] drain captured: {enriched:?} (speech_final={sp_f})");
+                            transcript_parts.push(enriched);
                         }
 
                         // Reset the timer — wait 500ms more for additional segments
@@ -338,5 +338,37 @@ pub async fn stream_to_deepgram(
     }
 }
 
-// (parse_speech_final removed — main loop now captures all is_final=true events inline)
+/// Build enriched text from Deepgram's `words` array inside a Results message.
+/// Words with confidence < threshold are marked `[word?XX%]` so the LLM knows
+/// which words to scrutinize for context-based correction.
+///
+/// Falls back to joining plain `punctuated_word`/`word` fields if parsing fails.
+fn enrich_from_words(words_val: &Value) -> String {
+    let Some(words) = words_val.as_array() else {
+        return String::new();
+    };
+    if words.is_empty() {
+        return String::new();
+    }
+
+    let mut parts = Vec::with_capacity(words.len());
+    for w in words {
+        let word = w["punctuated_word"]
+            .as_str()
+            .or_else(|| w["word"].as_str())
+            .unwrap_or("");
+        if word.is_empty() {
+            continue;
+        }
+
+        let conf = w["confidence"].as_f64().unwrap_or(1.0);
+        if conf < LOW_CONFIDENCE_THRESHOLD {
+            parts.push(format!("[{}?{:.0}%]", word, conf * 100.0));
+        } else {
+            parts.push(word.to_string());
+        }
+    }
+
+    parts.join(" ")
+}
 
