@@ -181,6 +181,8 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/v1/openai-oauth/initiate",   post(routes::openai_oauth::initiate))
         .route("/v1/openai-oauth/status",     get(routes::openai_oauth::status))
         .route("/v1/openai-oauth/disconnect", axum::routing::delete(routes::openai_oauth::disconnect))
+        // Invite-a-friend email
+        .route("/v1/invite", post(routes::invite::send))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_secret,

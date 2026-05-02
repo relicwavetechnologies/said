@@ -3,6 +3,7 @@ pub mod cloud;
 pub mod feedback;
 pub mod health;
 pub mod history;
+pub mod invite;
 pub mod openai_oauth;
 pub mod pending_edits;
 pub mod pre_embed;

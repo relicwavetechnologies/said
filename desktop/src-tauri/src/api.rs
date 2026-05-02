@@ -847,6 +847,36 @@ pub async fn star_vocabulary_term(ep: &BackendEndpoint, term: &str) -> Result<bo
     Ok(resp["starred"].as_bool().unwrap_or(false))
 }
 
+/// Send an invite email via the backend (Resend under the hood).
+///
+/// Returns:
+///   Ok(true)                              — sent server-side
+///   Err("email_not_configured")           — backend has no RESEND_API_KEY
+///                                           caller should fall back to mailto
+///   Err("...")                            — any other failure (network, 5xx)
+pub async fn send_invite_email(ep: &BackendEndpoint, to: &str) -> Result<bool, String> {
+    let url  = format!("{}/v1/invite", ep.url);
+    let resp = Client::new()
+        .post(&url)
+        .header("Authorization", ep.bearer())
+        .json(&serde_json::json!({ "to": to }))
+        .send()
+        .await
+        .map_err(|e| format!("invite request failed: {e}"))?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(true);
+    }
+
+    // Try to parse error body so the frontend can branch on the reason.
+    let body = resp.text().await.unwrap_or_default();
+    if body.contains("email_not_configured") {
+        return Err("email_not_configured".into());
+    }
+    Err(format!("invite send error {status}: {body}"))
+}
+
 /// Minimal RFC-3986 path-segment encoder (Tauri-side).  Same conservative
 /// rules as the backend's keyterm encoder so server-side parsing matches.
 fn urlencoding_encode(s: &str) -> String {

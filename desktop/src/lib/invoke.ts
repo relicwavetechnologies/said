@@ -629,6 +629,23 @@ export async function starVocabularyTerm(term: string): Promise<boolean> {
   }
 }
 
+// ── Invite a friend ─────────────────────────────────────────────────────────
+
+export type InviteOutcome =
+  | { status: "sent" }              // backend sent it via Resend
+  | { status: "fallback_mailto" };  // backend has no email provider configured
+
+/**
+ * Try to send the invite email server-side via the backend.
+ * Returns "fallback_mailto" if the backend has no Resend key configured —
+ * the caller should then open `mailto:` so the user can send via their own client.
+ * Throws on network/server errors.
+ */
+export async function sendInviteEmail(to: string): Promise<InviteOutcome> {
+  if (!isTauriRuntime()) return { status: "fallback_mailto" };
+  return await tauriInvoke<InviteOutcome>("send_invite_email", { to });
+}
+
 /** Listen for vocabulary mutations (manual add / delete / star toggle / auto-promote). */
 export function onVocabularyChanged(handler: () => void): () => void {
   if (!isTauriRuntime()) return () => {};

@@ -1434,6 +1434,34 @@ async fn star_vocabulary_term(
     Ok(starred)
 }
 
+// ── Invite-a-friend ───────────────────────────────────────────────────────────
+
+/// Outcome of an invite send attempt — lets the frontend either celebrate
+/// the server-side send or seamlessly fall back to opening the user's mail app.
+#[derive(serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum InviteOutcome {
+    /// Email was sent server-side via Resend.
+    Sent,
+    /// Server has no email provider configured (RESEND_API_KEY missing).
+    /// Frontend should open `mailto:` so the user can still send via their
+    /// own mail client.
+    FallbackMailto,
+}
+
+#[tauri::command]
+async fn send_invite_email(
+    backend: State<'_, BackendState>,
+    to:      String,
+) -> Result<InviteOutcome, String> {
+    let ep = get_endpoint(&backend)?;
+    match api::send_invite_email(&ep, &to).await {
+        Ok(_)                              => Ok(InviteOutcome::Sent),
+        Err(e) if e == "email_not_configured" => Ok(InviteOutcome::FallbackMailto),
+        Err(e)                             => Err(e),
+    }
+}
+
 // ── Cloud auth commands ───────────────────────────────────────────────────────
 
 /// Cloud URL — read from env, default to the hosted service.
@@ -2403,6 +2431,8 @@ fn main() {
             add_vocabulary_term,
             delete_vocabulary_term,
             star_vocabulary_term,
+            // Invite a friend
+            send_invite_email,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Voice Polish desktop")

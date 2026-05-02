@@ -1,9 +1,23 @@
 import React, { useEffect, useRef, useState } from "react";
-import { X, Send, Check, Loader2, Heart } from "lucide-react";
+import { X, Send, Check, Loader2, Heart, AlertCircle } from "lucide-react";
+import { sendInviteEmail } from "@/lib/invoke";
 
 /* ════════════════════════════════════════════════════════════════════════════
-   InviteTeamModal — single-input "invite a friend" modal.
-   Free product, no team/billing pitch — just one warm ask.
+   InviteTeamModal — single-input "invite a friend".
+   Said is free while we're early — no team/billing pitch.
+
+   How sending works:
+   - Tries the backend first (POST /v1/invite → Resend).
+   - If the backend has no RESEND_API_KEY configured, it returns
+     "fallback_mailto" and we open the user's mail client with a
+     pre-written note. Either way the user gets a "sent" outcome.
+   - On a real network/server error, we surface a small inline message
+     and let the user retry.
+
+   Design tokens used (match the rest of the app):
+   - .input + .btn-primary utility classes
+   - --primary (mint) for the hero accent — same as everywhere else
+   - --surface-2 modal mat, --surface-3 input rest, --surface-4 borders
    ════════════════════════════════════════════════════════════════════════════ */
 
 interface Props {
@@ -13,10 +27,21 @@ interface Props {
 
 const VALID_EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+const MAIL_SUBJECT = "You should try Said";
+const MAIL_BODY =
+  "Hey — I've been using Said to dictate and polish text. " +
+  "It's quietly become my favourite way to write.\n\n" +
+  "Thought you'd like it: https://said.app";
+
+type SendState =
+  | { kind: "idle" }
+  | { kind: "sending" }
+  | { kind: "sent" }
+  | { kind: "error"; message: string };
+
 export function InviteTeamModal({ open, onClose }: Props) {
-  const [email,      setEmail]      = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [submitted,  setSubmitted]  = useState(false);
+  const [email, setEmail]    = useState("");
+  const [state, setState]    = useState<SendState>({ kind: "idle" });
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -31,33 +56,43 @@ export function InviteTeamModal({ open, onClose }: Props) {
   useEffect(() => {
     if (open) {
       setEmail("");
-      setSubmitting(false);
-      setSubmitted(false);
+      setState({ kind: "idle" });
       setTimeout(() => inputRef.current?.focus(), 60);
     }
   }, [open]);
 
   if (!open) return null;
 
-  const trimmed   = email.trim();
+  const trimmed    = email.trim();
   const looksValid = trimmed === "" || VALID_EMAIL.test(trimmed);
-  const canSend    = trimmed !== "" && VALID_EMAIL.test(trimmed);
+  const canSend    = trimmed !== "" && VALID_EMAIL.test(trimmed) && state.kind !== "sending";
 
   async function handleSend() {
-    if (!canSend || submitting) return;
-    setSubmitting(true);
-    const subject = encodeURIComponent("You should try Said");
-    const body    = encodeURIComponent(
-      "Hey — I've been using Said to dictate and polish text. " +
-      "It's quietly become my favourite way to write. " +
-      "Thought you'd like it: https://said.app"
-    );
-    window.open(`mailto:${trimmed}?subject=${subject}&body=${body}`, "_blank");
-    await new Promise((r) => setTimeout(r, 450));
-    setSubmitting(false);
-    setSubmitted(true);
-    setTimeout(() => onClose(), 1100);
+    if (!canSend) return;
+    setState({ kind: "sending" });
+
+    try {
+      const result = await sendInviteEmail(trimmed);
+
+      if (result.status === "fallback_mailto") {
+        // Backend has no provider — open the user's mail app with the note pre-written.
+        const subject = encodeURIComponent(MAIL_SUBJECT);
+        const body    = encodeURIComponent(MAIL_BODY);
+        window.open(`mailto:${trimmed}?subject=${subject}&body=${body}`, "_blank");
+      }
+
+      setState({ kind: "sent" });
+      setTimeout(() => onClose(), 1100);
+    } catch (err) {
+      setState({
+        kind: "error",
+        message: "Couldn't send right now. Try again in a moment.",
+      });
+    }
   }
+
+  const submitting = state.kind === "sending";
+  const submitted  = state.kind === "sent";
 
   return (
     <div
@@ -76,26 +111,26 @@ export function InviteTeamModal({ open, onClose }: Props) {
         className="rounded-[20px] overflow-hidden flex flex-col relative"
         style={{
           background: "hsl(var(--surface-2))",
-          width:  "min(460px, 92vw)",
+          width:  "min(440px, 92vw)",
           boxShadow:
-            "0 1px 0 hsl(0 0% 100% / 0.06) inset, 0 30px 80px hsl(220 60% 2% / 0.65)",
+            "inset 0 1px 0 hsl(0 0% 100% / 0.06), 0 30px 80px hsl(220 60% 2% / 0.65)",
         }}
       >
-        {/* Subtle violet wash top-right */}
+        {/* Mint wash top-right — same hero glow used across the app */}
         <div
           aria-hidden
           className="absolute pointer-events-none"
           style={{
-            right: -100, top: -100, width: 280, height: 280, borderRadius: "50%",
-            background: "radial-gradient(circle, hsl(var(--accent-violet) / 0.14) 0%, transparent 70%)",
+            right: -100, top: -120, width: 320, height: 320, borderRadius: "50%",
+            background: "radial-gradient(circle, hsl(var(--primary) / 0.12) 0%, transparent 70%)",
           }}
         />
 
-        {/* Close button — floats top-right */}
+        {/* Close — floats top-right (same icon-button treatment as Topbar) */}
         <button
           onClick={onClose}
-          title="Close"
-          className="absolute top-4 right-4 z-10 w-8 h-8 rounded-full flex items-center justify-center transition-colors"
+          aria-label="Close"
+          className="absolute top-3.5 right-3.5 z-10 w-8 h-8 rounded-full flex items-center justify-center transition-colors"
           style={{ color: "hsl(var(--muted-foreground))" }}
           onMouseEnter={(e) => {
             e.currentTarget.style.background = "hsl(var(--surface-4))";
@@ -109,22 +144,21 @@ export function InviteTeamModal({ open, onClose }: Props) {
           <X size={14} />
         </button>
 
-        {/* Body */}
-        <div className="relative px-8 pt-10 pb-8 flex flex-col items-center">
+        <div className="relative px-9 pt-10 pb-8 flex flex-col items-center">
 
-          {/* Heart icon chip */}
+          {/* Heart icon — mint chip, matches the chip-mint pattern used elsewhere */}
           <div
             className="w-12 h-12 rounded-2xl flex items-center justify-center mb-5"
             style={{
-              background: "hsl(var(--accent-violet) / 0.16)",
-              color:      "hsl(var(--accent-violet))",
-              boxShadow:  "inset 0 0 0 1px hsl(var(--accent-violet) / 0.25)",
+              background: "hsl(var(--primary) / 0.14)",
+              color:      "hsl(var(--primary))",
+              boxShadow:  "inset 0 0 0 1px hsl(var(--primary) / 0.22), 0 6px 18px hsl(var(--primary) / 0.18)",
             }}
           >
-            <Heart size={20} strokeWidth={2.2} />
+            <Heart size={20} strokeWidth={2.2} fill="currentColor" fillOpacity={0.18} />
           </div>
 
-          {/* Headline */}
+          {/* Headline — same scale & tracking as other modal titles (Topbar/Settings) */}
           <h2
             className="text-[22px] font-extrabold tracking-tight text-center mb-2"
             style={{
@@ -135,77 +169,75 @@ export function InviteTeamModal({ open, onClose }: Props) {
             Invite a friend
           </h2>
 
-          {/* Sub-line */}
+          {/* Sub-line — muted, same scale as DashboardCards body copy */}
           <p
-            className="text-[13.5px] text-center max-w-[340px] leading-relaxed mb-7"
+            className="text-[13px] text-center max-w-[320px] leading-relaxed mb-7"
             style={{ color: "hsl(var(--muted-foreground))" }}
           >
             Said is free while we're early. If someone in your life would love it, send them a note.
           </p>
 
-          {/* Email input */}
-          <div className="w-full mb-3">
-            <input
-              ref={inputRef}
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") handleSend(); }}
-              placeholder="friend@example.com"
-              autoComplete="email"
-              className="w-full px-4 py-3 rounded-xl text-[14px] transition-all"
-              style={{
-                background: "hsl(var(--surface-3))",
-                color:      "hsl(var(--foreground))",
-                boxShadow:  looksValid
-                  ? "inset 0 0 0 1px hsl(var(--surface-4))"
-                  : "inset 0 0 0 1px hsl(354 78% 60% / 0.5)",
-                outline:    "none",
-              }}
-              onFocus={(e) => {
-                e.currentTarget.style.boxShadow = looksValid
-                  ? "inset 0 0 0 1px hsl(var(--accent-violet) / 0.6), 0 0 0 3px hsl(var(--accent-violet) / 0.12)"
-                  : "inset 0 0 0 1px hsl(354 78% 60% / 0.6), 0 0 0 3px hsl(354 78% 60% / 0.12)";
-              }}
-              onBlur={(e) => {
-                e.currentTarget.style.boxShadow = looksValid
-                  ? "inset 0 0 0 1px hsl(var(--surface-4))"
-                  : "inset 0 0 0 1px hsl(354 78% 60% / 0.5)";
-              }}
-            />
-          </div>
+          {/* Email input — uses .input utility for full token consistency */}
+          <input
+            ref={inputRef}
+            type="email"
+            value={email}
+            onChange={(e) => {
+              setEmail(e.target.value);
+              if (state.kind === "error") setState({ kind: "idle" });
+            }}
+            onKeyDown={(e) => { if (e.key === "Enter") handleSend(); }}
+            placeholder="friend@example.com"
+            autoComplete="email"
+            disabled={submitting || submitted}
+            className="input"
+            style={{
+              fontSize: 14,
+              padding: "12px 14px",
+              borderRadius: 12,
+              ...(looksValid ? {} : {
+                borderColor: "hsl(354 78% 60% / 0.55)",
+                boxShadow:   "0 0 0 3px hsl(354 78% 60% / 0.10)",
+              }),
+            }}
+          />
 
-          {/* Send button — full width, matches our pill-active style */}
+          {/* Inline error — only when send fails */}
+          {state.kind === "error" && (
+            <div
+              className="w-full mt-3 flex items-center gap-2 px-3 py-2 rounded-lg"
+              style={{
+                background: "hsl(354 78% 60% / 0.10)",
+                color:      "hsl(354 78% 75%)",
+                boxShadow:  "inset 0 0 0 1px hsl(354 78% 60% / 0.25)",
+              }}
+            >
+              <AlertCircle size={13} className="flex-shrink-0" />
+              <span className="text-[12px] font-medium">{state.message}</span>
+            </div>
+          )}
+
+          {/* Send — uses .btn-primary so glow + hover match the rest of the app */}
           <button
             onClick={handleSend}
             disabled={!canSend || submitting || submitted}
-            className="w-full inline-flex items-center justify-center gap-2 px-5 py-3 rounded-xl text-[13.5px] font-semibold transition-all"
+            className="btn-primary mt-4 w-full justify-center py-3 rounded-xl"
             style={{
-              background: submitted
-                ? "hsl(var(--primary))"
-                : canSend
-                ? "hsl(var(--pill-active-bg))"
-                : "hsl(var(--surface-4))",
-              color: submitted
-                ? "hsl(var(--primary-foreground))"
-                : canSend
-                ? "hsl(var(--pill-active-fg))"
-                : "hsl(var(--muted-foreground))",
-              cursor: !canSend || submitting || submitted ? "default" : "pointer",
-              boxShadow: canSend && !submitted
-                ? "0 6px 18px hsl(var(--pill-active-bg) / 0.30)"
-                : "none",
-              opacity: !canSend && !submitted ? 0.7 : 1,
+              fontSize: 13.5,
+              ...(submitted ? {
+                background: "hsl(var(--primary))",
+                color:      "hsl(var(--primary-foreground))",
+              } : {}),
             }}
           >
             {submitting ? (
               <>
                 <Loader2 size={14} className="animate-spin" />
-                Opening mail…
+                Sending…
               </>
             ) : submitted ? (
               <>
-                <Check size={14} strokeWidth={2.5} />
+                <Check size={14} strokeWidth={2.6} />
                 Sent
               </>
             ) : (
@@ -216,12 +248,14 @@ export function InviteTeamModal({ open, onClose }: Props) {
             )}
           </button>
 
-          {/* Tiny footnote */}
+          {/* Footnote — tiny muted hint */}
           <p
-            className="text-[11.5px] text-center mt-5"
-            style={{ color: "hsl(var(--muted-foreground))", opacity: 0.75 }}
+            className="text-[11px] text-center mt-5 leading-relaxed"
+            style={{ color: "hsl(var(--muted-foreground))", opacity: 0.7 }}
           >
-            Opens your mail app with a short note already written.
+            We'll send a short note from Said.
+            <br />
+            No account needed for them.
           </p>
         </div>
       </div>
