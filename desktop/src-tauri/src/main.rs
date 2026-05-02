@@ -1647,6 +1647,22 @@ async fn watch_for_edit(
                 if resp.learned || resp.pending_id.is_some() {
                     let _ = app.emit("pending-edits-changed", ());
                 }
+
+                // If vocabulary was updated, refresh the hot-path cache now so
+                // the very next recording already uses the newly learned terms.
+                if resp.learned && resp.promoted_count > 0 {
+                    let hot_arc = Arc::clone(&app.state::<HotPathCache>().0);
+                    let ep2 = ep.clone();
+                    tokio::spawn(async move {
+                        if let Ok(terms) = api::get_vocabulary_terms(&ep2).await {
+                            tracing::info!(
+                                "[hot_cache] refreshed after learning — {} term(s) now cached",
+                                terms.len()
+                            );
+                            hot_arc.write().await.keyterms = terms;
+                        }
+                    });
+                }
             }
             Err(e) => {
                 tracing::warn!("[edit-watch] classify_edit call failed: {e}");
