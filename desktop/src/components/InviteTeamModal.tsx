@@ -1,42 +1,14 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
-  X, RefreshCw, Gift, SlidersHorizontal, Monitor, Hash,
-  User, Users, CreditCard, ShieldCheck, ArrowRight, Check, Loader2,
-  CloudCheck,
+  X, RefreshCw, Gift, ArrowRight, Check, Loader2,
 } from "lucide-react";
 
 /* ════════════════════════════════════════════════════════════════════════════
-   InviteTeamModal — two-pane modal with deep navy glass aesthetic.
-   Left pane: settings-style nav (Team highlighted active).
-   Right pane: invite form with promo pill, 3 email fields, Continue CTA.
-   Backdrop: blurred + dimmed.
+   InviteTeamModal — single-pane modal focused on team invitation.
+   Sidebar removed: this modal only does one thing (invite teammates),
+   so the misleading nav (which didn't actually navigate anywhere) is gone.
+   Other Settings live in SettingsModal.
    ════════════════════════════════════════════════════════════════════════════ */
-
-interface NavSection {
-  id:    string;
-  label: string;
-  icon:  React.ReactNode;
-}
-
-const NAV_GROUPS: { heading: string; items: NavSection[] }[] = [
-  {
-    heading: "Settings",
-    items: [
-      { id: "general",     label: "General",     icon: <SlidersHorizontal size={14} /> },
-      { id: "system",      label: "System",      icon: <Monitor          size={14} /> },
-      { id: "vibe-coding", label: "Vibe coding", icon: <Hash             size={14} /> },
-    ],
-  },
-  {
-    heading: "Account",
-    items: [
-      { id: "account", label: "Account",          icon: <User       size={14} /> },
-      { id: "team",    label: "Team",             icon: <Users      size={14} /> },
-      { id: "billing", label: "Plans and Billing", icon: <CreditCard size={14} /> },
-      { id: "privacy", label: "Data and Privacy", icon: <ShieldCheck size={14} /> },
-    ],
-  },
-];
 
 interface Props {
   open:   boolean;
@@ -46,11 +18,9 @@ interface Props {
 const VALID_EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export function InviteTeamModal({ open, onClose }: Props) {
-  const [activeNav,   setActiveNav]   = useState("team");
   const [emails,      setEmails]      = useState<string[]>(["", "", ""]);
   const [submitting,  setSubmitting]  = useState(false);
   const [submitted,   setSubmitted]   = useState(false);
-  const [version]                     = useState("1.5.113");
   const dialogRef = useRef<HTMLDivElement>(null);
 
   // Close on ESC
@@ -69,7 +39,6 @@ export function InviteTeamModal({ open, onClose }: Props) {
       setEmails(["", "", ""]);
       setSubmitting(false);
       setSubmitted(false);
-      setActiveNav("team");
     }
   }, [open]);
 
@@ -114,94 +83,14 @@ export function InviteTeamModal({ open, onClose }: Props) {
         className="rounded-[20px] overflow-hidden flex"
         style={{
           background: "hsl(var(--surface-2))",
-          width:  "min(900px, 92vw)",
+          width:  "min(640px, 92vw)",
           height: "min(620px, 90vh)",
           boxShadow:
             "0 1px 0 hsl(0 0% 100% / 0.06) inset, 0 30px 80px hsl(220 60% 2% / 0.65)",
         }}
       >
 
-        {/* ─────────── LEFT NAV ─────────── */}
-        <aside
-          className="flex flex-col flex-shrink-0"
-          style={{
-            width: 240,
-            background: "hsl(var(--surface-1))",
-            borderRight: "1px solid hsl(var(--surface-4))",
-          }}
-        >
-          <div className="flex-1 overflow-y-auto px-3 pt-4 pb-3 flex flex-col gap-5">
-            {NAV_GROUPS.map((group) => (
-              <section key={group.heading}>
-                <p className="section-label px-3 mb-2 flex items-center gap-2">
-                  <span
-                    className="inline-block w-1 h-1 rounded-full"
-                    style={{ background: "hsl(var(--accent-violet))" }}
-                  />
-                  {group.heading}
-                </p>
-                <div className="space-y-0.5">
-                  {group.items.map((item) => {
-                    const active = item.id === activeNav;
-                    return (
-                      <button
-                        key={item.id}
-                        onClick={() => setActiveNav(item.id)}
-                        className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-[13px] font-medium transition-all text-left"
-                        style={{
-                          background: active ? "hsl(var(--surface-3))" : "transparent",
-                          color:      active ? "hsl(var(--foreground))" : "hsl(var(--muted-foreground))",
-                          fontWeight: active ? 600 : 500,
-                          boxShadow:  active
-                            ? "inset 0 0 0 1px hsl(var(--glass-stroke))"
-                            : "none",
-                        }}
-                        onMouseEnter={(e) => {
-                          if (!active) {
-                            e.currentTarget.style.background = "hsl(var(--surface-hover))";
-                            e.currentTarget.style.color      = "hsl(var(--foreground))";
-                          }
-                        }}
-                        onMouseLeave={(e) => {
-                          if (!active) {
-                            e.currentTarget.style.background = "transparent";
-                            e.currentTarget.style.color      = "hsl(var(--muted-foreground))";
-                          }
-                        }}
-                      >
-                        <span className="flex-shrink-0 opacity-70">{item.icon}</span>
-                        <span className="flex-1 truncate">{item.label}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-              </section>
-            ))}
-          </div>
-
-          {/* Footer — version + cloud sync indicator */}
-          <div
-            className="px-4 py-3 flex items-center justify-between flex-shrink-0"
-            style={{ borderTop: "1px solid hsl(var(--surface-4))" }}
-          >
-            <p className="text-[11px] tabular-nums"
-               style={{ color: "hsl(var(--muted-foreground))" }}>
-              Said v{version}
-            </p>
-            <span
-              className="flex items-center justify-center w-5 h-5 rounded-full"
-              style={{
-                color: "hsl(var(--primary))",
-                background: "hsl(var(--primary) / 0.14)",
-              }}
-              title="All changes synced"
-            >
-              <CloudCheck size={11} />
-            </span>
-          </div>
-        </aside>
-
-        {/* ─────────── RIGHT PANE ─────────── */}
+        {/* Single content pane — sidebar removed; this modal does one thing. */}
         <main className="flex-1 flex flex-col min-w-0 relative overflow-hidden">
 
           {/* Subtle radial wash top-right (matches our app's mesh aesthetic) */}
