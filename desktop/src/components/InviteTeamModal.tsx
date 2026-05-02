@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { X, Send, Check, Loader2, Heart, AlertCircle } from "lucide-react";
-import { sendInviteEmail } from "@/lib/invoke";
+import { sendInviteEmail, openExternal } from "@/lib/invoke";
 
 /* ════════════════════════════════════════════════════════════════════════════
    InviteTeamModal — single-input "invite a friend".
@@ -76,9 +76,11 @@ export function InviteTeamModal({ open, onClose }: Props) {
 
       if (result.status === "fallback_mailto") {
         // Backend has no provider — open the user's mail app with the note pre-written.
+        // Tauri's webview silently blocks window.open for mailto:, so route through
+        // the native opener.
         const subject = encodeURIComponent(MAIL_SUBJECT);
         const body    = encodeURIComponent(MAIL_BODY);
-        window.open(`mailto:${trimmed}?subject=${subject}&body=${body}`, "_blank");
+        await openExternal(`mailto:${trimmed}?subject=${subject}&body=${body}`);
       }
 
       setState({ kind: "sent" });

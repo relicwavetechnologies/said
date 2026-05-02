@@ -629,6 +629,27 @@ export async function starVocabularyTerm(term: string): Promise<boolean> {
   }
 }
 
+// ── External URL opener ─────────────────────────────────────────────────────
+
+/**
+ * Open a URL (https://, mailto:) in the OS default handler.
+ * In a browser, falls back to `window.open` so dev mode in a normal browser
+ * still works. In Tauri, calls the native opener so mailto: actually launches
+ * the user's mail client (window.open silently fails in the webview).
+ */
+export async function openExternal(url: string): Promise<void> {
+  if (!isTauriRuntime()) {
+    window.open(url, "_blank");
+    return;
+  }
+  try {
+    await tauriInvoke("open_external", { url });
+  } catch {
+    // Last-ditch fallback so the user is never left with nothing happening.
+    window.open(url, "_blank");
+  }
+}
+
 // ── Invite a friend ─────────────────────────────────────────────────────────
 
 export type InviteOutcome =

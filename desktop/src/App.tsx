@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback } from "react";
-import { X, Mic } from "lucide-react";
+import { X, AlertCircle, Loader2, ArrowRight } from "lucide-react";
 import { Sidebar } from "@/components/Sidebar";
+import { BrandMark } from "@/components/BrandMark";
 import { InviteTeamModal } from "@/components/InviteTeamModal";
 import { SettingsModal } from "@/components/SettingsModal";
 import { Topbar } from "@/components/Topbar";
@@ -406,12 +407,13 @@ export default function App() {
 
   /* ── Auth gate ──────────────────────────────────────────────────────────── */
   if (needsAuth === null || openAIConnected === null) {
-    // Still checking — show a bare loading screen
+    // Still checking — bare loading splash with the same brand as the auth screens
     return (
-      <div className="flex h-screen w-screen items-center justify-center bg-background">
-        <div className="flex flex-col items-center gap-3 opacity-60">
-          <Mic size={28} />
-          <span className="text-sm">Starting…</span>
+      <div className="flex h-screen w-screen items-center justify-center"
+           style={{ background: "hsl(var(--background))" }}>
+        <div className="flex flex-col items-center gap-3">
+          <BrandMark size={36} idSuffix="loading" className="opacity-70" />
+          <span className="text-[12px] text-muted-foreground">Starting Said…</span>
         </div>
       </div>
     );
@@ -419,65 +421,135 @@ export default function App() {
 
   if (needsAuth) {
     return (
-      <div className="flex h-screen w-screen items-center justify-center bg-background">
-        <div className="w-full max-w-sm flex flex-col gap-6 p-8 rounded-2xl" style={{ background: "hsl(var(--surface-2))" }}>
+      <div className="flex h-screen w-screen items-center justify-center relative overflow-hidden"
+           style={{ background: "hsl(var(--background))" }}>
 
-          {/* Brand */}
-          <div className="flex flex-col items-center gap-2 mb-2">
-            <Mic size={32} className="opacity-80" />
-            <h1 className="text-xl font-semibold tracking-tight">Said</h1>
-            <p className="text-xs text-muted-foreground text-center">Voice Polish Studio</p>
-          </div>
+        {/* Mint hero glow — same wash used on the dashboard + invite modal */}
+        <div
+          aria-hidden
+          className="absolute pointer-events-none"
+          style={{
+            top: "-15%", left: "50%", transform: "translateX(-50%)",
+            width: 640, height: 640, borderRadius: "50%",
+            background: "radial-gradient(circle, hsl(var(--primary) / 0.10) 0%, transparent 65%)",
+          }}
+        />
 
-          {/* Mode toggle */}
-          <div className="flex gap-1 p-1 rounded-xl" style={{ background: "hsl(var(--surface-1))" }}>
-            {(["login", "signup"] as const).map((m) => (
-              <button
-                key={m}
-                onClick={() => { setAuthMode(m); setAuthError(""); }}
-                className={`flex-1 py-1.5 text-xs font-medium rounded-lg transition-all ${authMode === m ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground"}`}
+        <div
+          className="relative w-full max-w-[400px] flex flex-col p-9 rounded-[20px]"
+          style={{
+            background: "hsl(var(--surface-2))",
+            boxShadow:
+              "inset 0 1px 0 hsl(0 0% 100% / 0.06), 0 30px 80px hsl(220 60% 2% / 0.55)",
+          }}
+        >
+
+          {/* Brand — same mark as the sidebar so it reads instantly */}
+          <div className="flex flex-col items-center gap-3 mb-7">
+            <BrandMark size={56} idSuffix="auth-login" />
+            <div className="text-center">
+              <h1
+                className="text-[22px] font-extrabold tracking-tight"
+                style={{ color: "hsl(var(--foreground))", letterSpacing: "-0.02em" }}
               >
-                {m === "login" ? "Sign in" : "Create account"}
-              </button>
-            ))}
+                {authMode === "login" ? "Welcome back" : "Welcome to Said"}
+              </h1>
+              <p className="text-[12.5px] text-muted-foreground mt-1">
+                {authMode === "login"
+                  ? "Sign in to sync your vocabulary and history."
+                  : "Voice that sounds like you. Free while we're early."}
+              </p>
+            </div>
           </div>
 
-          {/* Form */}
-          <form onSubmit={handleAuthSubmit} className="flex flex-col gap-3">
+          {/* Mode toggle — uses the same .pill pattern as the rest of the app */}
+          <div
+            className="flex gap-1 p-1 rounded-xl mb-5"
+            style={{ background: "hsl(var(--surface-1))" }}
+          >
+            {(["login", "signup"] as const).map((m) => {
+              const isActive = authMode === m;
+              return (
+                <button
+                  key={m}
+                  onClick={() => { setAuthMode(m); setAuthError(""); }}
+                  className="flex-1 py-1.5 text-[12px] font-semibold rounded-lg transition-all"
+                  style={{
+                    background: isActive ? "hsl(var(--pill-active-bg))" : "transparent",
+                    color:      isActive ? "hsl(var(--pill-active-fg))" : "hsl(var(--muted-foreground))",
+                    boxShadow:  isActive ? "0 4px 12px hsl(var(--pill-active-bg) / 0.25)" : "none",
+                  }}
+                >
+                  {m === "login" ? "Sign in" : "Create account"}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Form — uses the shared .input class so focus/hover match every other field */}
+          <form onSubmit={handleAuthSubmit} className="flex flex-col gap-2.5">
             <input
               type="email"
-              placeholder="Email"
+              placeholder="you@example.com"
+              autoComplete="email"
               value={authEmail}
               onChange={(e) => setAuthEmail(e.target.value)}
               required
-              className="w-full px-3 py-2 text-sm rounded-lg bg-background border border-border outline-none focus:ring-1 focus:ring-foreground/30"
+              className="input"
+              style={{ fontSize: 13.5 }}
             />
             <input
               type="password"
               placeholder="Password"
+              autoComplete={authMode === "login" ? "current-password" : "new-password"}
               value={authPass}
               onChange={(e) => setAuthPass(e.target.value)}
               required
-              className="w-full px-3 py-2 text-sm rounded-lg bg-background border border-border outline-none focus:ring-1 focus:ring-foreground/30"
+              className="input"
+              style={{ fontSize: 13.5 }}
             />
+
             {authError && (
-              <p className="text-xs text-red-400 px-1">{authError}</p>
+              <div
+                className="flex items-center gap-2 px-3 py-2 rounded-lg mt-1"
+                style={{
+                  background: "hsl(354 78% 60% / 0.10)",
+                  color:      "hsl(354 78% 75%)",
+                  boxShadow:  "inset 0 0 0 1px hsl(354 78% 60% / 0.25)",
+                }}
+              >
+                <AlertCircle size={13} className="flex-shrink-0" />
+                <span className="text-[12px] font-medium">{authError}</span>
+              </div>
             )}
+
+            {/* Primary CTA — same .btn-primary as every other primary action */}
             <button
               type="submit"
               disabled={authBusy || !authEmail || !authPass}
-              className="w-full py-2 text-sm font-medium rounded-lg bg-foreground text-background disabled:opacity-40 transition-opacity"
+              className="btn-primary mt-3 w-full justify-center py-2.5 rounded-xl"
+              style={{ fontSize: 13.5 }}
             >
-              {authBusy ? "…" : authMode === "login" ? "Sign in" : "Create account"}
+              {authBusy ? (
+                <>
+                  <Loader2 size={14} className="animate-spin" />
+                  {authMode === "login" ? "Signing in…" : "Creating account…"}
+                </>
+              ) : (
+                <>
+                  {authMode === "login" ? "Sign in" : "Create account"}
+                  <ArrowRight size={13} />
+                </>
+              )}
             </button>
           </form>
 
-          {/* Skip option — for offline / dev use */}
+          {/* Offline escape — quiet, single line */}
           <button
             onClick={() => setNeedsAuth(false)}
-            className="text-xs text-muted-foreground hover:text-foreground text-center transition-colors"
+            className="text-[11.5px] text-muted-foreground hover:text-foreground text-center transition-colors mt-5"
           >
-            Continue without account (offline mode)
+            Continue without an account
           </button>
         </div>
       </div>
@@ -487,46 +559,81 @@ export default function App() {
   /* ── OpenAI connection gate (required — no skip) ───────────────────────── */
   if (!openAIConnected) {
     return (
-      <div className="flex h-screen w-screen items-center justify-center bg-background">
-        <div className="w-full max-w-sm flex flex-col gap-6 p-8 rounded-2xl" style={{ background: "hsl(var(--surface-2))" }}>
+      <div className="flex h-screen w-screen items-center justify-center relative overflow-hidden"
+           style={{ background: "hsl(var(--background))" }}>
 
-          {/* Brand */}
-          <div className="flex flex-col items-center gap-2 mb-2">
-            <Mic size={32} className="opacity-80" />
-            <h1 className="text-xl font-semibold tracking-tight">Said</h1>
-            <p className="text-xs text-muted-foreground text-center">Voice Polish Studio</p>
-          </div>
+        {/* Same hero glow so the two auth steps feel like one flow */}
+        <div
+          aria-hidden
+          className="absolute pointer-events-none"
+          style={{
+            top: "-15%", left: "50%", transform: "translateX(-50%)",
+            width: 640, height: 640, borderRadius: "50%",
+            background: "radial-gradient(circle, hsl(var(--primary) / 0.10) 0%, transparent 65%)",
+          }}
+        />
 
-          {/* Copy */}
-          <div className="flex flex-col items-center gap-2 text-center">
-            <p className="text-sm font-medium">Connect your ChatGPT account</p>
-            <p className="text-xs text-muted-foreground leading-relaxed">
-              Said uses your OpenAI account to polish your voice recordings. Connect once — it works silently from there.
-            </p>
+        <div
+          className="relative w-full max-w-[400px] flex flex-col p-9 rounded-[20px]"
+          style={{
+            background: "hsl(var(--surface-2))",
+            boxShadow:
+              "inset 0 1px 0 hsl(0 0% 100% / 0.06), 0 30px 80px hsl(220 60% 2% / 0.55)",
+          }}
+        >
+
+          {/* Brand — identical to the sign-in step, just the body copy changes */}
+          <div className="flex flex-col items-center gap-3 mb-7">
+            <BrandMark size={56} idSuffix="auth-openai" />
+            <div className="text-center">
+              <h1
+                className="text-[22px] font-extrabold tracking-tight"
+                style={{ color: "hsl(var(--foreground))", letterSpacing: "-0.02em" }}
+              >
+                One last step
+              </h1>
+              <p className="text-[12.5px] text-muted-foreground mt-1 leading-relaxed max-w-[300px] mx-auto">
+                Said uses your ChatGPT account to polish your voice. Connect once — it works silently from there.
+              </p>
+            </div>
           </div>
 
           {connectError && (
-            <p className="text-xs text-red-400 text-center px-1">{connectError}</p>
+            <div
+              className="flex items-center gap-2 px-3 py-2 rounded-lg mb-3"
+              style={{
+                background: "hsl(354 78% 60% / 0.10)",
+                color:      "hsl(354 78% 75%)",
+                boxShadow:  "inset 0 0 0 1px hsl(354 78% 60% / 0.25)",
+              }}
+            >
+              <AlertCircle size={13} className="flex-shrink-0" />
+              <span className="text-[12px] font-medium">{connectError}</span>
+            </div>
           )}
 
-          {/* CTA */}
+          {/* CTA — same .btn-primary token as the rest of the app */}
           <button
             onClick={handleOpenAIConnect}
             disabled={connectBusy}
-            className="w-full py-2.5 text-sm font-medium rounded-lg bg-foreground text-background disabled:opacity-40 transition-opacity flex items-center justify-center gap-2"
+            className="btn-primary w-full justify-center py-2.5 rounded-xl"
+            style={{ fontSize: 13.5 }}
           >
             {connectBusy ? (
               <>
-                <span className="inline-block w-3 h-3 rounded-full border border-background/30 border-t-background animate-spin" />
+                <Loader2 size={14} className="animate-spin" />
                 Waiting for browser…
               </>
             ) : (
-              "Connect OpenAI account →"
+              <>
+                Connect ChatGPT account
+                <ArrowRight size={13} />
+              </>
             )}
           </button>
 
           {connectBusy && (
-            <p className="text-xs text-muted-foreground text-center leading-relaxed">
+            <p className="text-[11.5px] text-muted-foreground text-center leading-relaxed mt-4">
               Complete the sign-in in your browser. This window will update automatically.
             </p>
           )}

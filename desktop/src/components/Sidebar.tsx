@@ -9,6 +9,8 @@ import {
   UserPlus,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { openExternal } from "@/lib/invoke";
+import { BrandMark } from "@/components/BrandMark";
 import type { AppSnapshot } from "@/types";
 
 // ── Nav item type ──────────────────────────────────────────────────────────────
@@ -94,63 +96,9 @@ export function Sidebar({ snapshot, activeView, onViewChange, busy, onOpenInvite
         {/* 70px left pad for macOS native traffic lights */}
         <div data-tauri-drag-region className="w-[70px] flex-shrink-0" />
 
-        {/* Brand mark — cyan tile with stylized quotation glyph */}
+        {/* Brand mark — single source of truth in BrandMark.tsx */}
         <div className="no-drag" title="Said — Voice Polish Studio">
-          <svg
-            width="32"
-            height="32"
-            viewBox="0 0 32 32"
-            fill="none"
-            xmlns="http://www.w3.org/2000/svg"
-          >
-            {/* Rounded mint-green tile with subtle gradient */}
-            <defs>
-              <linearGradient id="brand-grad" x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
-                <stop offset="0%"  stopColor="hsl(105 80% 72%)" />
-                <stop offset="100%" stopColor="hsl(160 70% 55%)" />
-              </linearGradient>
-            </defs>
-            <rect width="32" height="32" rx="9" fill="url(#brand-grad)" />
-
-            {/* Two opening curly-quote glyphs */}
-            <path
-              d="
-                M 9.5 11
-                C 9.5 9 11 8 12.5 8
-                L 12.5 9.5
-                C 11.7 9.5 11.2 10 11.2 10.7
-                L 12.7 10.7
-                C 13.4 10.7 13.7 11.2 13.7 12
-                L 13.7 14.5
-                C 13.7 15.3 13.2 15.8 12.4 15.8
-                L 10.8 15.8
-                C 10 15.8 9.5 15.3 9.5 14.5
-                Z
-                M 17.5 11
-                C 17.5 9 19 8 20.5 8
-                L 20.5 9.5
-                C 19.7 9.5 19.2 10 19.2 10.7
-                L 20.7 10.7
-                C 21.4 10.7 21.7 11.2 21.7 12
-                L 21.7 14.5
-                C 21.7 15.3 21.2 15.8 20.4 15.8
-                L 18.8 15.8
-                C 18 15.8 17.5 15.3 17.5 14.5
-                Z
-              "
-              fill="white"
-            />
-
-            {/* Voice motif baseline wave */}
-            <path
-              d="M 9 21 Q 12 19 14 21 T 19 21 T 23 21"
-              stroke="white"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              strokeOpacity="0.65"
-              fill="none"
-            />
-          </svg>
+          <BrandMark size={32} idSuffix="sidebar" />
         </div>
       </div>
 
@@ -236,10 +184,7 @@ export function Sidebar({ snapshot, activeView, onViewChange, busy, onOpenInvite
         <button
           className="nav-item"
           onClick={() => {
-            window.open(
-              "mailto:support@emiactech.com?subject=Said%20support",
-              "_blank",
-            );
+            openExternal("mailto:support@emiactech.com?subject=Said%20support");
           }}
         >
           <span className="flex-shrink-0 opacity-70">

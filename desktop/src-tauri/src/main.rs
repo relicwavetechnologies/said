@@ -1462,6 +1462,42 @@ async fn send_invite_email(
     }
 }
 
+// ── External URL opener ───────────────────────────────────────────────────────
+
+/// Open a URL (https://, mailto:, etc.) in the user's default app.
+///
+/// Tauri's webview blocks `window.open("mailto:…")` silently — calls fall
+/// through to the browser's noop handler, so the user sees nothing happen.
+/// This command shells out to the OS opener instead.
+#[tauri::command]
+fn open_external(url: String) -> Result<(), String> {
+    use std::process::Command;
+
+    // Defence in depth: only allow safe schemes. We never pass arbitrary
+    // shell to `open` (it's argv-based) but reject schemes that don't make
+    // sense for a "click a link" handler.
+    let lower = url.to_ascii_lowercase();
+    let ok    = lower.starts_with("https://")
+             || lower.starts_with("http://")
+             || lower.starts_with("mailto:");
+    if !ok {
+        return Err(format!("refusing to open scheme: {url}"));
+    }
+
+    #[cfg(target_os = "macos")]
+    let result = Command::new("open").arg(&url).spawn();
+
+    #[cfg(target_os = "windows")]
+    let result = Command::new("cmd").args(["/C", "start", "", &url]).spawn();
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = Command::new("xdg-open").arg(&url).spawn();
+
+    result
+        .map(|_| ())
+        .map_err(|e| format!("failed to open: {e}"))
+}
+
 // ── Cloud auth commands ───────────────────────────────────────────────────────
 
 /// Cloud URL — read from env, default to the hosted service.
@@ -2433,6 +2469,8 @@ fn main() {
             star_vocabulary_term,
             // Invite a friend
             send_invite_email,
+            // External URL opener (mailto:, https://) — Tauri webview blocks window.open
+            open_external,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Voice Polish desktop")
