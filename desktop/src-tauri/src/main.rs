@@ -39,16 +39,6 @@ use voice_polish_hotkey as hotkey;
 /// position and picking the candidate that preserves the most surrounding text
 /// (i.e., the smallest local edit).
 #[cfg(target_os = "macos")]
-/// Count of keystroke events recorded since `since`.  Cheap probe used by
-/// the AX-blind clipboard-snapshot trigger to know when the user has typed
-/// something since paste.  Returns 0 if the buffer is unavailable.
-#[cfg(target_os = "macos")]
-fn count_keystrokes_since(since: std::time::Instant) -> usize {
-    let buf = hotkey::key_buffer();
-    let Ok(guard) = buf.lock() else { return 0 };
-    guard.iter().filter(|t| t.when >= since).count()
-}
-
 fn reconstruct_from_keystrokes(
     initial: &str,
     since:   std::time::Instant,
@@ -1381,24 +1371,6 @@ async fn watch_for_edit(
     let mut best_candidate = post_paste.clone();
     let mut idle_at  = Instant::now();
     let started      = Instant::now();
-    let is_ax_blind  = post_paste.is_empty();
-
-    // ── AX-blind early-snapshot state ────────────────────────────────────────
-    //
-    // Foundational rule: in AX-blind apps (Claude input, Lark, Chrome
-    // contenteditable…) we get NO real-time read of the field during the
-    // loop.  The only way to capture the actual final text is via clipboard
-    // (Cmd+A+C).  We used to do this ONLY at the end — but if the user
-    // switched apps before the 8s idle window completed, the clipboard
-    // captured the wrong app and edit-watch silently skipped.
-    //
-    // Fix: in AX-blind mode, snapshot the clipboard the FIRST time we detect
-    // user keystrokes followed by ~1.5s of idle.  The snapshot is taken
-    // while still in the same app, so it remains valid even if the user
-    // switches apps later.  Re-snapshot if user types more after a long pause.
-    let mut ax_blind_snapshot: Option<String> = None;
-    let mut last_keystroke_count: usize = 0;
-    let mut last_snapshot_time: Option<Instant> = None;
 
     tracing::info!(
         "[edit-watch] watching {recording_id} — initial field readable: {} (len={})",
@@ -1406,7 +1378,10 @@ async fn watch_for_edit(
         post_paste.len(),
     );
 
-    // Poll loop: 30 ms cadence.
+    // Poll loop: 30 ms cadence.  No mid-loop side effects — we only read AX
+    // and watch for app switches.  Clipboard verification (Cmd+A+C) is
+    // strictly an end-of-loop, same-app operation; doing it during the loop
+    // disrupts the user's typing in AX-blind apps like Claude input.
     loop {
         tokio::time::sleep(Duration::from_millis(30)).await;
 
@@ -1430,45 +1405,6 @@ async fn watch_for_edit(
                 best_candidate = now_val.clone();
             }
             last_val = now_val;
-        }
-
-        // ── AX-blind early-snapshot trigger ──────────────────────────────────
-        //
-        // Trigger when: AX-blind, user has typed at least one key since
-        // watch_start, and they've been keyboard-idle for ≥ 1.5 s.
-        // Re-snapshot at most every 3 s so a long edit refreshes our view.
-        #[cfg(target_os = "macos")]
-        if is_ax_blind {
-            let keystroke_count = count_keystrokes_since(watch_start);
-            let typed_something = keystroke_count > 0;
-            let new_keystrokes  = keystroke_count > last_keystroke_count;
-            if new_keystrokes {
-                last_keystroke_count = keystroke_count;
-            }
-            let idle_for = idle_at.elapsed();
-            let snap_due = typed_something
-                && idle_for >= Duration::from_millis(1500)
-                && last_snapshot_time.map_or(true, |t| t.elapsed() >= Duration::from_secs(3));
-            if snap_due {
-                tracing::info!(
-                    "[edit-watch] AX-blind snapshot trigger ({keystroke_count} keystrokes, idle {:.1}s)",
-                    idle_for.as_secs_f64()
-                );
-                let cb_text = tokio::task::spawn_blocking(paster::capture_focused_text_via_selection)
-                    .await
-                    .unwrap_or(None);
-                if let Some(text) = cb_text {
-                    let trimmed = text.trim().to_string();
-                    if trimmed.contains(polished.trim()) {
-                        ax_blind_snapshot = Some(trimmed);
-                        last_snapshot_time = Some(Instant::now());
-                        tracing::info!(
-                            "[edit-watch] AX-blind clipboard snapshot captured ({} chars) — preserved against future app switch",
-                            ax_blind_snapshot.as_ref().map(|s| s.len()).unwrap_or(0)
-                        );
-                    }
-                }
-            }
         }
 
         let done = idle_at.elapsed() > Duration::from_secs(8)  // 8s idle — user stopped typing
@@ -1550,23 +1486,16 @@ async fn watch_for_edit(
             // 1. Run keystroke replay (no side effects).
             let ks_result = reconstruct_from_keystrokes(&polished, watch_start);
 
-            // 2. Source-of-truth clipboard text.  Two pathways:
-            //    a) ax_blind_snapshot — captured DURING the loop while still in
-            //       the same app.  Survives app switches, so this is preferred
-            //       whenever it's available.  Foundational fix for Claude/
-            //       Electron/Lark-style targets.
-            //    b) end-of-loop clipboard read — only meaningful if same_app.
-            //       Mid-loop snapshot makes this a fallback.
+            // 2. End-of-loop clipboard read — only meaningful if still in the
+            //    same app.  Doing this DURING the loop would disrupt typing
+            //    (Cmd+A selects the user's content), so we only do it once at
+            //    the end.
+            //
+            //    AX-blind + app-switched scenarios cannot be captured cleanly
+            //    from a third-party tool; we accept that as a structural limit
+            //    rather than disrupt the user mid-edit.
             let polished_trimmed = polished.trim();
-
-            let cb_kept: Option<String> = if let Some(snap) = ax_blind_snapshot.clone() {
-                // Snapshot captured mid-loop while still in the original app.
-                if snap.contains(polished_trimmed) {
-                    let edited = extract_kept(polished_trimmed, polished_trimmed, &snap);
-                    if edited == polished_trimmed { None } else { Some(edited) }
-                } else { None }
-            } else if same_app {
-                // No mid-loop snapshot but still in same app — try clipboard now.
+            let cb_kept: Option<String> = if same_app {
                 let cb_result = tokio::task::spawn_blocking(paster::capture_focused_text_via_selection)
                     .await
                     .unwrap_or(None);
@@ -1579,11 +1508,8 @@ async fn watch_for_edit(
                     if edited == polished_trimmed { None } else { Some(edited) }
                 })
             } else {
-                // App switched and we have no mid-loop snapshot — clipboard is
-                // useless (would capture wrong app).  Keystroke is the only
-                // available signal but unreliable, so it'll be marked LOW.
                 tracing::warn!(
-                    "[edit-watch] AX-blind + app switched + no mid-loop snapshot — clipboard unreachable for {recording_id}"
+                    "[edit-watch] AX-blind + app switched — clipboard unreachable for {recording_id}"
                 );
                 None
             };
