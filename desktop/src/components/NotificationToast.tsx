@@ -1,41 +1,77 @@
 import React, { useEffect } from "react";
-import { X, RotateCcw, Check, Sparkles, BookOpen, Star, Undo2 } from "lucide-react";
+import { X, RotateCcw, Check, Sparkles, BookOpen, Star, Undo2, History } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 // ── Retry Toast ───────────────────────────────────────────────────────────────
+//
+// Surfaces a recording / STT / polish failure with three affordances:
+//   • Retry        — re-runs the pipeline with the saved WAV (only if audioId)
+//   • Open history — navigates to the History view to inspect what landed
+//   • Dismiss      — closes the toast
+//
+// Retry is disabled (greyed out) when no audioId is available so users
+// understand why it's missing instead of silently no-op'ing.
 
 interface RetryToastProps {
-  message:  string;
-  onRetry:  () => void;
-  onDismiss: () => void;
+  message:        string;
+  canRetry:       boolean;
+  onRetry:        () => void;
+  onOpenHistory:  () => void;
+  onDismiss:      () => void;
 }
 
-export function RetryToast({ message, onRetry, onDismiss }: RetryToastProps) {
+export function RetryToast({
+  message, canRetry, onRetry, onOpenHistory, onDismiss,
+}: RetryToastProps) {
   return (
     <div
-      className="fixed bottom-5 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 px-4 py-3 rounded-2xl shadow-xl max-w-sm w-max"
+      className="fixed bottom-5 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 px-4 py-3 rounded-2xl shadow-xl max-w-md w-max"
       style={{
         background:  "hsl(var(--surface-3))",
         border:      "1px solid hsl(var(--border))",
         boxShadow:   "0 8px 32px hsl(0 0% 0% / 0.28)",
+        animation:   "fadeIn 0.18s ease-out",
       }}
     >
-      {/* Red dot */}
+      {/* Red accent circle */}
       <span
-        className="w-2 h-2 rounded-full flex-shrink-0"
-        style={{ background: "hsl(0 70% 60%)" }}
-      />
+        className="w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0"
+        style={{ background: "hsl(0 70% 60% / 0.16)", color: "hsl(0 70% 60%)" }}
+      >
+        <X size={13} strokeWidth={2.5} />
+      </span>
 
-      {/* Message */}
-      <p className="text-[12px] text-foreground leading-snug max-w-[200px] truncate" title={message}>
-        {message}
-      </p>
+      {/* Two-line message */}
+      <div className="flex-1 min-w-0">
+        <p className="text-[12px] font-semibold text-foreground leading-tight">
+          Recording failed
+        </p>
+        <p className="text-[11px] text-muted-foreground leading-tight mt-0.5 truncate" title={message}>
+          {message}
+        </p>
+      </div>
 
       {/* Actions */}
-      <div className="flex items-center gap-1.5 flex-shrink-0 ml-1">
+      <div className="flex items-center gap-1.5 flex-shrink-0">
+        <button
+          onClick={onOpenHistory}
+          title="Open history"
+          className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-colors"
+          style={{
+            background: "hsl(var(--surface-4))",
+            color:      "hsl(var(--foreground))",
+          }}
+          onMouseEnter={(e) => { e.currentTarget.style.background = "hsl(var(--surface-hover))"; }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = "hsl(var(--surface-4))"; }}
+        >
+          <History size={11} />
+          History
+        </button>
         <button
           onClick={onRetry}
-          className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-colors"
+          disabled={!canRetry}
+          title={canRetry ? "Retry the recording" : "No saved audio to retry"}
+          className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
           style={{
             background: "hsl(var(--primary))",
             color:      "hsl(var(--primary-foreground))",
@@ -46,6 +82,7 @@ export function RetryToast({ message, onRetry, onDismiss }: RetryToastProps) {
         </button>
         <button
           onClick={onDismiss}
+          title="Dismiss"
           className="w-6 h-6 rounded-lg flex items-center justify-center transition-colors opacity-50 hover:opacity-100"
           style={{ background: "hsl(var(--surface-4))" }}
         >

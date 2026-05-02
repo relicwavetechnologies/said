@@ -596,6 +596,7 @@ export default function App() {
       {retryToast && (
         <RetryToast
           message={retryToast.message}
+          canRetry={retryToast.audioId.length > 0}
           onRetry={async () => {
             setRetryToast(null);
             if (retryToast.audioId) {
@@ -605,6 +606,10 @@ export default function App() {
                 setErrorBanner(e instanceof Error ? e.message : String(e));
               }
             }
+          }}
+          onOpenHistory={() => {
+            setRetryToast(null);
+            handleViewChange("history");
           }}
           onDismiss={() => setRetryToast(null)}
         />
