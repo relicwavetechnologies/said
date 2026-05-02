@@ -200,7 +200,22 @@ export function SettingsView({
   }
 
   useEffect(() => {
-    checkNotificationPermission().then(setNotifPerm);
+    let alive = true;
+    const refresh = () => {
+      checkNotificationPermission().then((p) => {
+        if (alive) setNotifPerm(p);
+      });
+    };
+    refresh();
+    // Re-check when the user comes back to the window (after toggling perms
+    // in System Settings) or when the tab becomes visible again
+    window.addEventListener("focus",            refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      alive = false;
+      window.removeEventListener("focus",            refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
   }, []);
 
   async function handleNotifTest() {
@@ -350,7 +365,22 @@ export function SettingsView({
       if (geminiKey   && !geminiKey.startsWith("••"))    update.gemini_api_key   = geminiKey;
       if (groqKey     && !groqKey.startsWith("••"))      update.groq_api_key     = groqKey;
       const updated = await patchPreferences(update);
-      if (updated) setPrefs(updated);
+      if (updated) {
+        setPrefs(updated);
+        // Re-mask the inputs to bullets so the UI clearly reflects "saved"
+        // (otherwise the user keeps seeing the raw key they just typed and
+        // wonders whether it persisted)
+        const MASK = "••••••••••••••••";
+        if (updated.gateway_api_key)  setGatewayKey(MASK);
+        if (updated.deepgram_api_key) setDeepgramKey(MASK);
+        if (updated.gemini_api_key)   setGeminiKey(MASK);
+        if (updated.groq_api_key)     setGroqKey(MASK);
+        // Hide reveal-toggles after save so bullets aren't accidentally exposed
+        setShowGateway(false);
+        setShowDeepgram(false);
+        setShowGemini(false);
+        setShowGroq(false);
+      }
       // Show brief "Saved ✓" feedback
       setKeySaved(true);
       if (keySaveTimer.current) clearTimeout(keySaveTimer.current);

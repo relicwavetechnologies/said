@@ -497,7 +497,11 @@ export async function disconnectOpenAI(): Promise<void> {
 // ── Notification permission ───────────────────────────────────────────────────
 
 // isPermissionGranted() returns a PermissionState string: "granted" | "denied" | "prompt"
-// requestPermission()   returns a PermissionState string — does NOT re-prompt if already "denied"
+// IMPORTANT — Tauri plugin-notification surface:
+//   isPermissionGranted()  returns Promise<boolean>      (NOT a string!)
+//   requestPermission()    returns Promise<"granted"|"denied"|"default">
+// The previous version cast the boolean as a string, so `true` never matched
+// "granted" and the UI was permanently stuck on "Allow".
 
 export type NotifPermission = "granted" | "denied" | "prompt" | "unknown";
 
@@ -506,9 +510,10 @@ export async function checkNotificationPermission(): Promise<NotifPermission> {
   if (!isTauriRuntime()) return "unknown";
   try {
     const { isPermissionGranted } = await import("@tauri-apps/plugin-notification");
-    const state = await isPermissionGranted();
-    // The plugin returns a PermissionState string
-    return (state as NotifPermission) ?? "unknown";
+    const granted = await isPermissionGranted();
+    if (granted === true)  return "granted";
+    if (granted === false) return "prompt";
+    return "unknown";
   } catch {
     return "unknown";
   }
@@ -523,11 +528,12 @@ export async function requestNotifications(): Promise<NotifPermission> {
     const { isPermissionGranted, requestPermission } = await import(
       "@tauri-apps/plugin-notification"
     );
-    const current = await isPermissionGranted();
-    if (current === "granted") return "granted";
-    // Will show the system dialog if state is "prompt"; silently returns "denied" if already denied
+    if (await isPermissionGranted() === true) return "granted";
+    // requestPermission returns "granted" | "denied" | "default"
     const result = await requestPermission();
-    return (result as NotifPermission) ?? "denied";
+    if (result === "granted") return "granted";
+    if (result === "denied")  return "denied";
+    return "prompt";   // "default" → still un-decided; treat as prompt-able
   } catch {
     return "unknown";
   }

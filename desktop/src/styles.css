@@ -99,43 +99,43 @@
     --topbar-height:        56px;
   }
 
-  /* ── LIGHT — cool lavender floor + pure white tiles + black active ── */
+  /* ── LIGHT — Sentinel-inspired: pure whites, mint accent, subtle borders ── */
   [data-theme="light"] {
-    --background:           220 18% 92%;       /* cool lavender-gray floor */
-    --foreground:           220 28% 12%;
+    --background:           220 14% 97%;       /* near-white floor (sidebar/topbar) */
+    --foreground:           220 18% 10%;       /* near-black text */
     --card:                 0 0% 100%;
-    --card-foreground:      220 28% 12%;
+    --card-foreground:      220 18% 10%;
     --popover:              0 0% 100%;
-    --popover-foreground:   220 28% 12%;
+    --popover-foreground:   220 18% 10%;
 
-    --primary:              160 70% 38%;       /* deeper mint-teal for white bg */
+    --primary:              150 65% 38%;       /* deep mint green (matches reference) */
     --primary-foreground:   0 0% 100%;
 
-    --accent-violet:        258 70% 52%;       /* deeper violet for white bg */
-    --accent-violet-soft:   258 70% 52% / 0.14;
+    --accent-violet:        150 65% 38%;       /* alias to mint — drop violet entirely */
+    --accent-violet-soft:   150 65% 38% / 0.10;
 
     --secondary:            220 14% 96%;
-    --secondary-foreground: 220 28% 18%;
-    --muted:                220 14% 94%;
-    --muted-foreground:     220 10% 42%;
+    --secondary-foreground: 220 18% 18%;
+    --muted:                220 14% 96%;
+    --muted-foreground:     220 8% 45%;
 
-    --accent:               160 70% 38%;
+    --accent:               150 65% 38%;
     --accent-foreground:    0 0% 100%;
 
     --destructive:          354 78% 50%;
     --destructive-foreground: 0 0% 100%;
 
-    --border:               220 14% 88%;
-    --input:                220 14% 90%;
-    --ring:                 160 70% 38%;
+    --border:               220 14% 90%;       /* subtle Sentinel-style 1px border */
+    --input:                220 14% 96%;
+    --ring:                 150 65% 38%;
 
     --recording:            354 78% 52%;
 
     /* ── Surface hierarchy (light) ─────────────────────────────────── */
-    --surface-1:            220 18% 92%;       /* sidebar / page floor */
+    --surface-1:            220 14% 97%;       /* sidebar / page floor */
     --surface-2:            0 0% 100%;         /* mat (pure white)      */
-    --surface-3:            0 0% 100%;         /* tile (pure white + shadow) */
-    --surface-4:            220 12% 88%;       /* chip / backplate / chart track — DARKER for visibility */
+    --surface-3:            0 0% 100%;         /* tile (pure white + 1px border) */
+    --surface-4:            220 14% 94%;       /* chip / backplate / chart track */
     --surface-hover:        220 14% 96%;
 
     /* ── Glass tokens (light) ──────────────────────────────────────── */
@@ -180,10 +180,8 @@
       0 24px 60px hsl(220 28% 20% / 0.18);
 
     /* Soft mesh on light floor — barely-there cyan + lavender wash */
-    --mesh-bg:
-      radial-gradient(55% 40% at 8% 0%,  hsl(190 90% 60% / 0.10) 0%, transparent 60%),
-      radial-gradient(50% 40% at 100% 6%, hsl(260 70% 65% / 0.08) 0%, transparent 60%),
-      radial-gradient(60% 50% at 50% 100%, hsl(200 70% 70% / 0.06) 0%, transparent 60%);
+    /* Sentinel-style: NO mesh wash on light bg — keep it pure white */
+    --mesh-bg: none;
   }
 
   * {
@@ -282,10 +280,17 @@
       inset 0 1px 0 hsl(0 0% 100% / 0.04),
       0 1px 2px hsl(235 50% 2% / 0.20);
   }
-  /* Panel — same as tile but with slightly larger radius for hero panels */
+  /* Panel — Sentinel-style: white card with subtle 1px border + soft shadow */
   .panel {
     background: hsl(var(--surface-3));
-    border-radius: 20px;
+    border-radius: 16px;
+    box-shadow:
+      inset 0 0 0 1px hsl(var(--border)),
+      0 1px 2px hsl(220 18% 8% / 0.04);
+  }
+  /* Dark mode override — drop the visible border, restore inset highlight */
+  :root .panel,
+  [data-theme="dark"] .panel {
     box-shadow:
       inset 0 1px 0 hsl(0 0% 100% / 0.04);
   }
@@ -428,6 +433,18 @@
   .section-label {
     @apply text-[10px] font-bold uppercase tracking-[0.14em];
     color: hsl(var(--muted-foreground) / 0.85);
+  }
+
+  /* ── Filter pill (Sentinel-style chip used in DashboardFilterBar) ── */
+  .filter-pill {
+    @apply text-[12.5px] font-medium rounded-md px-3 py-2 transition-colors;
+    background: hsl(var(--surface-3));
+    color: hsl(var(--foreground));
+    box-shadow: inset 0 0 0 1px hsl(var(--border));
+    height: 34px;
+  }
+  .filter-pill:hover {
+    background: hsl(var(--surface-hover));
   }
 
   /* ── Live token blinking caret ──────────────────────────────────── */

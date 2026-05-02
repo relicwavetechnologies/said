@@ -7,7 +7,7 @@ const STORAGE_KEY = "vp-theme";
 /**
  * Read/write theme to localStorage and `document.documentElement.dataset.theme`.
  * The initial value is ALSO synced from a small inline script in index.html
- * (no-flash bootstrap). Defaults to dark.
+ * (no-flash bootstrap). Defaults to light.
  */
 export function useTheme(): {
   theme:  Theme;
@@ -15,8 +15,8 @@ export function useTheme(): {
   setTheme: (t: Theme) => void;
 } {
   const [theme, setThemeState] = useState<Theme>(() => {
-    if (typeof document === "undefined") return "dark";
-    return (document.documentElement.dataset.theme as Theme) ?? "dark";
+    if (typeof document === "undefined") return "light";
+    return (document.documentElement.dataset.theme as Theme) ?? "light";
   });
 
   useEffect(() => {

@@ -5,8 +5,11 @@ import {
   HeroStat,
   DonutCard,
   TimeSavedCard,
+  PaceCard,
   RecordingsTable,
   ActivityHeatmap,
+  WorkspaceTopBar,
+  FilterBar,
 } from "@/components/DashboardCards";
 import { listHistory } from "@/lib/invoke";
 import type { AppSnapshot, PendingEdit, Recording } from "@/types";
@@ -19,6 +22,7 @@ interface DashboardViewProps {
   onToggle:        () => void;
   onAccessibility: () => void;
   onNavigate?:     (view: string) => void;
+  onOpenInvite?:   () => void;
   statusPhase?:    string;
   liveText?:       string;
   pendingEdits?:   PendingEdit[];
@@ -33,6 +37,7 @@ export function DashboardView({
   onToggle,
   onAccessibility,
   onNavigate,
+  onOpenInvite,
   statusPhase    = "",
   liveText       = "",
   pendingEdits   = [],
@@ -57,6 +62,13 @@ export function DashboardView({
   return (
     <ScrollArea className="h-full">
       <div className="px-7 pt-4 pb-10 max-w-[1280px] mx-auto">
+
+        {/* ── Workspace top bar ──────────────────────── */}
+        <WorkspaceTopBar onInvite={() => onOpenInvite?.()} />
+
+        {/* ── Filter / search bar ─────────────────────── */}
+        <FilterBar onNewRecording={onToggle} />
+
 
         {/* ── Pending learning approvals banner ──────── */}
         {pendingEdits.length > 0 && (
@@ -172,40 +184,43 @@ export function DashboardView({
         )}
 
         {/* ─────────────────────────────────────────────────────────────────
-           TOP HERO ROW — 5 / 3 / 4 columns (Airbus pattern)
+           Single-column flow — full-width main content
            ─────────────────────────────────────────────────────────────── */}
-        <div className="grid grid-cols-12 gap-4 mb-4" style={{ minHeight: 280 }}>
-          <div className="col-span-12 lg:col-span-5">
+        <div className="space-y-4">
+
+          {/* Stat tiles — auto-fit so cards re-flow naturally as the
+              window shrinks (4 → 3 → 2 → 1 across) */}
+          <div
+            className="grid gap-4"
+            style={{
+              gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+            }}
+          >
             <HeroStat snapshot={snapshot} />
-          </div>
-          <div className="col-span-12 lg:col-span-3">
+            <PaceCard snapshot={snapshot} />
             <DonutCard
               snapshot={snapshot}
               isRecording={isRecording}
               isProcessing={isProcessing}
             />
-          </div>
-          <div className="col-span-12 lg:col-span-4">
             <TimeSavedCard snapshot={snapshot} />
           </div>
-        </div>
 
-        {/* ── Recordings table (Mytasky tasks-list pattern) ──────────── */}
-        <div className="mb-4">
+          {/* Activity heatmap */}
+          <ActivityHeatmap
+            snapshot={snapshot}
+            isRecording={isRecording}
+            isProcessing={isProcessing}
+            onToggle={onToggle}
+            onView={() => onNavigate?.("history")}
+          />
+
+          {/* Recordings list */}
           <RecordingsTable
             recordings={recordings}
             onSeeAll={() => onNavigate?.("history")}
           />
         </div>
-
-        {/* ── Activity bar chart (Mytasky Task Time pattern) ─────────── */}
-        <ActivityHeatmap
-          snapshot={snapshot}
-          isRecording={isRecording}
-          isProcessing={isProcessing}
-          onToggle={onToggle}
-          onView={() => onNavigate?.("history")}
-        />
 
         {/* ── Accessibility nudge ────────────────────── */}
         {snapshot && !snapshot.accessibility_granted && snapshot.auto_paste_supported && (

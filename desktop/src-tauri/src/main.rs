@@ -925,9 +925,8 @@ fn do_finish_recording(
     });
 }
 
-/// Async SSE consumer: streams tokens from backend then stores the result.
-/// Nothing is pasted automatically. User presses Ctrl+Cmd+V (or calls
-/// `paste_latest`) to paste the stored result whenever they're ready.
+/// Async SSE consumer: streams tokens from backend, types them word-by-word,
+/// and stores the result for Ctrl+Cmd+V re-paste.
 async fn run_voice_polish_sse(
     back_arc:       &Arc<Mutex<Option<BackendEndpoint>>>,
     wav:            Vec<u8>,
@@ -942,41 +941,63 @@ async fn run_voice_polish_sse(
 
     let app_clone = app.clone();
 
+    // Track whether word-by-word AX typing succeeded
+    let typed_any    = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let typed_any2   = typed_any.clone();
+    let token_count  = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let token_count2 = token_count.clone();
+
     let done = api::stream_voice_polish(&ep, wav, target_app, pre_transcript, move |event| {
         match &event {
             api::PolishEvent::Token { token } => {
-                // Emit to UI for live preview only — no auto-paste
-                let _ = app_clone.emit(
-                    "voice-token",
-                    serde_json::json!({ "token": token }),
-                );
+                // Emit to UI for live preview
+                let _ = app_clone.emit("voice-token", serde_json::json!({ "token": token }));
+                // Type word-by-word directly into focused app via AX
+                match paster::type_text(token) {
+                    Ok(true) => {
+                        let prev = typed_any2.swap(true, std::sync::atomic::Ordering::Relaxed);
+                        let n = token_count2.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if !prev {
+                            tracing::info!("[main] GAP-2: word-by-word typing started — first token {:?}", token);
+                        }
+                        let _ = n;
+                    }
+                    Ok(false) => { /* AX not granted — will fall back to paste() below */ }
+                    Err(e)   => tracing::warn!("[main] type_text error: {e}"),
+                }
             }
             api::PolishEvent::Status { phase, transcript } => {
-                let _ = app_clone.emit(
-                    "voice-status",
-                    serde_json::json!({ "phase": phase, "transcript": transcript }),
-                );
+                let _ = app_clone.emit("voice-status", serde_json::json!({ "phase": phase, "transcript": transcript }));
             }
             api::PolishEvent::Done(done) => {
                 let _ = app_clone.emit("voice-done", done);
             }
             api::PolishEvent::Error { message, audio_id } => {
-                let _ = app_clone.emit(
-                    "voice-error",
-                    serde_json::json!({ "message": message, "audio_id": audio_id }),
-                );
+                let _ = app_clone.emit("voice-error", serde_json::json!({ "message": message, "audio_id": audio_id }));
             }
         }
     })
     .await?;
 
-    // Store latest result — user pastes with Ctrl+Cmd+V when ready
+    let n_typed = token_count.load(std::sync::atomic::Ordering::Relaxed);
+    if typed_any.load(std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!("[main] GAP-2: word-by-word complete — {n_typed} token(s) typed directly");
+    } else {
+        // AX not available — fall back to clipboard paste
+        tracing::info!("[main] AX not granted — falling back to clipboard paste ({} chars)", done.polished.len());
+        if !done.polished.is_empty() {
+            if let Err(e) = paster::paste(&done.polished) {
+                tracing::warn!("[main] paste fallback failed: {e}");
+            }
+        }
+    }
+
+    // Always store latest result so Ctrl+Cmd+V can re-paste it any time
     if !done.polished.is_empty() {
         if let Ok(mut g) = app.state::<LatestResult>().0.lock() {
             *g = Some(done.polished.clone());
         }
-        tracing::info!("[main] result stored ({} chars) — press Ctrl+Cmd+V to paste", done.polished.len());
-        let _ = app.emit("latest-result-ready", serde_json::json!({ "chars": done.polished.len() }));
+        tracing::info!("[main] result stored ({} chars) — Ctrl+Cmd+V to paste again", done.polished.len());
     }
 
     Ok(done)
@@ -1528,7 +1549,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+                .unwrap_or_else(|_| "info,voice_polish_hotkey=debug,voice_polish_paster=debug".into()),
         )
         .with_ansi(false)   // no colour codes in the file
         .with_writer(std::sync::Mutex::new(log_file))

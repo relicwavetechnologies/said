@@ -3,6 +3,9 @@ name    = "voice-polish-hotkey"
 version = "0.1.0"
 edition = "2024"
 
+[dependencies]
+tracing = "0.1"
+
 # macOS only — the CGEventTap API lives here
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"

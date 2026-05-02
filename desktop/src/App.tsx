@@ -563,6 +563,7 @@ export default function App() {
                 onToggle={handleToggle}
                 onAccessibility={handleAccessibility}
                 onNavigate={handleViewChange}
+                onOpenInvite={() => setInviteOpen(true)}
                 statusPhase={statusPhase}
                 liveText={liveText}
                 pendingEdits={pendingEdits}

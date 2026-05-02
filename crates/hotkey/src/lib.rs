@@ -218,14 +218,23 @@ mod imp {
         let cmd   = (flags & ffi::K_CG_FLAG_COMMAND)  != 0;
         let alt   = (flags & ffi::K_CG_FLAG_ALT)     != 0;
         let shift = (flags & ffi::K_CG_FLAG_SHIFT)    != 0;
+        let kc    = unsafe { ffi::CGEventGetIntegerValueField(event, ffi::K_CG_KEYBOARD_EVENT_KEYCODE) };
+
+        // Log every Ctrl or Cmd keypress so we can see flags in the log file
+        if ctrl || cmd {
+            tracing::debug!("[hotkey] keydown flags={flags:#010x} ctrl={ctrl} cmd={cmd} alt={alt} shift={shift} kc={kc}");
+        }
 
         // Exactly Ctrl+Cmd, no other modifiers
         if !ctrl || !cmd || alt || shift { return false; }
-
-        let kc = unsafe { ffi::CGEventGetIntegerValueField(event, ffi::K_CG_KEYBOARD_EVENT_KEYCODE) };
         if kc != ffi::KC_V { return false; }
 
-        if let Some(cb) = PASTE_CB.get() { cb(); }
+        tracing::info!("[hotkey] Ctrl+Cmd+V detected — firing paste callback");
+        if let Some(cb) = PASTE_CB.get() {
+            cb();
+        } else {
+            tracing::warn!("[hotkey] Ctrl+Cmd+V fired but PASTE_CB not registered!");
+        }
         true
     }
 
@@ -271,7 +280,7 @@ mod imp {
         if !granted { return false; }
 
         // Permission was just granted (transition: denied → granted after launch).
-        println!("[hotkey] Input Monitoring newly granted — restarting hold listener");
+        tracing::info!("[hotkey] Input Monitoring newly granted — restarting hold listener");
 
         // Restart the hold listener with the saved callbacks.
         if let Some((on_press, on_release)) = HOLD_CALLBACKS.get() {
@@ -392,7 +401,7 @@ mod imp {
                 if let Some(ref mut s) = TOGGLE_STATE {
                     if s.last_fire.elapsed().as_millis() > DEBOUNCE_MS {
                         s.last_fire = Instant::now();
-                        println!("[hotkey] Caps Lock → toggle");
+                        tracing::info!("[hotkey] Caps Lock → toggle");
                         (s.callback)();
                     }
                 }
@@ -459,11 +468,11 @@ mod imp {
                 if let Some(ref mut s) = HOLD_STATE {
                     if caps_on && !s.is_down {
                         s.is_down = true;
-                        println!("[hotkey] Caps Lock held → start recording");
+                        tracing::info!("[hotkey] Caps Lock held → start recording");
                         (s.on_press)();
                     } else if !caps_on && s.is_down {
                         s.is_down = false;
-                        println!("[hotkey] Caps Lock released → process");
+                        tracing::info!("[hotkey] Caps Lock released → process");
                         (s.on_release)();
                     }
                 }
@@ -499,7 +508,7 @@ mod imp {
             if !tap.is_null() {
                 // SAFETY: tap is a valid CFMachPortRef checked above
                 unsafe { ffi::CGEventTapEnable(tap, true) };
-                eprintln!("[hotkey] tap re-enabled after macOS disabled it");
+                tracing::info!("[hotkey] tap re-enabled after macOS disabled it");
             }
         }
     }
@@ -516,11 +525,11 @@ mod imp {
         let tap = unsafe { ffi::CGEventTapCreate(0, 0, 0, mask, callback, std::ptr::null_mut()) };
 
         if tap.is_null() {
-            eprintln!("[hotkey] CGEventTapCreate failed — requesting Input Monitoring permission");
+            tracing::info!("[hotkey] CGEventTapCreate failed — requesting Input Monitoring permission");
             // Trigger the macOS TCC permission dialog for Input Monitoring.
             // NSInputMonitoringUsageDescription in Info.plist is required for this to work.
             unsafe { ffi::CGRequestListenEventAccess() };
-            eprintln!("[hotkey] Restart the app after granting Input Monitoring in System Settings.");
+            tracing::info!("[hotkey] Restart the app after granting Input Monitoring in System Settings.");
             return;
         }
 
@@ -532,14 +541,14 @@ mod imp {
 
         // SAFETY: tap is a valid non-null CFMachPortRef
         if unsafe { !ffi::CGEventTapIsEnabled(tap) } {
-            eprintln!("[hotkey] tap disabled — grant Input Monitoring permission, then restart");
+            tracing::info!("[hotkey] tap disabled — grant Input Monitoring permission, then restart");
         } else {
-            println!("[hotkey] CGEventTap active — listening for Caps Lock");
+            tracing::info!("[hotkey] CGEventTap active — listening for Caps Lock");
         }
 
         // SAFETY: tap is valid; null allocator uses default CF allocator
         let source = unsafe { ffi::CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0) };
-        if source.is_null() { eprintln!("[hotkey] RunLoop source creation failed"); return; }
+        if source.is_null() { tracing::info!("[hotkey] RunLoop source creation failed"); return; }
 
         unsafe {
             ffi::CFRunLoopAddSource(
