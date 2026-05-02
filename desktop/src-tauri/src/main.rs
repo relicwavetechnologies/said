@@ -938,7 +938,19 @@ fn do_finish_recording(
             None
         };
 
-        let result = run_voice_polish_sse(&back_arc2, wav, None, pre_transcript, &app2).await;
+        // Hard 25 s timeout on the full SSE pipeline.  If the backend stalls,
+        // the spawned task would otherwise hang indefinitely with state stuck
+        // in Processing, silently swallowing every subsequent Caps Lock press.
+        let result = match tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            run_voice_polish_sse(&back_arc2, wav, None, pre_transcript, &app2),
+        ).await {
+            Ok(r)  => r,
+            Err(_) => {
+                tracing::error!("[pipeline] hard timeout after 25 s — forcing recovery to Idle");
+                Err("Request timed out after 25 s — please try again.".to_string())
+            }
+        };
 
         // Spawn edit-watcher immediately after paste (non-blocking).
         // Capture watch_start NOW — before the spawn — so the ring
