@@ -158,7 +158,6 @@ pub async fn stream_to_deepgram(
             msg = ws_rx.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        // Log every Results message at debug so we can see what Deepgram sends
                         if let Ok(v) = serde_json::from_str::<Value>(&text) {
                             let msg_type = v["type"].as_str().unwrap_or("?");
                             if msg_type == "Results" {
@@ -167,17 +166,23 @@ pub async fn stream_to_deepgram(
                                 let t      = v["channel"]["alternatives"][0]["transcript"]
                                     .as_str().unwrap_or("");
                                 debug!("[dg_stream] Results is_final={is_f} speech_final={sp_f} transcript={t:?}");
+
+                                // Capture ALL is_final=true segments — not just speech_final.
+                                // Each is_final covers a distinct audio chunk; speech_final
+                                // only fires after endpointing silence (300ms).  Without this,
+                                // continuous speech produces 0 parts during streaming and the
+                                // entire transcript comes from a single drain speech_final
+                                // (often just the LAST segment, losing everything before it).
+                                if is_f && !t.is_empty() {
+                                    info!("[dg_stream] captured is_final segment: {t:?} (speech_final={sp_f})");
+                                    transcript_parts.push(t.to_string());
+                                }
                             } else {
                                 debug!("[dg_stream] server msg type={msg_type}");
                             }
                         }
-                        if let Some(fragment) = parse_speech_final(&text) {
-                            debug!("[dg_stream] speech_final captured: {fragment:?}");
-                            transcript_parts.push(fragment);
-                        }
                     }
                     Some(Ok(Message::Close(frame))) => {
-                        // Upgraded from debug → warn so it's always visible
                         warn!("[dg_stream] server closed WS during streaming: {:?}", frame);
                         exit_reason = "server-closed";
                         break;
@@ -194,9 +199,9 @@ pub async fn stream_to_deepgram(
         }
     }
 
+    let parts_from_streaming = transcript_parts.len();
     info!(
-        "[dg_stream] select loop done (reason={exit_reason}), parts so far: {}, chunks_sent: {chunks_sent}",
-        transcript_parts.len()
+        "[dg_stream] select loop done (reason={exit_reason}), parts from streaming: {parts_from_streaming}, chunks_sent: {chunks_sent}",
     );
 
     // ── Drain remaining messages after CloseStream ────────────────────────────
@@ -205,26 +210,45 @@ pub async fn stream_to_deepgram(
     // and losing Deepgram's final is_final Results.
     let _keep_tx_alive = ws_tx;
 
-    // Give Deepgram time to flush remaining utterances.
-    // Optimised drain: break as soon as speech_final=true arrives (~100-300ms after
-    // CloseStream), rather than waiting for UtteranceEnd (~1000ms). This saves
-    // ~700-900ms per recording.  UtteranceEnd and timeout are safety-net fallbacks.
+    // Give Deepgram time to flush remaining utterances after CloseStream.
+    //
+    // IMPORTANT: Don't break on the FIRST speech_final — there may be multiple
+    // utterances pending (the user paused briefly, creating separate segments).
+    // Instead, after seeing the first speech_final, set a short secondary timeout
+    // (200ms) to catch any additional segments.  If nothing arrives in 200ms after
+    // the last speech_final, we're done.
     let drain_ms = (chunks_sent as u64 * 12).max(800);
-    // ── GAP-1 PROOF ── log drain budget at INFO so it's always visible
-    info!("[dg_stream] GAP-1: drain budget={drain_ms}ms — will exit early on speech_final (~100-300ms) or UtteranceEnd (~1000ms)");
+    info!("[dg_stream] drain budget={drain_ms}ms — will wait 200ms after last speech_final for additional segments");
     let drain_start    = tokio::time::Instant::now();
     let drain_deadline = drain_start + Duration::from_millis(drain_ms);
+
+    // Track when we last saw a speech_final — after 200ms with no more results, we exit
+    let mut last_speech_final: Option<tokio::time::Instant> = None;
+
     loop {
         let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            info!("[dg_stream] GAP-1: drain budget exhausted after {}ms (no speech_final/UtteranceEnd)",
+            info!("[dg_stream] drain budget exhausted after {}ms",
                   drain_start.elapsed().as_millis());
             break;
         }
 
-        match tokio::time::timeout(remaining, ws_rx.next()).await {
+        // If we've seen a speech_final, use a shorter timeout (200ms) to catch stragglers
+        let effective_timeout = if let Some(sf_at) = last_speech_final {
+            let since_sf = tokio::time::Instant::now().saturating_duration_since(sf_at);
+            let sf_remaining = Duration::from_millis(200).saturating_sub(since_sf);
+            if sf_remaining.is_zero() {
+                info!("[dg_stream] 200ms after last speech_final — drain done ({}ms total)",
+                      drain_start.elapsed().as_millis());
+                break;
+            }
+            remaining.min(sf_remaining)
+        } else {
+            remaining
+        };
+
+        match tokio::time::timeout(effective_timeout, ws_rx.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => {
-                // Parse once, handle all cases in one place
                 if let Ok(v) = serde_json::from_str::<Value>(&text) {
                     let msg_type = v["type"].as_str().unwrap_or("?");
                     if msg_type == "Results" {
@@ -234,23 +258,20 @@ pub async fn stream_to_deepgram(
                             .as_str().unwrap_or("");
                         debug!("[dg_stream] drain Results is_final={is_f} speech_final={sp_f} transcript={t:?}");
 
-                        // Capture any is_final or speech_final fragment
-                        if (is_f || sp_f) && !t.is_empty() {
-                            debug!("[dg_stream] drain captured: {t:?}");
+                        // Capture any is_final fragment (same rule as main loop)
+                        if is_f && !t.is_empty() {
+                            info!("[dg_stream] drain captured: {t:?} (speech_final={sp_f})");
                             transcript_parts.push(t.to_string());
                         }
 
-                        // ── GAP-1 PROOF ── speech_final = Deepgram is done; exit immediately
-                        // This fires ~100-300ms after CloseStream, saving ~700-900ms vs UtteranceEnd
+                        // Reset the speech_final timer — wait 200ms more for additional segments
                         if sp_f {
-                            info!("[dg_stream] GAP-1: speech_final received after {}ms — drain done (saved ~{}ms vs UtteranceEnd wait)",
-                                  drain_start.elapsed().as_millis(),
-                                  1000u64.saturating_sub(drain_start.elapsed().as_millis() as u64));
-                            break;
+                            last_speech_final = Some(tokio::time::Instant::now());
+                            info!("[dg_stream] speech_final at {}ms — waiting 200ms for more segments",
+                                  drain_start.elapsed().as_millis());
                         }
                     } else if msg_type == "UtteranceEnd" {
-                        // ── GAP-1 PROOF ── fallback: speech_final never came (shouldn't happen)
-                        info!("[dg_stream] GAP-1: UtteranceEnd received after {}ms — drain exiting (speech_final was missed)",
+                        info!("[dg_stream] UtteranceEnd at {}ms — drain done",
                               drain_start.elapsed().as_millis());
                         break;
                     } else {
@@ -269,8 +290,13 @@ pub async fn stream_to_deepgram(
             Ok(Some(Err(e))) => { warn!("[dg_stream] drain WS error: {e}"); break; }
             Ok(Some(Ok(_))) => {} // ping/pong/binary — ignore
             Err(_) => {
-                info!("[dg_stream] GAP-1: drain timed out after {}ms (no speech_final/UtteranceEnd arrived)",
-                      drain_start.elapsed().as_millis());
+                if last_speech_final.is_some() {
+                    info!("[dg_stream] 200ms after last speech_final — drain done ({}ms total)",
+                          drain_start.elapsed().as_millis());
+                } else {
+                    info!("[dg_stream] drain timed out after {}ms (no speech_final arrived)",
+                          drain_start.elapsed().as_millis());
+                }
                 break;
             }
         }
@@ -286,23 +312,21 @@ pub async fn stream_to_deepgram(
         .collect::<Vec<_>>()
         .join(" ");
 
+    let parts_from_drain = transcript_parts.len() - parts_from_streaming;
+    info!(
+        "[dg_stream] transcript assembled: {} parts ({} streaming + {} drain), {} chars",
+        transcript_parts.len(), parts_from_streaming, parts_from_drain, full.len()
+    );
+
     if full.is_empty() {
         warn!("[dg_stream] no transcript received from WS stream (parts={}, chunks_sent={chunks_sent})",
               transcript_parts.len());
         None
     } else {
-        debug!("[dg_stream] final transcript: {full:?}");
+        info!("[dg_stream] final transcript: {full:?}");
         Some(full)
     }
 }
 
-// ── Deepgram message parsers ─────────────────────────────────────────────────
-
-fn parse_speech_final(text: &str) -> Option<String> {
-    let v: Value = serde_json::from_str(text).ok()?;
-    if v["type"] != "Results" { return None; }
-    if !v["speech_final"].as_bool().unwrap_or(false) { return None; }
-    let t = v["channel"]["alternatives"][0]["transcript"].as_str()?.to_string();
-    if t.is_empty() { None } else { Some(t) }
-}
+// (parse_speech_final removed — main loop now captures all is_final=true events inline)
 
