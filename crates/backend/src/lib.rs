@@ -94,6 +94,8 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/v1/pending-edits",        post(routes::pending_edits::create))
         .route("/v1/pending-edits",        get(routes::pending_edits::list))
         .route("/v1/pending-edits/:id/resolve", post(routes::pending_edits::resolve))
+        .route("/v1/vocabulary/terms",     get(routes::vocabulary::list_terms))
+        .route("/v1/vocabulary",           get(routes::vocabulary::list))
         .route("/v1/history",              get(routes::history::list))
         .route("/v1/recordings/:id",       axum::routing::delete(routes::history::delete))
         .route("/v1/recordings/:id/audio", get(routes::history::audio))

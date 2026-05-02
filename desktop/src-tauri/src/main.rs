@@ -806,17 +806,30 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
             }
             tracing::debug!("[dg_stream] API key present ({} chars)", deepgram_key.len());
 
-            // Fetch language from local backend prefs (127.0.0.1, <20 ms).
-            let ep_opt   = back_arc.lock().ok().and_then(|g| g.clone());
-            let language = if let Some(ref ep) = ep_opt {
-                api::get_preferences(ep).await.ok()
-                    .map(|p| p.language.clone())
-                    .unwrap_or_default()
+            // Fetch language + personal vocabulary in parallel from local
+            // backend (127.0.0.1, <30 ms combined). Vocab terms become Deepgram
+            // `keyterm=` biases — the single most important learning signal,
+            // applied at the source rather than post-hoc.
+            let ep_opt = back_arc.lock().ok().and_then(|g| g.clone());
+            let (language, keyterms): (String, Vec<String>) = if let Some(ref ep) = ep_opt {
+                let (prefs_res, vocab_res) = tokio::join!(
+                    api::get_preferences(ep),
+                    api::get_vocabulary_terms(ep),
+                );
+                let lang = prefs_res.ok().map(|p| p.language.clone()).unwrap_or_default();
+                let vocab = vocab_res.unwrap_or_else(|e| {
+                    tracing::debug!("[dg_stream] vocab fetch skipped: {e}");
+                    Vec::new()
+                });
+                if !vocab.is_empty() {
+                    tracing::info!("[dg_stream] biasing WS with {} personal term(s)", vocab.len());
+                }
+                (lang, vocab)
             } else {
-                String::new()
+                (String::new(), Vec::new())
             };
 
-            let transcript = dg_stream::stream_to_deepgram(chunk_recv, &deepgram_key, &language).await;
+            let transcript = dg_stream::stream_to_deepgram(chunk_recv, &deepgram_key, &language, &keyterms).await;
             tracing::info!(
                 "[dg_stream] pre-transcript result: {}",
                 transcript.as_deref().unwrap_or("<none>")

@@ -717,6 +717,28 @@ pub async fn classify_edit(
         .map_err(|e| format!("parse classify response: {e}"))
 }
 
+/// Light-weight fetch of just the personal vocabulary terms — used by the
+/// dictation hot path to bias Deepgram's WS at recording start.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct VocabTermsResponse {
+    pub terms: Vec<String>,
+}
+
+pub async fn get_vocabulary_terms(ep: &BackendEndpoint) -> Result<Vec<String>, String> {
+    let url = format!("{}/v1/vocabulary/terms", ep.url);
+    let resp = Client::new()
+        .get(&url)
+        .header("Authorization", ep.bearer())
+        .timeout(std::time::Duration::from_millis(500))   // hot path — fail fast
+        .send()
+        .await
+        .map_err(|e| format!("get vocab terms failed: {e}"))?
+        .json::<VocabTermsResponse>()
+        .await
+        .map_err(|e| format!("parse vocab terms: {e}"))?;
+    Ok(resp.terms)
+}
+
 pub async fn get_pending_edits(ep: &BackendEndpoint) -> Result<PendingEditsResponse, String> {
     let url = format!("{}/v1/pending-edits", ep.url);
     Client::new()

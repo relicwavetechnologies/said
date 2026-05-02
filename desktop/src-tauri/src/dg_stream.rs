@@ -32,6 +32,7 @@ pub async fn stream_to_deepgram(
     chunk_recv:   ChunkReceiver,
     deepgram_key: &str,
     language:     &str,
+    keyterms:     &[String],
 ) -> Option<String> {
     if deepgram_key.is_empty() {
         warn!("[dg_stream] no Deepgram API key — WS streaming disabled");
@@ -43,7 +44,11 @@ pub async fn stream_to_deepgram(
     // Deepgram WS URL with encoding parameters for raw i16 PCM at 16 kHz.
     // utterance_end_ms=1000: Deepgram emits UtteranceEnd ~1 s after speech stops,
     // which lets us break the drain loop immediately instead of waiting the full window.
-    let url_str = format!(
+    //
+    // keyterm=<term> repeated per personal-vocabulary entry — biases the nova-3
+    // decoder toward correctly-spelled jargon, names, and code identifiers.
+    // Capped at 100 to stay under Deepgram's request size limits.
+    let mut url_str = format!(
         "wss://api.deepgram.com/v1/listen\
          ?model=nova-3\
          &language={lang}\
@@ -56,8 +61,18 @@ pub async fn stream_to_deepgram(
          &endpointing=300\
          &utterance_end_ms=1000"
     );
+    let bias_count = keyterms.iter().filter(|t| !t.trim().is_empty()).count().min(100);
+    for term in keyterms.iter().take(100) {
+        let cleaned = term.trim();
+        if cleaned.is_empty() { continue; }
+        url_str.push_str("&keyterm=");
+        url_str.push_str(&urlencode(cleaned));
+    }
 
-    info!("[dg_stream] connecting to Deepgram WS (lang={lang}, 16kHz), key_len={}", deepgram_key.len());
+    info!(
+        "[dg_stream] connecting to Deepgram WS (lang={lang}, 16kHz, bias={bias_count}), key_len={}",
+        deepgram_key.len()
+    );
 
     let mut req = match url_str.into_client_request() {
         Ok(r)  => r,
@@ -370,5 +385,37 @@ fn enrich_from_words(words_val: &Value) -> String {
     }
 
     parts.join(" ")
+}
+
+/// Minimal URL encoder for query-string values (RFC 3986 unreserved set).
+/// Spaces become `%20` (not `+`).
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(out, "%{:02X}", b);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::urlencode;
+
+    #[test]
+    fn urlencode_handles_jargon_and_special_chars() {
+        assert_eq!(urlencode("n8n"),       "n8n");
+        assert_eq!(urlencode("k8s"),       "k8s");
+        assert_eq!(urlencode("hello"),     "hello");
+        assert_eq!(urlencode("hi there"),  "hi%20there");
+        assert_eq!(urlencode("a&b=c"),     "a%26b%3Dc");
+    }
 }
 
