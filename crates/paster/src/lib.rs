@@ -365,7 +365,10 @@ mod imp {
     /// Returns `None` if nothing is selected or accessibility is not granted.
     pub fn read_selected_text() -> Option<String> {
         unsafe {
-            if !ffi::AXIsProcessTrusted() { return None; }
+            if !ffi::AXIsProcessTrusted() {
+                tracing::warn!("[paster] read_selected_text: AX not trusted — returning None");
+                return None;
+            }
 
             // ── Try AX kAXSelectedTextAttribute first ─────────────────────────
             let sys = ffi::AXUIElementCreateSystemWide();
@@ -386,16 +389,25 @@ mod imp {
                             ffi::CFRelease(sel_val);
                             if let Some(text) = s {
                                 if !text.trim().is_empty() {
+                                    tracing::info!("[paster] read_selected_text: AXSelectedText returned {} chars", text.len());
                                     return Some(text);
                                 }
+                                tracing::debug!("[paster] read_selected_text: AXSelectedText returned empty string");
                             }
+                        } else {
+                            tracing::debug!("[paster] read_selected_text: AXSelectedText attribute not available");
                         }
+                    } else {
+                        tracing::debug!("[paster] read_selected_text: no AXFocusedUIElement");
                     }
+                } else {
+                    tracing::debug!("[paster] read_selected_text: no AXFocusedApplication");
                 }
             }
         }
 
         // ── Fallback: Cmd+C to copy the current selection ─────────────────────
+        tracing::info!("[paster] read_selected_text: AX path failed — trying Cmd+C fallback");
         let original = pbpaste();
         pbcopy("");
         thread::sleep(Duration::from_millis(50));
@@ -403,6 +415,7 @@ mod imp {
         unsafe {
             let source = ffi::CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION);
             if source.is_null() {
+                tracing::warn!("[paster] read_selected_text: CGEventSourceCreate failed");
                 pbcopy(&original);
                 return None;
             }
@@ -417,7 +430,13 @@ mod imp {
         let captured = pbpaste();
         pbcopy(&original);
 
-        if captured.is_empty() { None } else { Some(captured) }
+        if captured.is_empty() {
+            tracing::warn!("[paster] read_selected_text: Cmd+C fallback also returned empty");
+            None
+        } else {
+            tracing::info!("[paster] read_selected_text: Cmd+C fallback got {} chars", captured.len());
+            Some(captured)
+        }
     }
 
     /// Return the PID of the focused application, or None.

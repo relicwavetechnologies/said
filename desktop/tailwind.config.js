@@ -1,6 +1,12 @@
 /** @type {import('tailwindcss').Config} */
 export default {
   content: ["./index.html", "./src/**/*.{ts,tsx}"],
+  // Heatmap level classes are built dynamically via `heat-${level}` template
+  // literals — Tailwind's content scanner can't see them as class names, so
+  // we safelist them explicitly to prevent purging.
+  safelist: [
+    "heat-0", "heat-1", "heat-2", "heat-3", "heat-4", "heat-current",
+  ],
   theme: {
     extend: {
       colors: {

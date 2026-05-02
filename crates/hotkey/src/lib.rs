@@ -177,11 +177,19 @@ mod imp {
         let cmd   = (flags & ffi::K_CG_FLAG_COMMAND)  != 0;
         let shift = (flags & ffi::K_CG_FLAG_SHIFT)    != 0;
         let ctrl  = (flags & ffi::K_CG_FLAG_CONTROL)  != 0;
+        let kc    = unsafe { ffi::CGEventGetIntegerValueField(event, ffi::K_CG_KEYBOARD_EVENT_KEYCODE) };
+
+        // Log every Option keypress at INFO so it always appears in said.log
+        if alt {
+            tracing::info!("[hotkey] option keydown kc={kc} flags={flags:#010x} alt={alt} cmd={cmd} shift={shift} ctrl={ctrl}");
+        }
 
         // Only fire on bare Option (no other modifiers)
-        if !alt || cmd || shift || ctrl { return false; }
+        if !alt || cmd || shift || ctrl {
+            if alt { tracing::info!("[hotkey] option+{kc} rejected — other modifier held cmd={cmd} shift={shift} ctrl={ctrl}"); }
+            return false;
+        }
 
-        let kc = unsafe { ffi::CGEventGetIntegerValueField(event, ffi::K_CG_KEYBOARD_EVENT_KEYCODE) };
         let digit: Option<u8> = match kc {
             18 => Some(1),
             19 => Some(2),
@@ -192,9 +200,15 @@ mod imp {
         };
 
         if let Some(n) = digit {
-            if let Some(cb) = SHORTCUT_CB.get() { cb(n); }
+            tracing::info!("[hotkey] Option+{n} fired — calling tray polish callback");
+            if let Some(cb) = SHORTCUT_CB.get() {
+                cb(n);
+            } else {
+                tracing::warn!("[hotkey] Option+{n} fired but SHORTCUT_CB not registered!");
+            }
             true
         } else {
+            tracing::info!("[hotkey] option+{kc} — not a tone shortcut key (bare Option)");
             false
         }
     }
@@ -443,6 +457,11 @@ mod imp {
             rearm_if_disabled(event_type, HOLD_TAP);
 
             if event_type == ffi::K_CG_EVENT_KEY_DOWN {
+                // Log keycode + flags for every keydown so we can confirm events arrive
+                let _kc = ffi::CGEventGetIntegerValueField(event, ffi::K_CG_KEYBOARD_EVENT_KEYCODE);
+                let _fl = ffi::CGEventGetFlags(event);
+                tracing::debug!("[hotkey] HOLD tap keydown kc={_kc} flags={_fl:#010x}");
+
                 if check_and_fire_paste(event) {
                     return std::ptr::null_mut(); // suppress Ctrl+Cmd+V system action
                 }
