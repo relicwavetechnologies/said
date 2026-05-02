@@ -17,6 +17,7 @@ import {
   deleteVocabularyTerm,
   starVocabularyTerm,
   onVocabularyChanged,
+  requestNotifications,
   type VocabRow,
 } from "@/lib/invoke";
 
@@ -289,6 +290,11 @@ export function VocabularyView() {
   useEffect(() => {
     refresh();
     const unsub = onVocabularyChanged(refresh);
+    // Quietly request macOS notification permission on first mount.
+    // No-op if already granted; opens the macOS prompt if undecided; no-op if
+    // already denied (in which case the user must enable in System Settings).
+    // Without this, manual-add and auto-promote notifications silently fail.
+    requestNotifications().catch(() => {});
     return () => unsub();
   }, []);
 

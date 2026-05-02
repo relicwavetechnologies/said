@@ -1257,6 +1257,16 @@ async fn add_vocabulary_term(
     let ep = get_endpoint(&backend)?;
     api::add_vocabulary_term(&ep, &term).await?;
     let _ = app.emit("vocabulary-changed", ());
+
+    // Native macOS notification — confirms STT will now bias toward this term.
+    // Mirrors the auto-promote notification path so the UX is consistent
+    // whether the term was learned automatically or added manually.
+    use tauri_plugin_notification::NotificationExt;
+    let _ = app.notification()
+        .builder()
+        .title("Said vocabulary")
+        .body(&format!("Added \"{term}\" — biasing STT on the next recording"))
+        .show();
     Ok(())
 }
 
@@ -1281,6 +1291,17 @@ async fn star_vocabulary_term(
     let ep = get_endpoint(&backend)?;
     let starred = api::star_vocabulary_term(&ep, &term).await?;
     let _ = app.emit("vocabulary-changed", ());
+
+    // Lightweight confirmation toast for star/unstar — only on STAR (positive
+    // affirmation), not on unstar (silent).
+    if starred {
+        use tauri_plugin_notification::NotificationExt;
+        let _ = app.notification()
+            .builder()
+            .title("Said vocabulary")
+            .body(&format!("Pinned \"{term}\" — protected from automatic demotion"))
+            .show();
+    }
     Ok(starred)
 }
 
