@@ -65,6 +65,55 @@ pub fn script_matches(term: &str, output_language: &str) -> bool {
     }
 }
 
+/// True if `kept` looks like an insertion-without-deletion mishap rather
+/// than a clean correction — i.e. `kept` literally contains `polish` as a
+/// PREFIX or SUFFIX, with substantial extra characters attached.
+///
+/// The canonical case: cursor was at column 0 in the target field, user
+/// typed "EMIAC" intending to *replace* "MAAR", but the polish wasn't
+/// selected — they ended up with "EMIACMAAR" (concatenation).  Here "MAAR"
+/// is a SUFFIX of "EMIACMAAR" with a 5-char prefix added.  Refuse to learn.
+///
+/// We require the addition to be ≥ 3 chars to distinguish concatenation from
+/// typo extension ("Anis" → "anish" is a 1-char tail; that's a real STT fix,
+/// not a concatenation).  We also require polish to sit at the boundary
+/// (start or end of kept) — interior containment is rare in practice and
+/// usually a coincidence rather than a missed-deletion.
+///
+/// Returns false when:
+///   • `polish` is empty
+///   • `polish` is < 3 chars (containment is too noisy at that length)
+///   • `kept == polish` (no diff)
+///   • polish appears in kept but not as prefix or suffix
+///   • the extra-char count is < 3 (typo / minor extension, not concatenation)
+pub fn is_concatenation_pattern(polish: &str, kept: &str) -> bool {
+    let polish = polish.trim();
+    let kept   = kept.trim();
+    if polish.is_empty() || kept.is_empty() || polish == kept {
+        return false;
+    }
+    let polish_chars = polish.chars().count();
+    let kept_chars   = kept.chars().count();
+    if polish_chars < 3 || kept_chars <= polish_chars {
+        return false;
+    }
+    let extra = kept_chars - polish_chars;
+    if extra < 3 {
+        // Likely typo extension (e.g. "Anis" → "anish") — let the normal
+        // gates handle it.
+        return false;
+    }
+
+    // Boundary check — polish must be a prefix OR suffix of kept.
+    // Case-insensitive for ASCII, exact for non-ASCII.
+    let (polish_cmp, kept_cmp): (String, String) = if polish.is_ascii() && kept.is_ascii() {
+        (polish.to_ascii_lowercase(), kept.to_ascii_lowercase())
+    } else {
+        (polish.to_string(), kept.to_string())
+    };
+    kept_cmp.starts_with(&polish_cmp) || kept_cmp.ends_with(&polish_cmp)
+}
+
 /// True if `user_kept` looks like a USER_REWRITE rather than a small in-place
 /// correction.  Heuristic — any of:
 ///   • user_kept length > 1.4× polish length (added substantial content)
@@ -191,5 +240,67 @@ mod tests {
         let polish    = "the meeting was good";
         let user_kept = "the meeting was great";
         assert!(!looks_like_user_addition(polish, user_kept));
+    }
+
+    // ── is_concatenation_pattern ──────────────────────────────────────────────
+
+    #[test]
+    fn concatenation_caught_for_emiac_maar_case() {
+        // The exact production case: user wanted to replace "MAAR" with "EMIAC"
+        // but cursor went to start of field, ended up with "EMIACMAAR".
+        assert!(is_concatenation_pattern("MAAR", "EMIACMAAR"));
+        assert!(is_concatenation_pattern("maar", "emiacmaar"));
+    }
+
+    #[test]
+    fn concatenation_caught_for_prefix_and_suffix() {
+        // polish at start, with a substantial suffix added
+        assert!(is_concatenation_pattern("hello", "helloWORLD"));
+        // polish at end, with a substantial prefix added (the EMIAC case shape)
+        assert!(is_concatenation_pattern("server", "MYBIGserver"));
+    }
+
+    #[test]
+    fn interior_containment_is_not_flagged() {
+        // polish in the middle of kept (e.g. "server" inside "myserver-prod")
+        // is rare and ambiguous — let normal gates handle it, don't block here.
+        assert!(!is_concatenation_pattern("server", "myserver-prod"));
+    }
+
+    #[test]
+    fn concatenation_ignored_for_clean_swap() {
+        // Genuine STT correction — n8n is NOT a substring of written.
+        assert!(!is_concatenation_pattern("written", "n8n"));
+        assert!(!is_concatenation_pattern("Anis",    "anish"));
+    }
+
+    #[test]
+    fn concatenation_ignored_when_polish_too_short() {
+        // 1-2 char polish forms make false positives trivial — skip.
+        assert!(!is_concatenation_pattern("ai", "aiden"));
+        assert!(!is_concatenation_pattern("a",  "anish"));
+    }
+
+    #[test]
+    fn concatenation_ignored_when_equal() {
+        assert!(!is_concatenation_pattern("hello", "hello"));
+        assert!(!is_concatenation_pattern("",      ""));
+    }
+
+    #[test]
+    fn concatenation_ignored_when_polish_empty() {
+        assert!(!is_concatenation_pattern("", "anything"));
+    }
+
+    #[test]
+    fn concatenation_handles_non_ascii_prefix() {
+        // Devanagari concatenation case (the polish-at-start variant).
+        // We need ≥ 3 extra chars, so use a longer suffix.
+        assert!(is_concatenation_pattern("नमस्ते", "नमस्तेजीसाहब"));
+    }
+
+    #[test]
+    fn concatenation_unrelated_devanagari_not_flagged() {
+        assert!(!is_concatenation_pattern("नमस्ते", "खुशी"));
     }
 }

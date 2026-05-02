@@ -693,16 +693,18 @@ pub struct ClassifyEditResponse {
 /// STT_ERROR auto-promotes on first sighting; POLISH_ERROR promotes only on
 /// repeat; REPHRASE/REWRITE do nothing.
 pub async fn classify_edit(
-    ep:           &BackendEndpoint,
-    recording_id: &str,
-    ai_output:    &str,
-    user_kept:    &str,
+    ep:             &BackendEndpoint,
+    recording_id:   &str,
+    ai_output:      &str,
+    user_kept:      &str,
+    capture_method: &str,
 ) -> Result<ClassifyEditResponse, String> {
     let url  = format!("{}/v1/classify-edit", ep.url);
     let body = serde_json::json!({
-        "recording_id": recording_id,
-        "ai_output":    ai_output,
-        "user_kept":    user_kept,
+        "recording_id":   recording_id,
+        "ai_output":      ai_output,
+        "user_kept":      user_kept,
+        "capture_method": capture_method,
     });
     Client::new()
         .post(&url)

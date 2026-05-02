@@ -89,6 +89,8 @@ fn label_with_extract(
 }
 
 /// Stage-4 promotion logic mirroring `routes::classify::classify` (no network).
+/// Includes the full gate stack: capture-confidence, script, phonetic/jargon,
+/// concatenation, appears-in-user-kept.
 fn promote(
     pool:            &DbPool,
     user_id:         &str,
@@ -96,6 +98,26 @@ fn promote(
     output_language: &str,
     cands:           &[LabelledHunk],
 ) -> (usize, bool) {
+    promote_with_capture(pool, user_id, user_kept, output_language, cands, "ax")
+}
+
+fn promote_with_capture(
+    pool:            &DbPool,
+    user_id:         &str,
+    user_kept:       &str,
+    output_language: &str,
+    cands:           &[LabelledHunk],
+    capture_method:  &str,
+) -> (usize, bool) {
+    // Capture-confidence master gate — mirrors the route.
+    let auto_promote_allowed = matches!(
+        capture_method,
+        "ax" | "keystroke_verified" | "clipboard"
+    );
+    if !auto_promote_allowed {
+        return (0, false);
+    }
+
     let mut promoted = 0_usize;
     let mut learned  = false;
     for cand in cands {
@@ -105,6 +127,13 @@ fn promote(
 
         if !promotion_gate::appears_in_user_kept(correct, user_kept) { continue; }
         if !promotion_gate::script_matches(correct, output_language) { continue; }
+
+        // Concatenation guard — same as the route.
+        if cand.extracted_term.is_none()
+            && promotion_gate::is_concatenation_pattern(cand.polish_form(), correct)
+        {
+            continue;
+        }
 
         let phon_sim = phonetics::similarity(cand.transcript_form(), correct)
             .max(phonetics::similarity(cand.polish_form(), correct));
@@ -302,6 +331,96 @@ fn extracted_term_overrides_kept_window_in_correct_form() {
     );
     assert_eq!(cand.correct_form(), "anish");
     assert_eq!(cand.transcript_form(), "Anis");
+}
+
+#[test]
+fn emiac_concatenation_blocked_by_concatenation_gate() {
+    // Production case: user wanted to replace "MAAR" with "EMIAC" but the
+    // captured edit shows "EMIACMAAR" because keystroke replay missed the
+    // selection event in an AX-blind app.  The concatenation gate alone
+    // (independent of capture confidence) must refuse this promotion.
+    let pool = pool();
+    let hunk = Hunk {
+        transcript_window: "MAAR".into(),
+        polish_window:     "MAAR".into(),
+        kept_window:       "EMIACMAAR".into(),
+    };
+    let cands = vec![label(hunk, EditClass::SttError, 0.85)];
+    let kept  = "EMIACMAAR technologies ka kal IPO nikalne wala hai";
+
+    // Even with full "ax" confidence, the concatenation gate refuses promotion.
+    let (promoted, learned) = promote(&pool, "u1", kept, "english", &cands);
+    assert_eq!(promoted, 0, "concatenation pattern must not promote");
+    assert!(!learned);
+    assert_eq!(vocabulary::count(&pool, "u1"), 0);
+}
+
+#[test]
+fn keystroke_only_capture_blocks_all_promotion() {
+    // Foundational guard: when the desktop reports `keystroke_only`
+    // (clipboard verification was unavailable, so the captured edit might be
+    // a reconstruction artifact), NO promotion fires regardless of class.
+    let pool = pool();
+    let hunk = Hunk {
+        transcript_window: "written".into(),
+        polish_window:     "written".into(),
+        kept_window:       "n8n".into(),
+    };
+    let cands = vec![label(hunk, EditClass::SttError, 0.95)];
+    let (promoted, learned) =
+        promote_with_capture(&pool, "u1", "I use n8n daily", "english", &cands, "keystroke_only");
+    assert_eq!(promoted, 0, "low-confidence capture must not auto-promote");
+    assert!(!learned);
+    assert_eq!(vocabulary::count(&pool, "u1"), 0,
+               "vocab must remain empty under keystroke_only confidence");
+}
+
+#[test]
+fn keystroke_verified_capture_does_promote() {
+    // When the desktop cross-verified keystroke replay against clipboard and
+    // they agreed, capture confidence is high — promotion proceeds normally.
+    let pool = pool();
+    let hunk = Hunk {
+        transcript_window: "written".into(),
+        polish_window:     "written".into(),
+        kept_window:       "n8n".into(),
+    };
+    let cands = vec![label(hunk, EditClass::SttError, 0.95)];
+    let (promoted, learned) =
+        promote_with_capture(&pool, "u1", "I use n8n", "english", &cands, "keystroke_verified");
+    assert!(promoted >= 1);
+    assert!(learned);
+    assert!(vocabulary::top_term_strings(&pool, "u1", 10).contains(&"n8n".to_string()));
+}
+
+#[test]
+fn clipboard_capture_does_promote() {
+    let pool = pool();
+    let hunk = Hunk {
+        transcript_window: "written".into(),
+        polish_window:     "written".into(),
+        kept_window:       "n8n".into(),
+    };
+    let cands = vec![label(hunk, EditClass::SttError, 0.9)];
+    let (promoted, learned) =
+        promote_with_capture(&pool, "u1", "I use n8n", "english", &cands, "clipboard");
+    assert!(promoted >= 1);
+    assert!(learned);
+}
+
+#[test]
+fn unknown_capture_method_defaults_to_blocked() {
+    // Defensive: any unknown capture_method string is treated as low-confidence.
+    let pool = pool();
+    let hunk = Hunk {
+        transcript_window: "written".into(),
+        polish_window:     "written".into(),
+        kept_window:       "n8n".into(),
+    };
+    let cands = vec![label(hunk, EditClass::SttError, 0.9)];
+    let (promoted, _) =
+        promote_with_capture(&pool, "u1", "I use n8n", "english", &cands, "future_method");
+    assert_eq!(promoted, 0);
 }
 
 #[test]

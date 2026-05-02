@@ -45,9 +45,24 @@ use crate::{
 
 #[derive(Deserialize)]
 pub struct ClassifyBody {
-    pub recording_id: String,
-    pub ai_output:    String,
-    pub user_kept:    String,
+    pub recording_id:   String,
+    pub ai_output:      String,
+    pub user_kept:      String,
+    /// How the desktop captured the edit text.  Drives auto-promotion gating:
+    ///   "ax" | "keystroke_verified" → high confidence, may auto-promote
+    ///   "clipboard"                 → medium, may auto-promote with strict gates
+    ///   "keystroke_only"            → LOW, store as pending only
+    /// Missing/unknown values are treated as `"ax"` for backward compatibility.
+    #[serde(default = "default_capture_method")]
+    pub capture_method: String,
+}
+
+fn default_capture_method() -> String { "ax".to_string() }
+
+/// Capture-confidence policy.  Maps the wire-level `capture_method` string
+/// into a single bool: "is this capture trustworthy enough to auto-promote?"
+fn capture_allows_auto_promote(capture_method: &str) -> bool {
+    matches!(capture_method, "ax" | "keystroke_verified" | "clipboard")
 }
 
 #[derive(Serialize)]
@@ -153,12 +168,26 @@ pub async fn classify(
     let mut pending_id     = None;
     let mut learned        = false;
 
+    // Capture-confidence master switch.  When false, no auto-promotion regardless
+    // of class — we store as pending and let the user review.  This is the
+    // foundational guard against unreliable AX-blind keystroke reconstruction
+    // (where CGEventTap can't see selection events, so a "select X + type Y"
+    // edit looks identical to "type Y at cursor", producing concatenations).
+    let auto_promote_allowed = capture_allows_auto_promote(&body.capture_method);
+    if !auto_promote_allowed {
+        info!(
+            "[classify] capture_method={:?} → low-confidence capture, no auto-promotion (will store as pending if learnable)",
+            body.capture_method
+        );
+    }
+
     for cand in &result.candidates {
         let correct = cand.correct_form().trim();
         if correct.is_empty() { continue; }
 
         match cand.class {
             EditClass::SttError => {
+                if !auto_promote_allowed { continue; }
                 if !stt_promotion_allowed(cand, correct, &body.user_kept, &output_language) {
                     continue;
                 }
@@ -181,6 +210,7 @@ pub async fn classify(
                 }
             }
             EditClass::PolishError => {
+                if !auto_promote_allowed { continue; }
                 if !polish_promotion_allowed(cand, correct, &body.user_kept, &output_language) {
                     continue;
                 }
@@ -204,9 +234,15 @@ pub async fn classify(
         }
     }
 
-    // For overall=POLISH_ERROR the user can review pending if no auto-promotion
-    // fired (single-shot first-time correction).  This is the safety valve.
-    if result.class == EditClass::PolishError && !learned {
+    // Pending-edit safety valve.  Two reasons to write a pending row:
+    //   1. POLISH_ERROR with no auto-promotion fired (single-shot, user reviews).
+    //   2. ANY learnable class (STT_ERROR | POLISH_ERROR) when the capture was
+    //      low-confidence (auto_promote_allowed=false).  Without this, low-
+    //      confidence captures would silently disappear.
+    let learnable = result.class.is_learnable();
+    let needs_pending = (result.class == EditClass::PolishError && !learned)
+        || (learnable && !auto_promote_allowed);
+    if needs_pending {
         pending_id = pending_edits::insert(
             &state.pool, &state.default_user_id,
             Some(&body.recording_id), &body.ai_output, &body.user_kept,
@@ -256,6 +292,24 @@ fn stt_promotion_allowed(
     if !promotion_gate::script_matches(correct, output_language) {
         warn!(
             "[classify] STT_ERROR rejected — script of {correct:?} doesn't match output_language={output_language:?}"
+        );
+        return false;
+    }
+
+    // Concatenation guard: when correct_form contains polish_form as a
+    // substring (e.g. polish="MAAR" + kept="EMIACMAAR"), the user almost
+    // certainly intended a *replacement* but cursor positioning produced an
+    // *insertion*.  Refuse to promote — it's ambiguous and produces noisy vocab.
+    //
+    // Exception: if extracted_term is present and points at a sub-token (which
+    // by parser invariant must be a whole-word substring of the hunk windows),
+    // we trust the extraction over the raw concatenation pattern.
+    if cand.extracted_term.is_none()
+        && promotion_gate::is_concatenation_pattern(cand.polish_form(), correct)
+    {
+        warn!(
+            "[classify] STT_ERROR rejected — concatenation pattern: polish_form {:?} ⊂ correct_form {:?} (likely insertion-without-deletion)",
+            cand.polish_form(), correct,
         );
         return false;
     }
@@ -332,5 +386,22 @@ fn empty_response(class: &str, reason: &str) -> ClassifyResponse {
         pending_id:     None,
         promoted_count: 0,
         is_repeat:      false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_method_policy_table() {
+        assert!(capture_allows_auto_promote("ax"));
+        assert!(capture_allows_auto_promote("keystroke_verified"));
+        assert!(capture_allows_auto_promote("clipboard"));
+        // The bug case: keystroke alone is NOT allowed to auto-promote.
+        assert!(!capture_allows_auto_promote("keystroke_only"));
+        // Unknown values default to refused (safe fallback).
+        assert!(!capture_allows_auto_promote(""));
+        assert!(!capture_allows_auto_promote("anything_else"));
     }
 }

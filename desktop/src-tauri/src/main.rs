@@ -1417,9 +1417,17 @@ async fn watch_for_edit(
         matches!((initial_pid, final_pid), (Some(a), Some(b)) if a == b),
     );
 
-    // ── Determine user_kept ────────────────────────────────────────────────────
+    // ── Determine user_kept + capture_method ───────────────────────────────────
+    //
+    // The capture_method is propagated to the backend so auto-promotion thresholds
+    // can scale with capture confidence:
+    //   • "ax"                 → AX API read directly (high confidence, ground truth)
+    //   • "keystroke_verified" → keystroke replay AGREES with clipboard read (high)
+    //   • "clipboard"          → clipboard read; keystroke unavailable or disagreed (medium)
+    //   • "keystroke_only"     → keystroke replay; clipboard unreachable (LOW — pending only)
 
     let user_kept: String;
+    let capture_method: &'static str;
 
     if !post_paste.is_empty() {
         // ── AX was readable — compare values directly ──────────────────────────
@@ -1428,6 +1436,7 @@ async fn watch_for_edit(
             return;
         }
         user_kept = extract_kept(&polished, &post_paste, &effective_val);
+        capture_method = "ax";
         tracing::info!(
             "[edit-watch] edit captured (AX) for {recording_id}: {:?} → {:?}",
             polished.chars().take(60).collect::<String>(),
@@ -1435,74 +1444,111 @@ async fn watch_for_edit(
         );
     } else {
         // ── AX blind (Lark, Chrome contenteditable, WebView) ─────────────────
-        // AXValue returned nil.  Replay the keystrokes the CGEventTap has been
-        // recording in its ring buffer since watch_start (same technique as
-        // Wispr Flow — universal, works in any app).
+        //
+        // Foundational rule: keystroke replay alone is STRUCTURALLY UNRELIABLE.
+        // CGEventTap doesn't see selection events (mouse drag-select, some
+        // app-level Cmd+A flavours), so a "select MAAR + type EMIAC" edit
+        // looks identical to "type EMIAC at cursor" — we'd reconstruct
+        // "EMIACMAAR" instead of the actual "EMIAC".
+        //
+        // Fix: ALWAYS cross-verify with clipboard. Clipboard reads the actual
+        // final state of the field; it's the ground truth.
+        //   • keystroke + clipboard agree           → high confidence
+        //   • keystroke + clipboard disagree         → trust clipboard
+        //   • clipboard available, keystroke None    → use clipboard
+        //   • clipboard unavailable                  → use keystroke but mark LOW
+        //   • neither available                      → skip
 
         #[cfg(target_os = "macos")]
         {
-            match reconstruct_from_keystrokes(&polished, watch_start) {
-                Some(reconstructed) if reconstructed.trim() != polished.trim() => {
-                    user_kept = reconstructed;
+            let same_app = matches!(
+                (initial_pid, final_pid),
+                (Some(a), Some(b)) if a == b
+            );
+            if !same_app {
+                tracing::info!(
+                    "[edit-watch] AX-blind + app switched — skipping {recording_id}"
+                );
+                return;
+            }
+
+            // 1. Run keystroke replay (no side effects).
+            let ks_result = reconstruct_from_keystrokes(&polished, watch_start);
+
+            // 2. Run clipboard verification (Cmd+A+C — has visible side effects
+            //    but they're transient and restored).  Spawn-blocking because
+            //    paster's clipboard ops are sync.
+            let cb_result = tokio::task::spawn_blocking(paster::capture_focused_text_via_selection)
+                .await
+                .unwrap_or(None);
+
+            let polished_trimmed = polished.trim();
+
+            // 3. Extract the kept text from clipboard if it contains polish.
+            let cb_kept: Option<String> = cb_result.and_then(|raw| {
+                let captured = raw.trim().to_string();
+                if !captured.contains(polished_trimmed) {
+                    return None;
+                }
+                let edited = extract_kept(polished_trimmed, polished_trimmed, &captured);
+                if edited == polished_trimmed { None } else { Some(edited) }
+            });
+
+            // 4. Reconcile keystroke vs clipboard.
+            match (ks_result, cb_kept) {
+                (Some(ks_text), Some(cb_text)) => {
+                    // Both available — clipboard is ground truth, keystroke is
+                    // confirmation.  If they agree (modulo trim) → high
+                    // confidence.  If they disagree → trust clipboard.
+                    if ks_text.trim() == cb_text.trim() {
+                        user_kept = cb_text;
+                        capture_method = "keystroke_verified";
+                        tracing::info!(
+                            "[edit-watch] edit captured (keystroke ⊕ clipboard agreed) for {recording_id}: {:?} → {:?}",
+                            polished.chars().take(60).collect::<String>(),
+                            user_kept.chars().take(60).collect::<String>(),
+                        );
+                    } else {
+                        tracing::warn!(
+                            "[edit-watch] keystroke ≠ clipboard — trusting clipboard. ks={:?} cb={:?}",
+                            ks_text.chars().take(60).collect::<String>(),
+                            cb_text.chars().take(60).collect::<String>(),
+                        );
+                        user_kept = cb_text;
+                        capture_method = "clipboard";
+                    }
+                }
+                (None, Some(cb_text)) => {
+                    user_kept = cb_text;
+                    capture_method = "clipboard";
                     tracing::info!(
-                        "[edit-watch] edit captured (keystrokes) for {recording_id}: {:?} → {:?}",
+                        "[edit-watch] edit captured (clipboard, keystroke uncertain) for {recording_id}: {:?} → {:?}",
                         polished.chars().take(60).collect::<String>(),
                         user_kept.chars().take(60).collect::<String>(),
                     );
                 }
-                Some(_) => {
-                    // Keystrokes replayed cleanly — user made no change.
+                (Some(ks_text), None) => {
+                    // Clipboard unreachable. Use keystroke but mark LOW —
+                    // backend will store as pending instead of auto-promoting.
+                    if ks_text.trim() == polished_trimmed {
+                        tracing::info!(
+                            "[edit-watch] keystroke replay: no change from polished — skipping {recording_id}"
+                        );
+                        return;
+                    }
+                    user_kept = ks_text;
+                    capture_method = "keystroke_only";
+                    tracing::warn!(
+                        "[edit-watch] edit captured (keystroke ONLY, clipboard unreachable) for {recording_id}: {:?} → {:?} (low-confidence — will store as pending only)",
+                        polished.chars().take(60).collect::<String>(),
+                        user_kept.chars().take(60).collect::<String>(),
+                    );
+                }
+                (None, None) => {
                     tracing::info!(
-                        "[edit-watch] keystroke replay: no change from polished — skipping {recording_id}"
+                        "[edit-watch] both keystroke and clipboard unavailable — skipping {recording_id}"
                     );
                     return;
-                }
-                None => {
-                    // Reconstruction uncertain (mouse click / Cmd+Z / Cmd+X).
-                    // Try Cmd+A+C clipboard capture as a last resort if still in the same app.
-                    tracing::info!(
-                        "[edit-watch] keystroke replay uncertain — trying clipboard fallback for {recording_id}"
-                    );
-
-                    let same_app = matches!(
-                        (initial_pid, final_pid),
-                        (Some(a), Some(b)) if a == b
-                    );
-                    if !same_app {
-                        tracing::info!("[edit-watch] app switched — skipping {recording_id}");
-                        return;
-                    }
-
-                    let captured = tokio::task::spawn_blocking(paster::capture_focused_text_via_selection)
-                        .await
-                        .unwrap_or(None);
-                    let Some(raw) = captured else {
-                        tracing::info!(
-                            "[edit-watch] clipboard fallback returned nothing — skipping {recording_id}"
-                        );
-                        return;
-                    };
-                    let captured         = raw.trim().to_string();
-                    let polished_trimmed = polished.trim();
-                    if !captured.contains(polished_trimmed) {
-                        tracing::info!(
-                            "[edit-watch] polished text not found in field — skipping {recording_id}"
-                        );
-                        return;
-                    }
-                    let edited = extract_kept(polished_trimmed, polished_trimmed, &captured);
-                    if edited == polished_trimmed {
-                        tracing::info!(
-                            "[edit-watch] no edit found via clipboard fallback — skipping {recording_id}"
-                        );
-                        return;
-                    }
-                    user_kept = edited;
-                    tracing::info!(
-                        "[edit-watch] edit captured (clipboard) for {recording_id}: {:?} → {:?}",
-                        polished.chars().take(60).collect::<String>(),
-                        user_kept.chars().take(60).collect::<String>(),
-                    );
                 }
             }
         }
@@ -1551,7 +1597,7 @@ async fn watch_for_edit(
 
     let ep_opt = back_arc.lock().ok().and_then(|g| g.clone());
     if let Some(ref ep) = ep_opt {
-        match api::classify_edit(ep, &recording_id, &polished, &user_kept).await {
+        match api::classify_edit(ep, &recording_id, &polished, &user_kept, capture_method).await {
             Ok(resp) => {
                 tracing::info!(
                     "[edit-watch] classifier: class={} promoted={} repeat={} learned={} notify={} reason={:?} pending={:?}",
