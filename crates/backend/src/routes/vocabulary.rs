@@ -1,28 +1,35 @@
 //! Vocabulary HTTP routes.
 //!
-//! GET  /v1/vocabulary/terms  — light: returns just the term strings, top-N
-//!                              by weight × recency.  Used by the Tauri WS
-//!                              client to bias Deepgram in real time.
-//!
-//! GET  /v1/vocabulary        — full: returns each row with weight, use_count,
-//!                              source, last_used.  Used by the (forthcoming)
-//!                              vocabulary management UI.
+//! GET    /v1/vocabulary/terms      — light: top-N term strings (STT-bias hot path)
+//! GET    /v1/vocabulary            — full: rows with weight/source/use_count
+//! POST   /v1/vocabulary            — manual add (source = 'manual')
+//! DELETE /v1/vocabulary/:term      — hard remove a single term
+//! POST   /v1/vocabulary/:term/star — toggle starred status (immune to demotion)
 
-use axum::{extract::State, Json};
-use serde::Serialize;
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    Json,
+};
+use rusqlite::params;
+use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 
-use crate::{store::vocabulary, AppState};
+use crate::{store::{vocabulary, now_ms}, AppState};
+
+// ── GET /v1/vocabulary/terms (hot path) ──────────────────────────────────────
 
 #[derive(Serialize)]
 pub struct TermsResponse {
     pub terms: Vec<String>,
 }
 
-/// GET /v1/vocabulary/terms — top 100 personal vocab terms by weight.
 pub async fn list_terms(State(state): State<AppState>) -> Json<TermsResponse> {
     let terms = vocabulary::top_term_strings(&state.pool, &state.default_user_id, 100);
     Json(TermsResponse { terms })
 }
+
+// ── GET /v1/vocabulary (management UI) ───────────────────────────────────────
 
 #[derive(Serialize)]
 pub struct VocabListResponse {
@@ -30,9 +37,114 @@ pub struct VocabListResponse {
     pub total: i64,
 }
 
-/// GET /v1/vocabulary — full rows with metadata for management UI.
 pub async fn list(State(state): State<AppState>) -> Json<VocabListResponse> {
-    let terms = vocabulary::top_terms(&state.pool, &state.default_user_id, 200);
+    let terms = vocabulary::top_terms(&state.pool, &state.default_user_id, 500);
     let total = vocabulary::count(&state.pool, &state.default_user_id);
     Json(VocabListResponse { terms, total })
+}
+
+// ── POST /v1/vocabulary (manual add) ─────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct CreateBody {
+    pub term: String,
+}
+
+pub async fn create(
+    State(state): State<AppState>,
+    Json(body):   Json<CreateBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let trimmed = body.term.trim();
+    if trimmed.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "term cannot be empty" })),
+        );
+    }
+    if trimmed.chars().count() > 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "term too long (max 64 chars)" })),
+        );
+    }
+    // Manual entries land at weight=1.5 (slightly above auto-default 1.0) so
+    // user-curated terms outrank a fresh auto-promoted one.
+    let ok = vocabulary::upsert(&state.pool, &state.default_user_id, trimmed, 1.5, "manual");
+    if ok {
+        info!("[vocab] manual add: {trimmed:?}");
+        (StatusCode::CREATED, Json(serde_json::json!({ "term": trimmed })))
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "insert failed" })),
+        )
+    }
+}
+
+// ── DELETE /v1/vocabulary/:term ──────────────────────────────────────────────
+
+pub async fn delete(
+    State(state): State<AppState>,
+    Path(term):   Path<String>,
+) -> StatusCode {
+    let trimmed = term.trim();
+    if trimmed.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
+    let conn = match state.pool.get() {
+        Ok(c) => c,
+        Err(e) => { warn!("[vocab] delete pool error: {e}"); return StatusCode::INTERNAL_SERVER_ERROR; }
+    };
+    let n = conn.execute(
+        "DELETE FROM vocabulary WHERE user_id = ?1 AND term = ?2",
+        params![state.default_user_id.as_str(), trimmed],
+    ).unwrap_or(0);
+    info!("[vocab] delete term={trimmed:?} rows={n}");
+    if n > 0 { StatusCode::NO_CONTENT } else { StatusCode::NOT_FOUND }
+}
+
+// ── POST /v1/vocabulary/:term/star ───────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct StarResponse {
+    pub starred: bool,
+}
+
+pub async fn toggle_star(
+    State(state): State<AppState>,
+    Path(term):   Path<String>,
+) -> (StatusCode, Json<StarResponse>) {
+    let trimmed = term.trim();
+    if trimmed.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(StarResponse { starred: false }));
+    }
+    let conn = match state.pool.get() {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(StarResponse { starred: false })),
+    };
+    let current_source: Option<String> = conn.query_row(
+        "SELECT source FROM vocabulary WHERE user_id = ?1 AND term = ?2",
+        params![state.default_user_id.as_str(), trimmed],
+        |r| r.get(0),
+    ).ok();
+
+    let Some(source) = current_source else {
+        return (StatusCode::NOT_FOUND, Json(StarResponse { starred: false }));
+    };
+
+    let (new_source, new_weight, starred) = if source == "starred" {
+        // Un-star → revert to manual (preserve weight, just lift the demotion shield).
+        ("manual", 1.5_f64, false)
+    } else {
+        // Star → bump weight high so it sorts to top + becomes demotion-immune.
+        ("starred", 3.0_f64, true)
+    };
+
+    let n = conn.execute(
+        "UPDATE vocabulary SET source = ?1, weight = ?2, last_used = ?3
+           WHERE user_id = ?4 AND term = ?5",
+        params![new_source, new_weight, now_ms(), state.default_user_id.as_str(), trimmed],
+    ).unwrap_or(0);
+    info!("[vocab] toggle_star term={trimmed:?} → source={new_source} starred={starred} rows={n}");
+    (StatusCode::OK, Json(StarResponse { starred }))
 }

@@ -7,6 +7,7 @@ import { Topbar } from "@/components/Topbar";
 import { DashboardView } from "@/components/views/DashboardView";
 import { HistoryView } from "@/components/views/HistoryView";
 import { InsightsView } from "@/components/views/InsightsView";
+import { VocabularyView } from "@/components/views/VocabularyView";
 import {
   invoke,
   listHistory,
@@ -34,8 +35,8 @@ import { useTheme } from "@/lib/useTheme";
 import type { AppSnapshot, HistoryItem, PendingEdit, Recording } from "@/types";
 import { RetryToast, EditConfirmToast } from "@/components/NotificationToast";
 
-export type ActiveView = "dashboard" | "history" | "insights" | "settings";
-const VALID_VIEWS: ActiveView[] = ["dashboard", "history", "insights", "settings"];
+export type ActiveView = "dashboard" | "history" | "vocabulary" | "insights" | "settings";
+const VALID_VIEWS: ActiveView[] = ["dashboard", "history", "vocabulary", "insights", "settings"];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -572,8 +573,9 @@ export default function App() {
                 }}
               />
             )}
-            {activeView === "history"  && <HistoryView />}
-            {activeView === "insights" && <InsightsView snapshot={snapshotWithHistory} />}
+            {activeView === "history"    && <HistoryView />}
+            {activeView === "vocabulary" && <VocabularyView />}
+            {activeView === "insights"   && <InsightsView snapshot={snapshotWithHistory} />}
             {/* Settings is now a modal — opened via setSettingsOpen */}
           </div>
         </main>

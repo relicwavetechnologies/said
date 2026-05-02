@@ -755,6 +755,108 @@ pub async fn get_vocabulary_terms(ep: &BackendEndpoint) -> Result<Vec<String>, S
     Ok(resp.terms)
 }
 
+// ── Vocabulary management API (settings UI) ─────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VocabRow {
+    pub term:      String,
+    pub weight:    f64,
+    pub use_count: i64,
+    pub last_used: i64,
+    pub source:    String,   // "auto" | "manual" | "starred"
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VocabListResponse {
+    pub terms: Vec<VocabRow>,
+    pub total: i64,
+}
+
+/// Full vocab list with metadata, for the management view.
+pub async fn list_vocabulary(ep: &BackendEndpoint) -> Result<VocabListResponse, String> {
+    let url = format!("{}/v1/vocabulary", ep.url);
+    Client::new()
+        .get(&url)
+        .header("Authorization", ep.bearer())
+        .send()
+        .await
+        .map_err(|e| format!("list vocab failed: {e}"))?
+        .json::<VocabListResponse>()
+        .await
+        .map_err(|e| format!("parse vocab list: {e}"))
+}
+
+/// Manually add a term (source = "manual", weight 1.5).
+pub async fn add_vocabulary_term(ep: &BackendEndpoint, term: &str) -> Result<(), String> {
+    let url = format!("{}/v1/vocabulary", ep.url);
+    let resp = Client::new()
+        .post(&url)
+        .header("Authorization", ep.bearer())
+        .json(&serde_json::json!({ "term": term }))
+        .send()
+        .await
+        .map_err(|e| format!("add vocab failed: {e}"))?;
+    let status = resp.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(format!("add vocab error {status}: {body}"))
+    }
+}
+
+/// Hard-delete a single vocab term.
+pub async fn delete_vocabulary_term(ep: &BackendEndpoint, term: &str) -> Result<(), String> {
+    let encoded = urlencoding_encode(term);
+    let url = format!("{}/v1/vocabulary/{}", ep.url, encoded);
+    let status = Client::new()
+        .delete(&url)
+        .header("Authorization", ep.bearer())
+        .send()
+        .await
+        .map_err(|e| format!("delete vocab failed: {e}"))?
+        .status();
+    if status.is_success() || status.as_u16() == 204 {
+        Ok(())
+    } else {
+        Err(format!("delete vocab error {status}"))
+    }
+}
+
+/// Toggle starred status — returns the new starred state.
+pub async fn star_vocabulary_term(ep: &BackendEndpoint, term: &str) -> Result<bool, String> {
+    let encoded = urlencoding_encode(term);
+    let url = format!("{}/v1/vocabulary/{}/star", ep.url, encoded);
+    let resp = Client::new()
+        .post(&url)
+        .header("Authorization", ep.bearer())
+        .send()
+        .await
+        .map_err(|e| format!("star vocab failed: {e}"))?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("parse star response: {e}"))?;
+    Ok(resp["starred"].as_bool().unwrap_or(false))
+}
+
+/// Minimal RFC-3986 path-segment encoder (Tauri-side).  Same conservative
+/// rules as the backend's keyterm encoder so server-side parsing matches.
+fn urlencoding_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(out, "%{:02X}", b);
+            }
+        }
+    }
+    out
+}
+
 pub async fn get_pending_edits(ep: &BackendEndpoint) -> Result<PendingEditsResponse, String> {
     let url = format!("{}/v1/pending-edits", ep.url);
     Client::new()

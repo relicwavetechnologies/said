@@ -586,6 +586,57 @@ export function onPendingEditsChanged(handler: () => void): () => void {
   return () => unsub();
 }
 
+// ── Vocabulary management ────────────────────────────────────────────────────
+
+export interface VocabRow {
+  term:      string;
+  weight:    number;
+  use_count: number;
+  last_used: number;
+  source:    "auto" | "manual" | "starred";
+}
+
+export interface VocabListResponse {
+  terms: VocabRow[];
+  total: number;
+}
+
+export async function listVocabulary(): Promise<VocabListResponse> {
+  if (!isTauriRuntime()) return { terms: [], total: 0 };
+  try {
+    return await tauriInvoke<VocabListResponse>("list_vocabulary");
+  } catch {
+    return { terms: [], total: 0 };
+  }
+}
+
+export async function addVocabularyTerm(term: string): Promise<void> {
+  if (!isTauriRuntime()) return;
+  await tauriInvoke("add_vocabulary_term", { term });
+}
+
+export async function deleteVocabularyTerm(term: string): Promise<void> {
+  if (!isTauriRuntime()) return;
+  await tauriInvoke("delete_vocabulary_term", { term });
+}
+
+export async function starVocabularyTerm(term: string): Promise<boolean> {
+  if (!isTauriRuntime()) return false;
+  try {
+    return await tauriInvoke<boolean>("star_vocabulary_term", { term });
+  } catch {
+    return false;
+  }
+}
+
+/** Listen for vocabulary mutations (manual add / delete / star toggle / auto-promote). */
+export function onVocabularyChanged(handler: () => void): () => void {
+  if (!isTauriRuntime()) return () => {};
+  let unsub: () => void = () => {};
+  listen("vocabulary-changed", () => handler()).then((fn) => { unsub = fn; });
+  return () => unsub();
+}
+
 // Suppress unused-import warnings for types only used in exported signatures
 export type {
   CloudAuthResponse,

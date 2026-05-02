@@ -1238,6 +1238,52 @@ async fn resolve_pending_edit(
     api::resolve_pending_edit(&ep, &id, &action).await
 }
 
+// ── Vocabulary management commands ────────────────────────────────────────────
+
+#[tauri::command]
+async fn list_vocabulary(
+    backend: State<'_, BackendState>,
+) -> Result<api::VocabListResponse, String> {
+    let ep = get_endpoint(&backend)?;
+    api::list_vocabulary(&ep).await
+}
+
+#[tauri::command]
+async fn add_vocabulary_term(
+    app:     tauri::AppHandle,
+    backend: State<'_, BackendState>,
+    term:    String,
+) -> Result<(), String> {
+    let ep = get_endpoint(&backend)?;
+    api::add_vocabulary_term(&ep, &term).await?;
+    let _ = app.emit("vocabulary-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+async fn delete_vocabulary_term(
+    app:     tauri::AppHandle,
+    backend: State<'_, BackendState>,
+    term:    String,
+) -> Result<(), String> {
+    let ep = get_endpoint(&backend)?;
+    api::delete_vocabulary_term(&ep, &term).await?;
+    let _ = app.emit("vocabulary-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+async fn star_vocabulary_term(
+    app:     tauri::AppHandle,
+    backend: State<'_, BackendState>,
+    term:    String,
+) -> Result<bool, String> {
+    let ep = get_endpoint(&backend)?;
+    let starred = api::star_vocabulary_term(&ep, &term).await?;
+    let _ = app.emit("vocabulary-changed", ());
+    Ok(starred)
+}
+
 // ── Cloud auth commands ───────────────────────────────────────────────────────
 
 /// Cloud URL — read from env, default to the hosted service.
@@ -2150,6 +2196,11 @@ fn main() {
             // Pending-edit review
             get_pending_edits,
             resolve_pending_edit,
+            // Vocabulary management
+            list_vocabulary,
+            add_vocabulary_term,
+            delete_vocabulary_term,
+            star_vocabulary_term,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Voice Polish desktop")
