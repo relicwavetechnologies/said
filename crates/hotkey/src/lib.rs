@@ -100,6 +100,10 @@ mod imp {
             /// macOS 10.15+ — returns true if this process has Input Monitoring TCC permission.
             /// This is the authoritative API; does NOT create any tap, no false positives.
             pub fn CGPreflightListenEventAccess() -> bool;
+
+            /// macOS 10.15+ — prompt the user to grant Input Monitoring TCC permission.
+            /// Shows the system dialog; returns true if permission is already granted.
+            pub fn CGRequestListenEventAccess() -> bool;
         }
     }
 
@@ -512,8 +516,11 @@ mod imp {
         let tap = unsafe { ffi::CGEventTapCreate(0, 0, 0, mask, callback, std::ptr::null_mut()) };
 
         if tap.is_null() {
-            eprintln!("[hotkey] CGEventTapCreate failed (Input Monitoring not granted?)");
-            eprintln!("         System Settings → Privacy & Security → Input Monitoring");
+            eprintln!("[hotkey] CGEventTapCreate failed — requesting Input Monitoring permission");
+            // Trigger the macOS TCC permission dialog for Input Monitoring.
+            // NSInputMonitoringUsageDescription in Info.plist is required for this to work.
+            unsafe { ffi::CGRequestListenEventAccess() };
+            eprintln!("[hotkey] Restart the app after granting Input Monitoring in System Settings.");
             return;
         }
 
