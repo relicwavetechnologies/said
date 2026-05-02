@@ -1,4 +1,5 @@
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, useLayoutEffect } from "react";
+import { createPortal } from "react-dom";
 import {
   LayoutDashboard,
   History,
@@ -194,15 +195,29 @@ const SUPPORT_EMAIL = "support@emiactech.com";
 
 function HelpButton() {
   const [open, setOpen] = useState(false);
-  const wrapRef = useRef<HTMLDivElement>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const popRef = useRef<HTMLDivElement>(null);
+  const [pos,  setPos]  = useState<{ left: number; bottom: number } | null>(null);
+
+  // Compute popover position from the anchor button's rect — using a portal
+  // so we escape the sidebar's overflow:hidden clipping.
+  useLayoutEffect(() => {
+    if (!open || !btnRef.current) return;
+    const r = btnRef.current.getBoundingClientRect();
+    setPos({
+      left:   r.right + 10,                          // 10px to the right of the button
+      bottom: window.innerHeight - r.bottom,         // align to button's bottom edge
+    });
+  }, [open]);
 
   // Click-away + ESC to close
   useEffect(() => {
     if (!open) return;
     function onDoc(e: MouseEvent) {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
+      const t = e.target as Node;
+      if (btnRef.current?.contains(t)) return;
+      if (popRef.current?.contains(t)) return;
+      setOpen(false);
     }
     function onKey(e: KeyboardEvent) {
       if (e.key === "Escape") setOpen(false);
@@ -216,8 +231,9 @@ function HelpButton() {
   }, [open]);
 
   return (
-    <div ref={wrapRef} className="relative">
+    <>
       <button
+        ref={btnRef}
         className={cn("nav-item", open && "active")}
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
@@ -228,16 +244,17 @@ function HelpButton() {
         <span className="flex-1 truncate text-left">Help</span>
       </button>
 
-      {/* Popover — sits to the right of the sidebar, vertically aligned with
-          the Help button. Same rounded-[16px] surface + inset stroke + drop
-          shadow as the rest of the app's panels. */}
-      {open && (
+      {/* Portal to body so overflow:hidden on the sidebar can't clip us,
+          and so we sit above any view content (recordings list, etc). */}
+      {open && pos && createPortal(
         <div
-          className="absolute z-50 left-full bottom-0 ml-3 w-[260px] rounded-2xl overflow-hidden"
+          ref={popRef}
+          className="fixed z-[100] w-[240px] rounded-2xl overflow-hidden"
           style={{
+            left: pos.left, bottom: pos.bottom,
             background: "hsl(var(--surface-2))",
             boxShadow:
-              "inset 0 0 0 1px hsl(var(--border)), inset 0 1px 0 hsl(0 0% 100% / 0.06), 0 18px 50px hsl(220 60% 2% / 0.55)",
+              "inset 0 0 0 1px hsl(var(--border)), inset 0 1px 0 hsl(0 0% 100% / 0.06), 0 6px 20px hsl(220 60% 2% / 0.30)",
             animation: "fadeIn 0.14s ease-out",
           }}
         >
@@ -292,8 +309,9 @@ function HelpButton() {
               Email support
             </button>
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
-    </div>
+    </>
   );
 }

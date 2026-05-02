@@ -436,35 +436,35 @@ export default function App() {
         />
 
         <div
-          className="relative w-full max-w-[400px] flex flex-col p-9 rounded-[20px]"
+          className="relative w-full max-w-[340px] flex flex-col p-7 rounded-[18px]"
           style={{
             background: "hsl(var(--surface-2))",
             boxShadow:
-              "inset 0 1px 0 hsl(0 0% 100% / 0.06), 0 30px 80px hsl(220 60% 2% / 0.55)",
+              "inset 0 1px 0 hsl(0 0% 100% / 0.06), 0 18px 50px hsl(220 60% 2% / 0.45)",
           }}
         >
 
-          {/* Brand — same mark as the sidebar so it reads instantly */}
-          <div className="flex flex-col items-center gap-3 mb-7">
-            <BrandMark size={56} idSuffix="auth-login" />
+          {/* Brand — tight stack */}
+          <div className="flex flex-col items-center gap-2.5 mb-5">
+            <BrandMark size={40} idSuffix="auth-login" />
             <div className="text-center">
               <h1
-                className="text-[22px] font-extrabold tracking-tight"
+                className="text-[18px] font-extrabold tracking-tight"
                 style={{ color: "hsl(var(--foreground))", letterSpacing: "-0.02em" }}
               >
                 {authMode === "login" ? "Welcome back" : "Welcome to Said"}
               </h1>
-              <p className="text-[12.5px] text-muted-foreground mt-1">
+              <p className="text-[11.5px] text-muted-foreground mt-1">
                 {authMode === "login"
-                  ? "Sign in to sync your vocabulary and history."
-                  : "Voice that sounds like you. Free while we're early."}
+                  ? "Sign in to sync your vocabulary."
+                  : "Free while we're early."}
               </p>
             </div>
           </div>
 
-          {/* Mode toggle — uses the same .pill pattern as the rest of the app */}
+          {/* Mode toggle — same pill pattern, tighter */}
           <div
-            className="flex gap-1 p-1 rounded-xl mb-5"
+            className="flex gap-1 p-0.5 rounded-lg mb-3.5"
             style={{ background: "hsl(var(--surface-1))" }}
           >
             {(["login", "signup"] as const).map((m) => {
@@ -473,11 +473,10 @@ export default function App() {
                 <button
                   key={m}
                   onClick={() => { setAuthMode(m); setAuthError(""); }}
-                  className="flex-1 py-1.5 text-[12px] font-semibold rounded-lg transition-all"
+                  className="flex-1 py-1 text-[11.5px] font-semibold rounded-md transition-all"
                   style={{
                     background: isActive ? "hsl(var(--pill-active-bg))" : "transparent",
                     color:      isActive ? "hsl(var(--pill-active-fg))" : "hsl(var(--muted-foreground))",
-                    boxShadow:  isActive ? "0 4px 12px hsl(var(--pill-active-bg) / 0.25)" : "none",
                   }}
                 >
                   {m === "login" ? "Sign in" : "Create account"}
@@ -486,8 +485,8 @@ export default function App() {
             })}
           </div>
 
-          {/* Form — uses the shared .input class so focus/hover match every other field */}
-          <form onSubmit={handleAuthSubmit} className="flex flex-col gap-2.5">
+          {/* Form — shared .input class, tighter spacing */}
+          <form onSubmit={handleAuthSubmit} className="flex flex-col gap-2">
             <input
               type="email"
               placeholder="you@example.com"
@@ -496,7 +495,7 @@ export default function App() {
               onChange={(e) => setAuthEmail(e.target.value)}
               required
               className="input"
-              style={{ fontSize: 13.5 }}
+              style={{ fontSize: 13 }}
             />
             <input
               type="password"
@@ -506,39 +505,39 @@ export default function App() {
               onChange={(e) => setAuthPass(e.target.value)}
               required
               className="input"
-              style={{ fontSize: 13.5 }}
+              style={{ fontSize: 13 }}
             />
 
             {authError && (
               <div
-                className="flex items-center gap-2 px-3 py-2 rounded-lg mt-1"
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md mt-0.5"
                 style={{
                   background: "hsl(354 78% 60% / 0.10)",
                   color:      "hsl(354 78% 75%)",
                   boxShadow:  "inset 0 0 0 1px hsl(354 78% 60% / 0.25)",
                 }}
               >
-                <AlertCircle size={13} className="flex-shrink-0" />
-                <span className="text-[12px] font-medium">{authError}</span>
+                <AlertCircle size={12} className="flex-shrink-0" />
+                <span className="text-[11.5px] font-medium">{authError}</span>
               </div>
             )}
 
-            {/* Primary CTA — same .btn-primary as every other primary action */}
+            {/* Primary CTA — same .btn-primary, tighter padding */}
             <button
               type="submit"
               disabled={authBusy || !authEmail || !authPass}
-              className="btn-primary mt-3 w-full justify-center py-2.5 rounded-xl"
-              style={{ fontSize: 13.5 }}
+              className="btn-primary mt-2 w-full justify-center py-2 rounded-lg"
+              style={{ fontSize: 12.5 }}
             >
               {authBusy ? (
                 <>
-                  <Loader2 size={14} className="animate-spin" />
+                  <Loader2 size={13} className="animate-spin" />
                   {authMode === "login" ? "Signing in…" : "Creating account…"}
                 </>
               ) : (
                 <>
                   {authMode === "login" ? "Sign in" : "Create account"}
-                  <ArrowRight size={13} />
+                  <ArrowRight size={12} />
                 </>
               )}
             </button>
@@ -547,7 +546,7 @@ export default function App() {
           {/* Offline escape — quiet, single line */}
           <button
             onClick={() => setNeedsAuth(false)}
-            className="text-[11.5px] text-muted-foreground hover:text-foreground text-center transition-colors mt-5"
+            className="text-[11px] text-muted-foreground hover:text-foreground text-center transition-colors mt-4"
           >
             Continue without an account
           </button>
@@ -574,67 +573,67 @@ export default function App() {
         />
 
         <div
-          className="relative w-full max-w-[400px] flex flex-col p-9 rounded-[20px]"
+          className="relative w-full max-w-[340px] flex flex-col p-7 rounded-[18px]"
           style={{
             background: "hsl(var(--surface-2))",
             boxShadow:
-              "inset 0 1px 0 hsl(0 0% 100% / 0.06), 0 30px 80px hsl(220 60% 2% / 0.55)",
+              "inset 0 1px 0 hsl(0 0% 100% / 0.06), 0 18px 50px hsl(220 60% 2% / 0.45)",
           }}
         >
 
-          {/* Brand — identical to the sign-in step, just the body copy changes */}
-          <div className="flex flex-col items-center gap-3 mb-7">
-            <BrandMark size={56} idSuffix="auth-openai" />
+          {/* Brand — identical scale to sign-in so the two steps feel equal */}
+          <div className="flex flex-col items-center gap-2.5 mb-5">
+            <BrandMark size={40} idSuffix="auth-openai" />
             <div className="text-center">
               <h1
-                className="text-[22px] font-extrabold tracking-tight"
+                className="text-[18px] font-extrabold tracking-tight"
                 style={{ color: "hsl(var(--foreground))", letterSpacing: "-0.02em" }}
               >
                 One last step
               </h1>
-              <p className="text-[12.5px] text-muted-foreground mt-1 leading-relaxed max-w-[300px] mx-auto">
-                Said uses your ChatGPT account to polish your voice. Connect once — it works silently from there.
+              <p className="text-[11.5px] text-muted-foreground mt-1 leading-relaxed">
+                Connect ChatGPT to polish your voice. Once and done.
               </p>
             </div>
           </div>
 
           {connectError && (
             <div
-              className="flex items-center gap-2 px-3 py-2 rounded-lg mb-3"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md mb-2.5"
               style={{
                 background: "hsl(354 78% 60% / 0.10)",
                 color:      "hsl(354 78% 75%)",
                 boxShadow:  "inset 0 0 0 1px hsl(354 78% 60% / 0.25)",
               }}
             >
-              <AlertCircle size={13} className="flex-shrink-0" />
-              <span className="text-[12px] font-medium">{connectError}</span>
+              <AlertCircle size={12} className="flex-shrink-0" />
+              <span className="text-[11.5px] font-medium">{connectError}</span>
             </div>
           )}
 
-          {/* CTA — same .btn-primary token as the rest of the app */}
+          {/* CTA — same .btn-primary token */}
           <button
             onClick={handleOpenAIConnect}
             disabled={connectBusy}
-            className="btn-primary w-full justify-center py-2.5 rounded-xl"
-            style={{ fontSize: 13.5 }}
+            className="btn-primary w-full justify-center py-2 rounded-lg"
+            style={{ fontSize: 12.5 }}
           >
             {connectBusy ? (
               <>
-                <Loader2 size={14} className="animate-spin" />
+                <Loader2 size={13} className="animate-spin" />
                 Waiting for browser…
               </>
             ) : (
               <>
-                Connect ChatGPT account
-                <ArrowRight size={13} />
+                Connect ChatGPT
+                <ArrowRight size={12} />
               </>
             )}
           </button>
 
           {connectBusy && (
-            <p className="text-[11.5px] text-muted-foreground text-center leading-relaxed mt-4">
-              Complete the sign-in in your browser. This window will update automatically.
+            <p className="text-[11px] text-muted-foreground text-center leading-relaxed mt-3">
+              Finish in your browser — this window updates automatically.
             </p>
           )}
         </div>
