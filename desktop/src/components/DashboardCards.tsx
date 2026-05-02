@@ -511,6 +511,40 @@ function wordsToLevel(words: number, max: number): 0 | 1 | 2 | 3 | 4 {
   return 4;
 }
 
+function SideStat({
+  label, value, unit, highlight,
+}: {
+  label:      string;
+  value:      number | string;
+  unit?:      string;
+  highlight?: boolean;
+}) {
+  return (
+    <div>
+      <p className="text-[10.5px] font-bold uppercase tracking-[0.14em]"
+         style={{ color: "hsl(var(--muted-foreground))" }}>
+        {label}
+      </p>
+      <p
+        className="font-bold tabular-nums leading-none tracking-tight mt-1"
+        style={{
+          fontSize: 24,
+          color: highlight ? "hsl(var(--primary))" : "hsl(var(--foreground))",
+          letterSpacing: "-0.02em",
+        }}
+      >
+        {typeof value === "number" ? value.toLocaleString() : value}
+        {unit && (
+          <span className="text-[11px] ml-1.5"
+                style={{ color: "hsl(var(--muted-foreground))", fontWeight: 600 }}>
+            {unit}
+          </span>
+        )}
+      </p>
+    </div>
+  );
+}
+
 export function ActivityHeatmap({
   snapshot,
   isRecording,
@@ -552,16 +586,36 @@ export function ActivityHeatmap({
   max = Math.max(max, 30);
 
   const inWindow: number[] = [];
+  let bestIdx   = -1;
+  let bestWords = 0;
   for (let c = 0; c < COLS; c++) {
     for (let r = 0; r < ROWS; r++) {
       const idx = startIdx + c * 7 + r;
       if (idx > todayIdx) continue;
-      inWindow.push(dayMap.get(idx) ?? 0);
+      const w = dayMap.get(idx) ?? 0;
+      inWindow.push(w);
+      if (w > bestWords) {
+        bestWords = w;
+        bestIdx   = idx;
+      }
     }
   }
-  const totalWords = inWindow.reduce((s, w) => s + w, 0);
-  const activeDays = inWindow.filter((w) => w > 0).length || 1;
-  const dailyAvg   = Math.round(totalWords / activeDays);
+  const totalWords     = inWindow.reduce((s, w) => s + w, 0);
+  const activeDayCount = inWindow.filter((w) => w > 0).length;
+  const totalDays      = inWindow.length;
+  const dailyAvg       = activeDayCount > 0 ? Math.round(totalWords / activeDayCount) : 0;
+
+  // Current streak — count back from today over consecutive non-zero days
+  let streak = 0;
+  for (let i = 0; i < totalDays; i++) {
+    const idx = todayIdx - i;
+    if ((dayMap.get(idx) ?? 0) > 0) streak += 1;
+    else break;
+  }
+
+  const bestDate = bestIdx >= 0
+    ? new Date(bestIdx * 86_400_000).toLocaleDateString("en-US", { month: "short", day: "numeric" })
+    : null;
 
   const colMonthLabel: (string | null)[] = Array(COLS).fill(null);
   let lastMonth = -1;
@@ -634,67 +688,100 @@ export function ActivityHeatmap({
         </div>
       </div>
 
-      {/* Month labels strip */}
-      <div
-        className="grid mb-2"
-        style={{
-          gridTemplateColumns: `repeat(${COLS}, minmax(0, 1fr))`,
-          columnGap: 4,
-        }}
-      >
-        {colMonthLabel.map((label, i) => (
-          <span
-            key={i}
-            className="text-[10.5px] font-medium tabular-nums"
+      {/* Two-column layout: heatmap on the left, derived stats on the right */}
+      <div className="flex gap-8 items-stretch">
+
+        {/* Heatmap — fixed-ish width so it keeps its compact original size */}
+        <div className="flex-shrink min-w-0" style={{ flexBasis: 640, maxWidth: 640 }}>
+          {/* Month labels strip */}
+          <div
+            className="grid mb-2"
             style={{
-              color: "hsl(var(--muted-foreground))",
-              opacity: label ? 1 : 0,
-              minHeight: 14,
+              gridTemplateColumns: `repeat(${COLS}, minmax(0, 1fr))`,
+              columnGap: 4,
             }}
           >
-            {label ?? ""}
-          </span>
-        ))}
-      </div>
+            {colMonthLabel.map((label, i) => (
+              <span
+                key={i}
+                className="text-[10.5px] font-medium tabular-nums"
+                style={{
+                  color: "hsl(var(--muted-foreground))",
+                  opacity: label ? 1 : 0,
+                  minHeight: 14,
+                }}
+              >
+                {label ?? ""}
+              </span>
+            ))}
+          </div>
 
-      {/* Heatmap grid — rows use `auto` so cells take their aspect-ratio
-          height from the column width (1fr rows would collapse to 0 in a
-          container with no explicit height) */}
-      <div
-        className="grid"
-        style={{
-          gridTemplateColumns: `repeat(${COLS}, minmax(0, 1fr))`,
-          gridTemplateRows:    `repeat(${ROWS}, auto)`,
-          gridAutoFlow:        "column",
-          columnGap: 4,
-          rowGap:    4,
-        }}
-      >
-        {Array.from({ length: COLS * ROWS }).map((_, i) => {
-          const c   = Math.floor(i / ROWS);
-          const r   = i % ROWS;
-          const idx = startIdx + c * 7 + r;
-          const future = idx > todayIdx;
-          const words  = future ? 0 : (dayMap.get(idx) ?? 0);
-          const level  = future ? 0 : wordsToLevel(words, max);
-          const isToday = idx === todayIdx;
-          const date    = new Date(idx * 86_400_000);
-          const tip = future
-            ? ""
-            : `${words} word${words === 1 ? "" : "s"} on ${date.toLocaleDateString("en-US", { month: "short", day: "numeric" })}`;
-          return (
-            <span
-              key={i}
-              title={tip}
-              className={`block rounded-full ${isToday ? "heat-current" : `heat-${level}`}`}
-              style={{
-                aspectRatio: "1 / 1",
-                width:       "100%",
-                opacity:     future ? 0.3 : 1,
-              }}
-            />
-          );
-        })}
+          {/* Heatmap grid — rows use `auto` so cells take their aspect-ratio
+              height from the column width (1fr rows would collapse to 0 in
+              a container with no explicit height) */}
+          <div
+            className="grid"
+            style={{
+              gridTemplateColumns: `repeat(${COLS}, minmax(0, 1fr))`,
+              gridTemplateRows:    `repeat(${ROWS}, auto)`,
+              gridAutoFlow:        "column",
+              columnGap: 4,
+              rowGap:    4,
+            }}
+          >
+            {Array.from({ length: COLS * ROWS }).map((_, i) => {
+              const c   = Math.floor(i / ROWS);
+              const r   = i % ROWS;
+              const idx = startIdx + c * 7 + r;
+              const future = idx > todayIdx;
+              const words  = future ? 0 : (dayMap.get(idx) ?? 0);
+              const level  = future ? 0 : wordsToLevel(words, max);
+              const isToday = idx === todayIdx;
+              const date    = new Date(idx * 86_400_000);
+              const tip = future
+                ? ""
+                : `${words} word${words === 1 ? "" : "s"} on ${date.toLocaleDateString("en-US", { month: "short", day: "numeric" })}`;
+              return (
+                <span
+                  key={i}
+                  title={tip}
+                  className={`block rounded-full ${isToday ? "heat-current" : `heat-${level}`}`}
+                  style={{
+                    aspectRatio: "1 / 1",
+                    width:       "100%",
+                    opacity:     future ? 0.3 : 1,
+                  }}
+                />
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Side stats — fills the dead space to the right */}
+        <div
+          className="flex-1 flex flex-col justify-between gap-4 pl-6"
+          style={{
+            minWidth: 140,
+            borderLeft: "1px solid hsl(var(--border))",
+          }}
+        >
+          <SideStat
+            label="Streak"
+            value={streak}
+            unit={streak === 1 ? "day" : "days"}
+            highlight
+          />
+          <SideStat
+            label="Best day"
+            value={bestWords > 0 ? bestWords : "—"}
+            unit={bestWords > 0 ? `words · ${bestDate}` : ""}
+          />
+          <SideStat
+            label="Active"
+            value={activeDayCount}
+            unit={`of ${totalDays} days`}
+          />
+        </div>
       </div>
 
       {/* Footer */}

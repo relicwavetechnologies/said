@@ -12,54 +12,54 @@
 @layer base {
   /* ── DARK (default) — deep navy + mint + violet ─────────────────────── */
   :root {
-    --background:           235 30% 8%;        /* deep navy-violet floor */
+    --background:           0 0% 4%;           /* near-black floor */
     --foreground:           0 0% 96%;
-    --card:                 235 24% 12%;
+    --card:                 0 0% 9%;
     --card-foreground:      0 0% 96%;
-    --popover:              235 24% 13%;
+    --popover:              0 0% 11%;
     --popover-foreground:   0 0% 96%;
 
     --primary:              105 75% 68%;       /* mint green */
-    --primary-foreground:   235 30% 8%;
+    --primary-foreground:   0 0% 4%;
 
     --accent-violet:        258 80% 70%;       /* secondary highlight */
     --accent-violet-soft:   258 80% 70% / 0.18;
 
-    --secondary:            235 18% 18%;
+    --secondary:            0 0% 16%;
     --secondary-foreground: 0 0% 92%;
-    --muted:                235 18% 14%;
-    --muted-foreground:     230 10% 58%;
+    --muted:                0 0% 12%;
+    --muted-foreground:     0 0% 60%;
 
     --accent:               105 75% 68%;
-    --accent-foreground:    235 30% 8%;
+    --accent-foreground:    0 0% 4%;
 
     --destructive:          354 80% 62%;
     --destructive-foreground: 0 0% 98%;
 
-    --border:               235 18% 20%;
-    --input:                235 18% 16%;
+    --border:               0 0% 16%;
+    --input:                0 0% 12%;
     --ring:                 105 75% 68%;
     --radius:               1rem;
 
     --recording:            354 84% 62%;
 
-    /* ── Surface hierarchy — solid panels, subtle hierarchy ──────────── */
-    --surface-1:            235 30% 8%;        /* page floor                       */
-    --surface-2:            235 24% 11%;       /* the mat (light lift)             */
-    --surface-3:            235 22% 13%;       /* primary card surface             */
-    --surface-4:            235 18% 18%;       /* chips / icon backplates          */
-    --surface-hover:        235 20% 16%;
+    /* ── Surface hierarchy — neutral grays on a black floor ──────────── */
+    --surface-1:            0 0% 4%;           /* page floor                       */
+    --surface-2:            0 0% 7%;           /* the mat (light lift)             */
+    --surface-3:            0 0% 10%;          /* primary card surface             */
+    --surface-4:            0 0% 16%;          /* chips / icon backplates          */
+    --surface-hover:        0 0% 13%;
 
     /* ── Glass tokens (kept for occasional use) ──────────────────────── */
-    --glass-bg:             235 24% 12% / 0.62;
-    --glass-bg-strong:      235 22% 14% / 0.85;
+    --glass-bg:             0 0% 9% / 0.62;
+    --glass-bg-strong:      0 0% 11% / 0.85;
     --glass-stroke:         0 0% 100% / 0.06;
     --glass-stroke-strong:  0 0% 100% / 0.10;
     --glass-highlight:      0 0% 100% / 0.04;
 
-    /* ── Pill active (inverted neutral — pure white pill on dark) ────── */
+    /* ── Pill active (inverted neutral — pure white pill on black) ───── */
     --pill-active-bg:       0 0% 98%;
-    --pill-active-fg:       235 30% 8%;
+    --pill-active-fg:       0 0% 4%;
 
     /* ── Chip / accent backgrounds + text (legible on dark) ─────────── */
     --chip-mint-bg:         105 75% 68% / 0.16;
@@ -79,21 +79,19 @@
     --chip-lime-bg:         105 75% 68% / 0.16;
     --chip-lime-fg:         105 80% 75%;
 
-    --heat-0:               220 20% 16%;
+    --heat-0:               0 0% 14%;          /* visible on black floor */
 
     /* Shadows — minimal, just enough lift */
     --shadow-tile:
       0 1px 0 hsl(0 0% 100% / 0.04) inset;
     --shadow-glass:
       0 1px 0 hsl(0 0% 100% / 0.06) inset,
-      0 10px 30px hsl(235 50% 2% / 0.45);
+      0 10px 30px hsl(0 0% 0% / 0.55);
     --shadow-pop:
-      0 24px 60px hsl(235 50% 2% / 0.65);
+      0 24px 60px hsl(0 0% 0% / 0.75);
 
-    /* Very subtle violet wash on the floor — barely there */
-    --mesh-bg:
-      radial-gradient(60% 50% at 100% 0%,  hsl(258 70% 50% / 0.10) 0%, transparent 65%),
-      radial-gradient(50% 40% at 0% 100%,  hsl(105 70% 45% / 0.05) 0%, transparent 65%);
+    /* Pure black floor — no colored wash */
+    --mesh-bg: none;
 
     --sidebar-width:        232px;
     --topbar-height:        56px;
@@ -101,7 +99,7 @@
 
   /* ── LIGHT — Sentinel-inspired: pure whites, mint accent, subtle borders ── */
   [data-theme="light"] {
-    --background:           220 14% 97%;       /* near-white floor (sidebar/topbar) */
+    --background:           220 14% 90%;       /* off-white floor (sidebar/topbar) */
     --foreground:           220 18% 10%;       /* near-black text */
     --card:                 0 0% 100%;
     --card-foreground:      220 18% 10%;
@@ -131,12 +129,14 @@
 
     --recording:            354 78% 52%;
 
-    /* ── Surface hierarchy (light) ─────────────────────────────────── */
-    --surface-1:            220 14% 97%;       /* sidebar / page floor */
-    --surface-2:            0 0% 100%;         /* mat (pure white)      */
-    --surface-3:            0 0% 100%;         /* tile (pure white + 1px border) */
-    --surface-4:            220 14% 94%;       /* chip / backplate / chart track */
-    --surface-hover:        220 14% 96%;
+    /* ── Surface hierarchy (light) ────────────────────────────────────
+       Floor → mat → card, getting brighter at each lift.
+       Wider gaps so the three layers are clearly distinguishable. */
+    --surface-1:            220 14% 90%;       /* sidebar / page floor — most off-white */
+    --surface-2:            220 14% 96%;       /* mat (clear lift)    — content area     */
+    --surface-3:            0 0% 100%;         /* tile / card (pure white + 1px border)  */
+    --surface-4:            220 14% 88%;       /* chip / backplate / chart track         */
+    --surface-hover:        220 14% 93%;
 
     /* ── Glass tokens (light) ──────────────────────────────────────── */
     --glass-bg:             0 0% 100% / 0.65;
@@ -398,12 +398,12 @@
   .orb-recording { animation: pulse-orb 1.4s ease-in-out infinite; }
   .orb-glow      { box-shadow: 0 0 20px hsl(var(--primary) / 0.55); }
 
-  /* ── Heatmap cells (mint ramp) ───────────────────────────────────── */
+  /* ── Heatmap cells (mint ramp on black) ─────────────────────────── */
   .heat-0       { background: hsl(var(--heat-0)); }
-  .heat-1       { background: hsl(140 50% 32%); }
-  .heat-2       { background: hsl(130 60% 45%); }
-  .heat-3       { background: hsl(120 70% 55%); }
-  .heat-4       { background: hsl(110 80% 65%); }
+  .heat-1       { background: hsl(140 45% 22%); }
+  .heat-2       { background: hsl(135 55% 32%); }
+  .heat-3       { background: hsl(125 65% 45%); }
+  .heat-4       { background: hsl(115 75% 60%); }
   .heat-current {
     background: hsl(105 75% 68% / 0.25);
     box-shadow: inset 0 0 0 1.5px hsl(var(--primary));
