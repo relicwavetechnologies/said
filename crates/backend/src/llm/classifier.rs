@@ -33,14 +33,41 @@ use super::edit_diff::Hunk;
 const GROQ_ENDPOINT:    &str = "https://api.groq.com/openai/v1/chat/completions";
 const CLASSIFIER_MODEL: &str = "llama-3.1-8b-instant";
 
-/// One labelled hunk — pairing the deterministic diff hunk with the LLM's
-/// class assignment.  Replaces the old `Candidate` struct: candidates are no
-/// longer LLM-generated, they're diff-derived.  The LLM only labels them.
+/// Specific token-level correction extracted from inside a composite hunk.
+///
+/// When the user's edit bundles multiple changes (e.g. fixed a misheard name
+/// AND wrapped it in a markdown link), the diff produces ONE hunk but only a
+/// SUB-string of it is the actual learnable STT/polish error.  The labeler
+/// emits this struct to tell us "promote *this specific term* from inside the
+/// hunk", rather than the whole `kept_window`.
+///
+/// Example:
+///   hunk.polish_window = "Anis at the rate Gmail dot com"
+///   hunk.kept_window   = "[anish@gmail.com](mailto:anish@gmail.com)"
+///   extracted_term     = { transcript_form: "Anis", correct_form: "anish" }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtractedTerm {
+    /// What STT actually wrote for this token (within the polish/transcript).
+    pub transcript_form: String,
+    /// The correctly-spelled form the user wanted (must be a whole-word
+    /// substring of `hunk.kept_window`).
+    pub correct_form:    String,
+}
+
+/// One labelled hunk — pairs a deterministic diff hunk with the LLM's class
+/// assignment AND (optionally) a specific token-level extraction within the
+/// hunk.  Promotion uses `extracted_term` when present, otherwise falls back
+/// to `kept_window`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LabelledHunk {
-    pub hunk:       Hunk,
-    pub class:      EditClass,
-    pub confidence: f64,
+    pub hunk:           Hunk,
+    pub class:          EditClass,
+    pub confidence:     f64,
+    /// When the LLM identifies a specific token within the hunk as the actual
+    /// STT/polish error (vs. the whole hunk being the correction), it emits
+    /// this field.  Stage-4 promotion prefers it over `kept_window`.
+    #[serde(default)]
+    pub extracted_term: Option<ExtractedTerm>,
 }
 
 /// Backwards-compatible alias for the route layer — a labelled hunk is the
@@ -49,16 +76,31 @@ pub struct LabelledHunk {
 pub type Candidate = LabelledHunk;
 
 impl LabelledHunk {
-    /// What STT transcribed for this region (may be empty if the diff
-    /// couldn't positionally align transcript to polish).
-    pub fn transcript_form(&self) -> &str { &self.hunk.transcript_window }
-    /// What the polish step produced.
+    /// What STT transcribed for the candidate.  When `extracted_term` is
+    /// present, returns the specific sub-token from inside the hunk; else
+    /// returns the full hunk's transcript window.
+    pub fn transcript_form(&self) -> &str {
+        self.extracted_term
+            .as_ref()
+            .map(|t| t.transcript_form.as_str())
+            .unwrap_or(&self.hunk.transcript_window)
+    }
+    /// What the polish step produced.  No extraction equivalent — polish_form
+    /// is always the hunk's polish window because polish errors are the WHOLE
+    /// substituted region.
     pub fn polish_form(&self) -> &str { &self.hunk.polish_window }
-    /// What the user kept (the proposed correct form).
-    pub fn correct_form(&self) -> &str { &self.hunk.kept_window }
-    /// Spoken form — best guess at what was actually spoken.  For STT_ERROR
-    /// this is the kept_window (user restored what they actually said).
-    pub fn spoke(&self) -> &str { &self.hunk.kept_window }
+    /// The proposed correct form.  When `extracted_term` is present, returns
+    /// the specific sub-token; else returns the full hunk's kept window.
+    /// Stage-4 promotion uses THIS getter.
+    pub fn correct_form(&self) -> &str {
+        self.extracted_term
+            .as_ref()
+            .map(|t| t.correct_form.as_str())
+            .unwrap_or(&self.hunk.kept_window)
+    }
+    /// Best guess at what was actually spoken.  For STT_ERROR this equals
+    /// `correct_form()` (user restored what they actually said).
+    pub fn spoke(&self) -> &str { self.correct_form() }
 }
 
 /// The four mutually-exclusive classes of edit.
@@ -143,16 +185,49 @@ B. If kept_window contains characters in a different script than the user's outp
 C. The transcript may itself be wrong. STT_ERROR is exactly the case where transcript and polish both contain the same wrong word.
 D. If polish_window is empty (pure insertion) → USER_REWRITE. If kept_window is empty (pure deletion) → USER_REWRITE.
 
+EXTRACTED TERMS (important for composite hunks):
+A hunk often bundles MULTIPLE changes (e.g. a misheard name + a markdown link wrapper). When the hunk's class is STT_ERROR or POLISH_ERROR and only a SUB-string of the hunk is the actual learnable correction, you MUST emit `extracted_term` to point at the specific tokens.
+
+  • `extracted_term.transcript_form` MUST be a whole-word substring of `polish_window` (or `transcript_window` if polish_window is empty).
+  • `extracted_term.correct_form`    MUST be a whole-word substring of `kept_window`.
+  • Do NOT include surrounding punctuation, brackets, or formatting characters.
+  • Do NOT invent text that isn't literally present in the windows.
+
+When the hunk IS the correction in its entirety (e.g. polish_window="written", kept_window="n8n"), set extracted_term to {"transcript_form":"written","correct_form":"n8n"} — a single-word hunk's extracted term equals the hunk itself.
+
+Examples:
+  Hunk: polish="written" kept="n8n"
+    → extracted_term: {"transcript_form":"written","correct_form":"n8n"}
+
+  Hunk: polish="Anis at the rate Gmail dot com"
+        kept  ="[anish@gmail.com](mailto:anish@gmail.com)"
+    → STT_ERROR, extracted_term: {"transcript_form":"Anis","correct_form":"anish"}
+    (The markdown link wrapping is REWRITE shape; only the name is the learnable STT fix.)
+
+  Hunk: polish="kindly" kept="please"
+    → POLISH_ERROR, extracted_term: {"transcript_form":"kindly","correct_form":"please"}
+
+  Hunk: polish="" kept="[link](mailto:x@y)"
+    → USER_REWRITE, extracted_term: null
+
 OUTPUT — strict JSON only, no markdown, no commentary:
 {
-  "labels":     [{"hunk_index": 0, "class": "STT_ERROR" | "POLISH_ERROR" | "USER_REPHRASE" | "USER_REWRITE", "confidence": 0.0}],
+  "labels": [
+    {
+      "hunk_index": 0,
+      "class": "STT_ERROR" | "POLISH_ERROR" | "USER_REPHRASE" | "USER_REWRITE",
+      "confidence": 0.0,
+      "extracted_term": {"transcript_form": "...", "correct_form": "..."} | null
+    }
+  ],
   "overall":    "STT_ERROR" | "POLISH_ERROR" | "USER_REPHRASE" | "USER_REWRITE",
   "reason":     "one sentence explanation referencing the actual hunk windows"
 }
 
 `overall` is the single dominant class for the whole edit (use the most-learnable class present, with priority STT_ERROR > POLISH_ERROR > USER_REPHRASE > USER_REWRITE).
 `labels[i]` MUST exist for every hunk_index from 0 to N-1 in input order.
-`confidence` ∈ [0,1]. Be honest — low when the hunk is ambiguous."#;
+`confidence` ∈ [0,1]. Be honest — low when the hunk is ambiguous.
+`extracted_term` is REQUIRED for STT_ERROR and POLISH_ERROR labels. Set to null only for USER_REPHRASE / USER_REWRITE."#;
 
 /// Label diff-derived hunks via Groq.  Hunks are computed by `edit_diff::diff`
 /// before this is called — the LLM only assigns class labels, it cannot
@@ -280,6 +355,27 @@ pub async fn classify_edit(
         })
 }
 
+/// True if `needle` appears as a whole-word substring of `haystack`.  Word
+/// boundaries are defined by Unicode whitespace and ASCII punctuation (with
+/// `_` and `-` treated as word characters so identifiers like `n8n-prod` are
+/// still atomic).  Used to validate LLM-extracted terms — the term MUST be
+/// literal text from the diff hunk's windows; we never trust an extraction
+/// that doesn't survive this check.
+fn is_whole_word_substring(needle: &str, haystack: &str) -> bool {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return false;
+    }
+    haystack
+        .split(|c: char| c.is_whitespace() || (c.is_ascii_punctuation() && c != '_' && c != '-'))
+        .any(|tok| {
+            let tok = tok.trim();
+            !tok.is_empty()
+                && (tok == needle
+                    || (tok.is_ascii() && needle.is_ascii() && tok.eq_ignore_ascii_case(needle)))
+        })
+}
+
 /// Parse the labeler response.  Pairs each LLM label with its corresponding
 /// diff hunk by `hunk_index`.  If the LLM omits a hunk we treat its class
 /// as USER_REPHRASE (safe default — no learning).
@@ -300,11 +396,20 @@ pub fn parse_label_response(s: &str, hunks: &[Hunk]) -> Option<ClassifyResult> {
     #[derive(Deserialize)]
     struct RawLabel {
         #[serde(default)]
-        hunk_index: usize,
+        hunk_index:     usize,
         #[serde(default)]
-        class:      String,
+        class:          String,
         #[serde(default)]
-        confidence: f64,
+        confidence:     f64,
+        #[serde(default)]
+        extracted_term: Option<RawExtracted>,
+    }
+    #[derive(Deserialize)]
+    struct RawExtracted {
+        #[serde(default)]
+        transcript_form: String,
+        #[serde(default)]
+        correct_form:    String,
     }
 
     let raw: Raw = serde_json::from_str(s).ok()?;
@@ -336,7 +441,41 @@ pub fn parse_label_response(s: &str, hunks: &[Hunk]) -> Option<ClassifyResult> {
             .and_then(|l| EditClass::parse(&l.class))
             .unwrap_or(EditClass::UserRephrase);
         let confidence = lbl.map(|l| l.confidence.clamp(0.0, 1.0)).unwrap_or(0.0);
-        labelled.push(LabelledHunk { hunk: hunk.clone(), class, confidence });
+
+        // Validate extracted_term against the hunk's actual text — both forms
+        // must be whole-word substrings of the corresponding window.  This
+        // makes hallucination impossible at the schema level.
+        let extracted_term = lbl
+            .and_then(|l| l.extracted_term.as_ref())
+            .and_then(|et| {
+                let tf = et.transcript_form.trim();
+                let cf = et.correct_form.trim();
+                if tf.is_empty() || cf.is_empty() {
+                    return None;
+                }
+                let polish_haystack     = if hunk.polish_window.is_empty() {
+                    &hunk.transcript_window
+                } else {
+                    &hunk.polish_window
+                };
+                if !is_whole_word_substring(tf, polish_haystack) {
+                    return None;
+                }
+                if !is_whole_word_substring(cf, &hunk.kept_window) {
+                    return None;
+                }
+                Some(ExtractedTerm {
+                    transcript_form: tf.to_string(),
+                    correct_form:    cf.to_string(),
+                })
+            });
+
+        labelled.push(LabelledHunk {
+            hunk: hunk.clone(),
+            class,
+            confidence,
+            extracted_term,
+        });
     }
 
     let mean_conf = if labelled.is_empty() {
@@ -456,5 +595,118 @@ mod tests {
         let r = parse_label_response(json, &hunks).unwrap();
         assert!(r.candidates[0].confidence <= 1.0);
         assert!(r.confidence <= 1.0);
+    }
+
+    // ── extracted_term tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn composite_hunk_extracts_just_the_name() {
+        // The exact production case: user replaced "Anis at the rate Gmail dot
+        // com" with "[anish@gmail.com](mailto:anish@gmail.com)".  Only "anish"
+        // is the learnable STT correction; the link wrapping is REWRITE shape.
+        let hunks = vec![hunk(
+            "Anis at the rate Gmail dot com",
+            "Anis at the rate Gmail dot com",
+            "[anish@gmail.com](mailto:anish@gmail.com)",
+        )];
+        let json = r#"{"overall":"STT_ERROR","reason":"Anis was misheard for anish",
+                       "labels":[{
+                         "hunk_index":0,"class":"STT_ERROR","confidence":0.9,
+                         "extracted_term":{"transcript_form":"Anis","correct_form":"anish"}
+                       }]}"#;
+        let r = parse_label_response(json, &hunks).unwrap();
+        assert_eq!(r.candidates.len(), 1);
+        let cand = &r.candidates[0];
+        // The candidate's getters now return the extracted token, NOT the
+        // whole hunk.  This is what Stage-4 promotion sees.
+        assert_eq!(cand.transcript_form(), "Anis");
+        assert_eq!(cand.correct_form(),    "anish");
+        // The original hunk text is preserved for inspection.
+        assert_eq!(cand.hunk.kept_window,
+                   "[anish@gmail.com](mailto:anish@gmail.com)");
+        assert_eq!(cand.extracted_term.as_ref().unwrap().correct_form, "anish");
+    }
+
+    #[test]
+    fn extracted_term_rejected_if_not_in_kept_window() {
+        // LLM hallucinated a correct_form that doesn't appear in kept_window.
+        // The parser must drop the extraction (set to None) — promotion
+        // can still fall back to kept_window via the getters.
+        let hunks = vec![hunk("written", "written", "n8n")];
+        let json = r#"{"overall":"STT_ERROR","labels":[{
+                        "hunk_index":0,"class":"STT_ERROR","confidence":0.9,
+                        "extracted_term":{"transcript_form":"written","correct_form":"FAKE"}
+                      }]}"#;
+        let r = parse_label_response(json, &hunks).unwrap();
+        assert!(r.candidates[0].extracted_term.is_none(),
+                "FAKE is not in kept_window — extraction must be rejected");
+        // Getters fall back to kept_window.
+        assert_eq!(r.candidates[0].correct_form(), "n8n");
+    }
+
+    #[test]
+    fn extracted_term_rejected_if_not_in_polish_window() {
+        let hunks = vec![hunk("written", "written", "n8n")];
+        let json = r#"{"overall":"STT_ERROR","labels":[{
+                        "hunk_index":0,"class":"STT_ERROR","confidence":0.9,
+                        "extracted_term":{"transcript_form":"FAKE","correct_form":"n8n"}
+                      }]}"#;
+        let r = parse_label_response(json, &hunks).unwrap();
+        assert!(r.candidates[0].extracted_term.is_none());
+    }
+
+    #[test]
+    fn single_word_hunk_extracted_term_equals_hunk() {
+        // For atomic hunks the extracted_term is just the hunk itself.
+        let hunks = vec![hunk("written", "written", "n8n")];
+        let json = r#"{"overall":"STT_ERROR","labels":[{
+                        "hunk_index":0,"class":"STT_ERROR","confidence":0.9,
+                        "extracted_term":{"transcript_form":"written","correct_form":"n8n"}
+                      }]}"#;
+        let r = parse_label_response(json, &hunks).unwrap();
+        assert_eq!(r.candidates[0].correct_form(), "n8n");
+        assert_eq!(r.candidates[0].transcript_form(), "written");
+    }
+
+    #[test]
+    fn missing_extracted_term_falls_back_to_hunk() {
+        let hunks = vec![hunk("written", "written", "n8n")];
+        let json = r#"{"overall":"STT_ERROR","labels":[{
+                        "hunk_index":0,"class":"STT_ERROR","confidence":0.9
+                      }]}"#;
+        let r = parse_label_response(json, &hunks).unwrap();
+        assert!(r.candidates[0].extracted_term.is_none());
+        assert_eq!(r.candidates[0].correct_form(), "n8n");
+    }
+
+    #[test]
+    fn whole_word_substring_does_not_match_partial() {
+        // "ai" must NOT match inside "anish"; only whole-word matches count.
+        let hunks = vec![hunk("anish", "anish", "anish.org")];
+        let json = r#"{"overall":"STT_ERROR","labels":[{
+                        "hunk_index":0,"class":"STT_ERROR","confidence":0.9,
+                        "extracted_term":{"transcript_form":"ai","correct_form":"ai"}
+                      }]}"#;
+        let r = parse_label_response(json, &hunks).unwrap();
+        assert!(r.candidates[0].extracted_term.is_none(),
+                "'ai' is a substring of 'anish' but not a whole word — must reject");
+    }
+
+    #[test]
+    fn extracted_term_within_markdown_link_is_accepted() {
+        // The exact case: "anish" appears as a whole word inside the link.
+        let hunks = vec![hunk(
+            "Anis",
+            "Anis",
+            "[anish@gmail.com](mailto:anish@gmail.com)",
+        )];
+        let json = r#"{"overall":"STT_ERROR","labels":[{
+                        "hunk_index":0,"class":"STT_ERROR","confidence":0.85,
+                        "extracted_term":{"transcript_form":"Anis","correct_form":"anish"}
+                      }]}"#;
+        let r = parse_label_response(json, &hunks).unwrap();
+        let et = r.candidates[0].extracted_term.as_ref()
+            .expect("'anish' is whole-word inside the link — must be accepted");
+        assert_eq!(et.correct_form, "anish");
     }
 }

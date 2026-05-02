@@ -13,7 +13,7 @@
 #![cfg(test)]
 
 use crate::llm::{
-    classifier::{EditClass, LabelledHunk},
+    classifier::{EditClass, ExtractedTerm, LabelledHunk},
     edit_diff::{self, Hunk},
     phonetics, pre_filter, promotion_gate,
 };
@@ -65,7 +65,27 @@ fn pool() -> DbPool {
 
 /// Build a labelled hunk identical to what the full pipeline would produce.
 fn label(hunk: Hunk, class: EditClass, confidence: f64) -> LabelledHunk {
-    LabelledHunk { hunk, class, confidence }
+    LabelledHunk { hunk, class, confidence, extracted_term: None }
+}
+
+/// Build a labelled hunk with an extracted_term (the LLM identified a specific
+/// sub-token within the hunk as the actual correction).
+fn label_with_extract(
+    hunk: Hunk,
+    class: EditClass,
+    confidence: f64,
+    transcript_form: &str,
+    correct_form: &str,
+) -> LabelledHunk {
+    LabelledHunk {
+        hunk,
+        class,
+        confidence,
+        extracted_term: Some(ExtractedTerm {
+            transcript_form: transcript_form.into(),
+            correct_form:    correct_form.into(),
+        }),
+    }
 }
 
 /// Stage-4 promotion logic mirroring `routes::classify::classify` (no network).
@@ -234,6 +254,54 @@ fn weak_signal_stt_candidate_is_dropped() {
     let cands = vec![label(hunk, EditClass::SttError, 0.3)];
     let (promoted, _) = promote(&pool, "u1", "ok then", "english", &cands);
     assert_eq!(promoted, 0);
+}
+
+#[test]
+fn anish_email_link_extracts_just_the_name() {
+    // The exact production case from the user's logs:
+    //   polish: "Anis at the rate Gmail dot com ko dekhna. Zara mail bhej..."
+    //   kept:   "[anish@gmail.com](mailto:anish@gmail.com) ko dekhna. Zara mail bhej sakte ho?"
+    //
+    // The hunk's kept_window contains the WHOLE markdown link (which is
+    // REWRITE shape), but the LLM correctly identifies that only "anish" is
+    // the learnable STT correction.  With extracted_term, promotion picks up
+    // ONLY "anish" — the link wrapping is ignored.
+    let pool = pool();
+    let hunk = Hunk {
+        transcript_window: "Anis at the rate Gmail dot com".into(),
+        polish_window:     "Anis at the rate Gmail dot com".into(),
+        kept_window:       "[anish@gmail.com](mailto:anish@gmail.com)".into(),
+    };
+    let cands = vec![label_with_extract(hunk, EditClass::SttError, 0.9, "Anis", "anish")];
+    let kept  = "[anish@gmail.com](mailto:anish@gmail.com) ko dekhna. Zara mail bhej sakte ho?";
+
+    let (promoted, learned) = promote(&pool, "u1", kept, "hinglish", &cands);
+    assert!(learned, "anish should be learned via extracted_term");
+    assert!(promoted >= 1);
+
+    // The vocabulary now contains "anish" — NOT the whole markdown link.
+    let terms = vocabulary::top_term_strings(&pool, "u1", 10);
+    assert!(terms.iter().any(|t| t == "anish"),
+            "vocab should contain 'anish' alone, got: {terms:?}");
+    assert!(!terms.iter().any(|t| t.contains("[")),
+            "vocab must NOT contain the markdown link as a term");
+    assert!(!terms.iter().any(|t| t.contains("mailto")),
+            "vocab must NOT contain 'mailto' as a term");
+}
+
+#[test]
+fn extracted_term_overrides_kept_window_in_correct_form() {
+    // Even at the unit level: the getter must prefer extracted_term.correct_form.
+    let cand = label_with_extract(
+        Hunk {
+            transcript_window: "Anis ...".into(),
+            polish_window:     "Anis ...".into(),
+            kept_window:       "[anish@gmail.com](mailto:anish@gmail.com)".into(),
+        },
+        EditClass::SttError, 0.9, "Anis", "anish",
+    );
+    assert_eq!(cand.correct_form(), "anish");
+    assert_eq!(cand.transcript_form(), "Anis");
 }
 
 #[test]
