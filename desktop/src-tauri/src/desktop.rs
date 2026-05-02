@@ -91,12 +91,14 @@ impl DesktopApp {
             // almost certainly hung (backend stall, SSE timeout, task panic).
             // Force-reset to Idle so the next Caps Lock press starts fresh
             // instead of being silently swallowed forever.
+            // 12 s = 4 s (WS timeout) + 6 s (SSE timeout) + 2 s slack.
+            // If we're still in Processing after that, the task has hung.
             let stale = self.processing_started
-                .map(|t| t.elapsed().as_secs() >= 15)
+                .map(|t| t.elapsed().as_secs() >= 12)
                 .unwrap_or(true);   // no timestamp = definitely stale
             if stale {
                 tracing::warn!(
-                    "[state] Processing stuck for ≥15 s — force-resetting to Idle for recovery"
+                    "[state] Processing stuck for ≥12 s — force-resetting to Idle for recovery"
                 );
                 self.state              = AppState::Idle;
                 self.processing_started = None;

@@ -938,17 +938,24 @@ fn do_finish_recording(
             None
         };
 
-        // Hard 25 s timeout on the full SSE pipeline.  If the backend stalls,
-        // the spawned task would otherwise hang indefinitely with state stuck
-        // in Processing, silently swallowing every subsequent Caps Lock press.
+        // Hard 6 s timeout on the backend SSE call.
+        //
+        // Recording duration does NOT affect this timeout — the WS streams
+        // audio in real-time, so by Caps Lock release Deepgram has already
+        // processed the speech.  The 4 s WS wait above is a separate budget.
+        // What remains is: embed (~300 ms) + LLM TTFT (~400 ms) + token
+        // streaming (~1-3 s) — well under 6 s when healthy.
+        //
+        // Worst case from Caps Lock release: 4 s (WS) + 6 s (SSE) = 10 s,
+        // after which state is forced back to Idle automatically.
         let result = match tokio::time::timeout(
-            std::time::Duration::from_secs(25),
+            std::time::Duration::from_secs(6),
             run_voice_polish_sse(&back_arc2, wav, None, pre_transcript, &app2),
         ).await {
             Ok(r)  => r,
             Err(_) => {
-                tracing::error!("[pipeline] hard timeout after 25 s — forcing recovery to Idle");
-                Err("Request timed out after 25 s — please try again.".to_string())
+                tracing::error!("[pipeline] backend SSE timed out after 6 s — forcing recovery to Idle");
+                Err("Request timed out — please try again.".to_string())
             }
         };
 
