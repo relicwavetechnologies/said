@@ -1160,6 +1160,15 @@ async fn run_voice_polish_sse(
                 }));
                 // Native macOS notification — human copy, never raw error text.
                 notify_macos("Said couldn't finish that recording", &human);
+                // Bring Said to the front so the user can interact with the
+                // in-app toast immediately (History · Retry · Dismiss).  The
+                // osascript banner has no action buttons — the actual surface
+                // is the in-app toast.  show() + set_focus() are no-ops when
+                // the window is already visible and focused.
+                if let Some(w) = app_clone.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
             }
         }
     })
