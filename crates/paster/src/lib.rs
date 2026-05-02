@@ -289,18 +289,91 @@ mod imp {
             }
 
             // ── Step 3: AXSelectedText — works in some Electron apps ──────────
-            let sel = ax_attr(el2 as *const _, "AXSelectedText");
-            ffi::CFRelease(el2);
-            ffi::CFRelease(app);
-
-            if let Some(sel_cf) = sel {
+            if let Some(sel_cf) = ax_attr(el2 as *const _, "AXSelectedText") {
                 let result = cfstring_to_rust(sel_cf as *const _);
                 ffi::CFRelease(sel_cf);
-                return result;
+                if result.is_some() {
+                    ffi::CFRelease(el2);
+                    ffi::CFRelease(app);
+                    return result;
+                }
             }
 
-            None
+            // ── Step 4: BFS the focused element's subtree for a text-bearing
+            //     descendant.  In modern Electron apps (Claude, Linear, certain
+            //     Lark builds) AXFocusedUIElement returns a wrapper (the
+            //     WebView itself) rather than the actual contenteditable; the
+            //     real text lives one or two layers deep.
+            //
+            //     We bound the walk hard: max 64 elements visited, max depth 4.
+            //     That's enough for typical Chromium AX trees but stays cheap
+            //     enough to run inside the 30 ms edit-watch poll.
+            let deep = read_text_in_subtree(el2 as *const _, 64, 4);
+            ffi::CFRelease(el2);
+            ffi::CFRelease(app);
+            deep
         }
+    }
+
+    /// BFS a UI element's descendants looking for a non-empty CFString-typed
+    /// AXValue.  Returns the first one found (closest to the root).
+    ///
+    /// The AX tree of a Chromium WebView can be wide (lots of toolbar/header
+    /// children).  We cap the visit count and depth so this is bounded and
+    /// safe to call from a hot polling loop.
+    unsafe fn read_text_in_subtree(
+        root: *const c_void, max_visits: usize, max_depth: usize,
+    ) -> Option<String> {
+        use std::collections::VecDeque;
+        // Queue of (element, depth).  We DO NOT take ownership of `root`'s
+        // refcount — caller still owns it.  Children obtained from AXChildren
+        // are owned by us and must be CFReleased after we finish.
+        let mut queue: VecDeque<(*const c_void, usize)> = VecDeque::new();
+        let mut owned_for_release: Vec<*mut c_void> = Vec::new();
+        let mut visits: usize = 0;
+        queue.push_back((root, 0));
+
+        let result: Option<String> = loop {
+            let Some((el, depth)) = queue.pop_front() else { break None };
+            visits += 1;
+            if visits > max_visits { break None; }
+
+            // Try AXValue on this element.
+            if let Some(val_cf) = unsafe { ax_attr(el, "AXValue") } {
+                let s = unsafe { cfstring_to_rust(val_cf as *const _) };
+                unsafe { ffi::CFRelease(val_cf) };
+                if let Some(text) = s {
+                    if !text.is_empty() {
+                        break Some(text);
+                    }
+                }
+            }
+
+            // Stop descending past the depth cap.
+            if depth >= max_depth { continue; }
+
+            // Enqueue AXChildren if any.
+            let Some(children_cf) = (unsafe { ax_attr(el, "AXChildren") }) else { continue };
+            // children_cf is a CFArrayRef (or compatible).  Verify type? Skip
+            // — AX always returns CFArray for AXChildren when present.
+            let count = unsafe { ffi::CFArrayGetCount(children_cf as *const _) };
+            for i in 0..count.min(16) {  // cap fan-out per node
+                let child = unsafe { ffi::CFArrayGetValueAtIndex(children_cf as *const _, i) };
+                if !child.is_null() {
+                    queue.push_back((child, depth + 1));
+                }
+            }
+            // children_cf was returned from AXUIElementCopyAttributeValue —
+            // we own it.  Track for release after the loop.
+            owned_for_release.push(children_cf);
+        };
+
+        // Release every CFArray we copied.  The element pointers inside are
+        // owned by their parent; we don't release individual children.
+        for cf in owned_for_release {
+            unsafe { ffi::CFRelease(cf) };
+        }
+        result
     }
 
     /// Fallback for AX-blind apps (Electron, Chrome, web views).
