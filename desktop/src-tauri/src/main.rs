@@ -39,6 +39,16 @@ use voice_polish_hotkey as hotkey;
 /// position and picking the candidate that preserves the most surrounding text
 /// (i.e., the smallest local edit).
 #[cfg(target_os = "macos")]
+/// Count of keystroke events recorded since `since`.  Cheap probe used by
+/// the AX-blind clipboard-snapshot trigger to know when the user has typed
+/// something since paste.  Returns 0 if the buffer is unavailable.
+#[cfg(target_os = "macos")]
+fn count_keystrokes_since(since: std::time::Instant) -> usize {
+    let buf = hotkey::key_buffer();
+    let Ok(guard) = buf.lock() else { return 0 };
+    guard.iter().filter(|t| t.when >= since).count()
+}
+
 fn reconstruct_from_keystrokes(
     initial: &str,
     since:   std::time::Instant,
@@ -1357,6 +1367,24 @@ async fn watch_for_edit(
     let mut best_candidate = post_paste.clone();
     let mut idle_at  = Instant::now();
     let started      = Instant::now();
+    let is_ax_blind  = post_paste.is_empty();
+
+    // ── AX-blind early-snapshot state ────────────────────────────────────────
+    //
+    // Foundational rule: in AX-blind apps (Claude input, Lark, Chrome
+    // contenteditable…) we get NO real-time read of the field during the
+    // loop.  The only way to capture the actual final text is via clipboard
+    // (Cmd+A+C).  We used to do this ONLY at the end — but if the user
+    // switched apps before the 8s idle window completed, the clipboard
+    // captured the wrong app and edit-watch silently skipped.
+    //
+    // Fix: in AX-blind mode, snapshot the clipboard the FIRST time we detect
+    // user keystrokes followed by ~1.5s of idle.  The snapshot is taken
+    // while still in the same app, so it remains valid even if the user
+    // switches apps later.  Re-snapshot if user types more after a long pause.
+    let mut ax_blind_snapshot: Option<String> = None;
+    let mut last_keystroke_count: usize = 0;
+    let mut last_snapshot_time: Option<Instant> = None;
 
     tracing::info!(
         "[edit-watch] watching {recording_id} — initial field readable: {} (len={})",
@@ -1388,6 +1416,45 @@ async fn watch_for_edit(
                 best_candidate = now_val.clone();
             }
             last_val = now_val;
+        }
+
+        // ── AX-blind early-snapshot trigger ──────────────────────────────────
+        //
+        // Trigger when: AX-blind, user has typed at least one key since
+        // watch_start, and they've been keyboard-idle for ≥ 1.5 s.
+        // Re-snapshot at most every 3 s so a long edit refreshes our view.
+        #[cfg(target_os = "macos")]
+        if is_ax_blind {
+            let keystroke_count = count_keystrokes_since(watch_start);
+            let typed_something = keystroke_count > 0;
+            let new_keystrokes  = keystroke_count > last_keystroke_count;
+            if new_keystrokes {
+                last_keystroke_count = keystroke_count;
+            }
+            let idle_for = idle_at.elapsed();
+            let snap_due = typed_something
+                && idle_for >= Duration::from_millis(1500)
+                && last_snapshot_time.map_or(true, |t| t.elapsed() >= Duration::from_secs(3));
+            if snap_due {
+                tracing::info!(
+                    "[edit-watch] AX-blind snapshot trigger ({keystroke_count} keystrokes, idle {:.1}s)",
+                    idle_for.as_secs_f64()
+                );
+                let cb_text = tokio::task::spawn_blocking(paster::capture_focused_text_via_selection)
+                    .await
+                    .unwrap_or(None);
+                if let Some(text) = cb_text {
+                    let trimmed = text.trim().to_string();
+                    if trimmed.contains(polished.trim()) {
+                        ax_blind_snapshot = Some(trimmed);
+                        last_snapshot_time = Some(Instant::now());
+                        tracing::info!(
+                            "[edit-watch] AX-blind clipboard snapshot captured ({} chars) — preserved against future app switch",
+                            ax_blind_snapshot.as_ref().map(|s| s.len()).unwrap_or(0)
+                        );
+                    }
+                }
+            }
         }
 
         let done = idle_at.elapsed() > Duration::from_secs(8)  // 8s idle — user stopped typing
@@ -1465,34 +1532,47 @@ async fn watch_for_edit(
                 (initial_pid, final_pid),
                 (Some(a), Some(b)) if a == b
             );
-            if !same_app {
-                tracing::info!(
-                    "[edit-watch] AX-blind + app switched — skipping {recording_id}"
-                );
-                return;
-            }
 
             // 1. Run keystroke replay (no side effects).
             let ks_result = reconstruct_from_keystrokes(&polished, watch_start);
 
-            // 2. Run clipboard verification (Cmd+A+C — has visible side effects
-            //    but they're transient and restored).  Spawn-blocking because
-            //    paster's clipboard ops are sync.
-            let cb_result = tokio::task::spawn_blocking(paster::capture_focused_text_via_selection)
-                .await
-                .unwrap_or(None);
-
+            // 2. Source-of-truth clipboard text.  Two pathways:
+            //    a) ax_blind_snapshot — captured DURING the loop while still in
+            //       the same app.  Survives app switches, so this is preferred
+            //       whenever it's available.  Foundational fix for Claude/
+            //       Electron/Lark-style targets.
+            //    b) end-of-loop clipboard read — only meaningful if same_app.
+            //       Mid-loop snapshot makes this a fallback.
             let polished_trimmed = polished.trim();
 
-            // 3. Extract the kept text from clipboard if it contains polish.
-            let cb_kept: Option<String> = cb_result.and_then(|raw| {
-                let captured = raw.trim().to_string();
-                if !captured.contains(polished_trimmed) {
-                    return None;
-                }
-                let edited = extract_kept(polished_trimmed, polished_trimmed, &captured);
-                if edited == polished_trimmed { None } else { Some(edited) }
-            });
+            let cb_kept: Option<String> = if let Some(snap) = ax_blind_snapshot.clone() {
+                // Snapshot captured mid-loop while still in the original app.
+                if snap.contains(polished_trimmed) {
+                    let edited = extract_kept(polished_trimmed, polished_trimmed, &snap);
+                    if edited == polished_trimmed { None } else { Some(edited) }
+                } else { None }
+            } else if same_app {
+                // No mid-loop snapshot but still in same app — try clipboard now.
+                let cb_result = tokio::task::spawn_blocking(paster::capture_focused_text_via_selection)
+                    .await
+                    .unwrap_or(None);
+                cb_result.and_then(|raw| {
+                    let captured = raw.trim().to_string();
+                    if !captured.contains(polished_trimmed) {
+                        return None;
+                    }
+                    let edited = extract_kept(polished_trimmed, polished_trimmed, &captured);
+                    if edited == polished_trimmed { None } else { Some(edited) }
+                })
+            } else {
+                // App switched and we have no mid-loop snapshot — clipboard is
+                // useless (would capture wrong app).  Keystroke is the only
+                // available signal but unreliable, so it'll be marked LOW.
+                tracing::warn!(
+                    "[edit-watch] AX-blind + app switched + no mid-loop snapshot — clipboard unreachable for {recording_id}"
+                );
+                None
+            };
 
             // 4. Reconcile keystroke vs clipboard.
             match (ks_result, cb_kept) {
@@ -1682,7 +1762,9 @@ fn extract_kept(polished: &str, post_paste: &str, last_val: &str) -> String {
 /// - Whitespace-only changes (trailing newline, extra space)
 /// - Case-only changes (auto-capitalize)
 /// - Smart-punctuation substitutions (smart quotes, em-dashes, ellipsis)
-/// - AX read jitter (< 3 character differences)
+/// - AX read jitter (< 3 character differences) — **except** when a jargon-
+///   like token (digits + letters mixed, e.g. n8n, k8s, v2.0) is involved,
+///   which is exactly the case where small char diffs ARE meaningful.
 fn is_meaningful_edit(polished: &str, user_kept: &str) -> bool {
     let p = normalize_for_diff(polished);
     let k = normalize_for_diff(user_kept);
@@ -1692,21 +1774,13 @@ fn is_meaningful_edit(polished: &str, user_kept: &str) -> bool {
         return false;
     }
 
-    // Character-level distance: if < 3 chars different after normalization,
-    // it's likely AX jitter or a trivial auto-correction, not a user edit.
-    let char_diff = simple_char_distance(&p, &k);
-    if char_diff < 3 {
-        tracing::info!(
-            "[edit-gate] char distance {char_diff} < 3 — AX jitter, not meaningful"
-        );
-        return false;
-    }
-
     // Word-level check: at least 1 alphanumeric word must actually differ.
+    // Compute this first so the char-distance gate can be context-aware.
     let p_words: Vec<&str> = p.split_whitespace().collect();
     let k_words: Vec<&str> = k.split_whitespace().collect();
     let max_len = p_words.len().max(k_words.len());
     let mut word_diffs = 0usize;
+    let mut jargon_diff = false;
     for i in 0..max_len {
         let pw = p_words.get(i).copied().unwrap_or("");
         let kw = k_words.get(i).copied().unwrap_or("");
@@ -1714,6 +1788,14 @@ fn is_meaningful_edit(polished: &str, user_kept: &str) -> bool {
                      || kw.chars().any(|c| c.is_alphanumeric()))
         {
             word_diffs += 1;
+            // Jargon signal: if EITHER side of the diff has digits, the edit
+            // is almost certainly a meaningful jargon correction (n8n, k8s,
+            // v2.0, IP0 → IPO, etc.) regardless of how few chars differ.
+            if pw.chars().any(|c| c.is_ascii_digit())
+                || kw.chars().any(|c| c.is_ascii_digit())
+            {
+                jargon_diff = true;
+            }
         }
     }
 
@@ -1724,8 +1806,19 @@ fn is_meaningful_edit(polished: &str, user_kept: &str) -> bool {
         return false;
     }
 
+    // Character-level distance gate.  Threshold = 1 for jargon edits (any
+    // diff matters), 3 for plain prose (filter AX jitter / autocorrect).
+    let char_diff = simple_char_distance(&p, &k);
+    let min_char_diff = if jargon_diff { 1 } else { 3 };
+    if char_diff < min_char_diff {
+        tracing::info!(
+            "[edit-gate] char distance {char_diff} < {min_char_diff} — AX jitter, not meaningful"
+        );
+        return false;
+    }
+
     tracing::info!(
-        "[edit-gate] {word_diffs} word(s) changed, char_diff={char_diff} — meaningful edit"
+        "[edit-gate] {word_diffs} word(s) changed, char_diff={char_diff}, jargon={jargon_diff} — meaningful edit"
     );
     true
 }
@@ -2054,4 +2147,63 @@ fn main() {
                 // code.is_some() means app.exit(N) was called — let it through
             }
         });
+}
+
+// ── Tests for the meaningful-edit gate ────────────────────────────────────────
+
+#[cfg(test)]
+mod meaningful_edit_tests {
+    use super::is_meaningful_edit;
+
+    #[test]
+    fn rejects_identical_after_normalize() {
+        assert!(!is_meaningful_edit("Hello", "  hello  "));
+    }
+
+    #[test]
+    fn rejects_punctuation_only_change() {
+        assert!(!is_meaningful_edit("Hello world.", "Hello world!"));
+    }
+
+    #[test]
+    fn rejects_short_non_jargon_typo() {
+        // Plain prose typo within 2 chars — likely AX jitter.
+        assert!(!is_meaningful_edit(
+            "the meeting was good",
+            "the meeting was god",
+        ));
+    }
+
+    #[test]
+    fn accepts_real_word_swap_at_threshold() {
+        assert!(is_meaningful_edit(
+            "the meeting was good",
+            "the meeting was great",
+        ));
+    }
+
+    #[test]
+    fn accepts_short_jargon_edit_with_digits() {
+        // The exact production case from logs:
+        //   "Kal N10 ka IB0 nikalne wala hai." → "Kal n8n ka IB0 nikalne wala hai."
+        // char_diff after normalize = 2.  Old gate rejected as "AX jitter".
+        // New jargon-aware gate accepts because the changed token has digits.
+        assert!(is_meaningful_edit(
+            "Kal N10 ka IB0 nikalne wala hai.",
+            "Kal n8n ka IB0 nikalne wala hai.",
+        ));
+    }
+
+    #[test]
+    fn accepts_n8n_corrections_universally() {
+        assert!(is_meaningful_edit("I use 10 daily", "I use n8n daily"));
+        assert!(is_meaningful_edit("I use written daily", "I use n8n daily"));
+        assert!(is_meaningful_edit("I use k9s",  "I use k8s"));   // 1-char digit fix
+        assert!(is_meaningful_edit("v2.1 release", "v2.0 release"));
+    }
+
+    #[test]
+    fn rejects_zero_alphanumeric_word_changes() {
+        assert!(!is_meaningful_edit("hello world", "hello   world"));
+    }
 }
