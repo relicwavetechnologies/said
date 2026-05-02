@@ -1513,13 +1513,27 @@ fn main() {
     // 1. Load env vars from .env files
     voice_polish_core::load_env();
 
-    // 2. Tracing
+    // 2. Tracing — write to ~/Library/Logs/Said/said.log so logs survive in bundled app
+    let log_dir = format!(
+        "{}/Library/Logs/Said",
+        std::env::var("HOME").unwrap_or_else(|_| ".".into())
+    );
+    std::fs::create_dir_all(&log_dir).ok();
+    let log_path = format!("{log_dir}/said.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("cannot open said.log");
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info".into()),
         )
+        .with_ansi(false)   // no colour codes in the file
+        .with_writer(std::sync::Mutex::new(log_file))
         .init();
+    tracing::info!("[main] said desktop starting — log file: {log_path}");
 
     // 3. Shared state
     let shared_app  = Arc::new(Mutex::new(DesktopApp::new()));
@@ -1531,6 +1545,17 @@ fn main() {
             let back_arc = Arc::clone(&backend_arc);
             move |app| {
                 // ── Spawn backend daemon ──────────────────────────────────────
+                // ── Permission status at launch (visible in ~/Library/Logs/Said/said.log) ──
+                let ax_ok = paster::is_accessibility_granted();
+                let im_ok = hotkey::is_input_monitoring_granted();
+                tracing::info!("[perm] Accessibility={ax_ok} InputMonitoring={im_ok}");
+                if !ax_ok {
+                    tracing::warn!("[perm] Accessibility NOT granted — paste will fail. Grant in System Settings → Privacy → Accessibility");
+                }
+                if !im_ok {
+                    tracing::warn!("[perm] Input Monitoring NOT granted — hotkeys (Caps Lock, Option+1-5, Ctrl+Cmd+V) will not work. Grant in System Settings → Privacy → Input Monitoring");
+                }
+
                 match backend::spawn() {
                     Ok(handle) => {
                         let ep = handle.endpoint();

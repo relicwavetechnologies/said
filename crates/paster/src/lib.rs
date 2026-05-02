@@ -867,20 +867,21 @@ mod imp {
     }
 
     pub fn paste(text: &str) -> Result<(), String> {
-        pbcopy(text);
+        let ax_ok = unsafe { ffi::AXIsProcessTrusted() };
+        tracing::info!("[paste] called — AXIsProcessTrusted={ax_ok}, text_len={}", text.len());
 
-        unsafe {
-            if !ffi::AXIsProcessTrusted() {
-                eprintln!("[paste] Accessibility not granted — text copied to clipboard");
-                eprintln!("[paste]   Press Cmd+V to paste manually, or grant Accessibility:");
-                eprintln!("[paste]   System Settings → Privacy & Security → Accessibility");
-                return Ok(());
-            }
+        if !ax_ok {
+            tracing::warn!("[paste] Accessibility NOT granted — cannot paste. \
+                Grant Said in System Settings → Privacy & Security → Accessibility, then restart.");
+            return Err("Accessibility permission not granted — go to System Settings → Privacy → Accessibility and enable Said".into());
         }
 
+        // Copy text to clipboard, send Cmd+V, then restore original clipboard
         let original = pbpaste();
-        thread::sleep(Duration::from_millis(100));
+        pbcopy(text);
+        thread::sleep(Duration::from_millis(80));
 
+        tracing::info!("[paste] sending Cmd+V keypress");
         unsafe {
             let source = ffi::CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION);
 
@@ -897,8 +898,9 @@ mod imp {
             }
         }
 
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(Duration::from_millis(400));
         pbcopy(&original);
+        tracing::info!("[paste] done — clipboard restored");
         Ok(())
     }
 }

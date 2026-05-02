@@ -16,12 +16,25 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
-    // ── Structured logging ────────────────────────────────────────────────────
+    // ── Structured logging — write to ~/Library/Logs/Said/backend.log ────────
+    let log_dir = format!(
+        "{}/Library/Logs/Said",
+        std::env::var("HOME").unwrap_or_else(|_| ".".into())
+    );
+    std::fs::create_dir_all(&log_dir).ok();
+    let log_path = format!("{log_dir}/backend.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("cannot open backend.log");
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
                 .add_directive("polish_backend=debug".parse().unwrap()),
         )
+        .with_ansi(false)
+        .with_writer(std::sync::Mutex::new(log_file))
         .init();
 
     // ── Load env vars ─────────────────────────────────────────────────────────
