@@ -45,8 +45,9 @@ pub async fn stream_to_deepgram(
 
     // Endpointing: how long Deepgram waits after silence before marking speech_final.
     // - multi: 100ms — Deepgram's recommended value for code-switching.
-    // - hi/en: 300ms — balanced; 500ms was too slow (added 200ms to every recording).
-    let endpointing = if lang == "multi" { 100 } else { 300 };
+    // - hi/en: 500ms — Hindi speech has natural inter-word pauses; shorter values
+    //   cause premature segment splits which reduce transcription accuracy.
+    let endpointing = if lang == "multi" { 100 } else { 500 };
 
     // Build WS URL — keyterms appended once via urlencode (RFC-3986 safe).
     // Previously keyterms were appended twice (once via replace('+') and once via
