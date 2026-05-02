@@ -1,20 +1,30 @@
 //! POST /v1/classify-edit
 //!
-//! Hands a (transcript, polished, user_kept) triple to the 4-way classifier and
-//! routes the result into the correct learning store *automatically*:
+//! Four-stage learning pipeline:
 //!
-//!   • STT_ERROR     → vocabulary (STT-layer bias) + stt_replacements (post-STT swap)
-//!   • POLISH_ERROR  → word_corrections (LLM polish substitution)
-//!   • USER_REPHRASE → no learning artifact written
-//!   • USER_REWRITE  → no learning artifact written
+//!   1. **Pre-filter** (cheap, no LLM): drop no-ops, USER_REWRITE shapes
+//!      (huge length deltas, polish-kept-verbatim-with-prefix), and script
+//!      mismatches. Most edits exit here without an API call.
 //!
-//! Auto-promotion (no manual approval): STT_ERROR with a clear jargon-like
-//! candidate is promoted on the FIRST sighting.  Why: a single occurrence is
-//! enough — the candidate is by definition a rare/specialized term, and the
-//! cost of a wrong promotion is bounded (we demote on revert).
+//!   2. **Diff** (deterministic): compute structural hunks from polish vs
+//!      user_kept. Each hunk carries `(transcript_window, polish_window,
+//!      kept_window)` taken directly from the texts. The classifier in stage
+//!      3 will *label* these — it can never *invent* candidates.
 //!
-//! For POLISH_ERROR we keep the original "promote on repeat" behavior, because
-//! single-shot promotions there can corrupt common words.
+//!   3. **Classify** (LLM as labeler): hand the hunks to Groq, which assigns
+//!      one class label per hunk + an overall class for the edit. Strict
+//!      JSON schema, missing labels default to USER_REPHRASE.
+//!
+//!   4. **Promotion gates** (data-driven, defense-in-depth): for each STT_ERROR
+//!      / POLISH_ERROR labelled hunk, verify the proposed correct_form
+//!      actually appears in user_kept, has the right script for the user's
+//!      output language, and is plausibly an STT mishearing (phonetic or
+//!      jargon evidence) before promoting to the vocabulary / replacement
+//!      stores.
+//!
+//! The architectural invariant: a learning artifact is written ONLY when a
+//! diff-derived hunk passes all four stages. The LLM cannot bypass this by
+//! claiming a correction that doesn't exist in the actual edit text.
 
 use axum::{extract::State, http::StatusCode, Json};
 use reqwest::Client;
@@ -22,8 +32,14 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::{
-    llm::{classifier, classifier::EditClass, phonetics},
-    store::{corrections, history, pending_edits, prefs::get_prefs, stt_replacements, vocabulary},
+    llm::{
+        classifier, classifier::{EditClass, LabelledHunk},
+        edit_diff, phonetics, pre_filter, promotion_gate,
+    },
+    store::{
+        corrections, history, pending_edits, prefs::get_prefs,
+        stt_replacements, vocabulary,
+    },
     AppState,
 };
 
@@ -36,28 +52,23 @@ pub struct ClassifyBody {
 
 #[derive(Serialize)]
 pub struct ClassifyResponse {
-    pub class:            String,
-    pub reason:           String,
-    pub candidates:       Vec<classifier::Candidate>,
-    /// True if any artifact was written (vocab / replacement / correction).
-    pub learned:          bool,
-    /// True if the desktop should show a notification.
-    pub notify:           bool,
-    /// Set when a pending_edits row was inserted (POLISH_ERROR first-sighting).
-    pub pending_id:       Option<String>,
-    /// Number of vocabulary or replacement terms promoted on this edit.
-    pub promoted_count:   usize,
-    /// Whether at least one of the candidates matched a previously-seen rule.
-    pub is_repeat:        bool,
+    pub class:          String,
+    pub reason:         String,
+    pub candidates:     Vec<LabelledHunk>,
+    pub learned:        bool,
+    pub notify:         bool,
+    pub pending_id:     Option<String>,
+    pub promoted_count: usize,
+    pub is_repeat:      bool,
 }
 
 pub async fn classify(
     State(state): State<AppState>,
     Json(body): Json<ClassifyBody>,
 ) -> (StatusCode, Json<ClassifyResponse>) {
-    // 1. Look up the transcript from the recording.
-    let transcript = match history::get_recording(&state.pool, &body.recording_id) {
-        Some(rec) => rec.transcript,
+    // 1. Look up the transcript and the user's output language preference.
+    let rec = match history::get_recording(&state.pool, &body.recording_id) {
+        Some(r) => r,
         None => {
             warn!("[classify] recording {} not found", body.recording_id);
             return (
@@ -66,20 +77,68 @@ pub async fn classify(
             );
         }
     };
+    let transcript = rec.transcript;
+    let prefs = get_prefs(&state.pool, &state.default_user_id);
+    let output_language = prefs
+        .as_ref()
+        .map(|p| p.output_language.clone())
+        .unwrap_or_else(|| "hinglish".into());
 
-    // 2. Resolve Groq key.
-    let groq_key = get_prefs(&state.pool, &state.default_user_id)
-        .and_then(|p| p.groq_api_key)
+    // 2. Run negative-signal demotion (independent of class).  If a previously
+    //    promoted vocab term appears in polish but is removed in user_kept,
+    //    decrement its weight.  Always runs — even on REWRITE/REPHRASE.
+    let demoted = run_demotion_pass(&state, &body.ai_output, &body.user_kept);
+    if demoted > 0 {
+        info!("[classify] demoted {demoted} vocabulary term(s) on this edit");
+    }
+
+    // 3. STAGE 1 — Pre-filter.
+    match pre_filter::run(&body.ai_output, &body.user_kept, &output_language) {
+        pre_filter::PreFilter::Drop => {
+            info!("[classify] pre-filter: drop (no real edit) for {}", body.recording_id);
+            return (
+                StatusCode::OK,
+                Json(empty_response("USER_REPHRASE", "no learnable change")),
+            );
+        }
+        pre_filter::PreFilter::EarlyClass(d) => {
+            info!(
+                "[classify] pre-filter: early-class={} reason={:?} (skipping LLM)",
+                d.class, d.reason
+            );
+            return (
+                StatusCode::OK,
+                Json(empty_response(d.class, d.reason)),
+            );
+        }
+        pre_filter::PreFilter::Pass => {} // continue
+    }
+
+    // 4. STAGE 2 — Compute diff hunks.
+    let hunks = edit_diff::diff(&transcript, &body.ai_output, &body.user_kept);
+    if hunks.is_empty() {
+        // Pre-filter said pass but diff found no structural change — vacuous edit.
+        info!("[classify] diff produced no hunks for {}", body.recording_id);
+        return (
+            StatusCode::OK,
+            Json(empty_response("USER_REPHRASE", "no structural diff hunks")),
+        );
+    }
+    info!("[classify] diff produced {} hunk(s) for {}", hunks.len(), body.recording_id);
+
+    // 5. STAGE 3 — LLM labeler.
+    let groq_key = prefs
+        .as_ref()
+        .and_then(|p| p.groq_api_key.clone())
         .or_else(|| std::env::var("GROQ_API_KEY").ok())
         .unwrap_or_default();
-
-    // 3. Call the 4-way classifier.
-    let http = Client::new();
+    let http   = Client::new();
     let result = match classifier::classify_edit(
         &http, &groq_key, &transcript, &body.ai_output, &body.user_kept,
+        &hunks, &output_language,
     ).await {
         Some(r) => r,
-        None => {
+        None    => {
             info!("[classify] classifier unavailable — skipping for {}", body.recording_id);
             return (
                 StatusCode::OK,
@@ -88,107 +147,72 @@ pub async fn classify(
         }
     };
 
-    // 3b. Negative-signal demotion: if a previously-promoted vocabulary term
-    //     appears in the polish but is removed/replaced in user_kept, decrement
-    //     its weight.  Pure additive — runs before class-specific routing so
-    //     even a USER_REPHRASE can demote a noisy past promotion.
-    let demoted = run_demotion_pass(&state, &body.ai_output, &body.user_kept);
-    if demoted > 0 {
-        info!("[classify] demoted {demoted} vocabulary term(s) on this edit");
-    }
-
-    // 4. Route to the correct store(s) based on class.
+    // 6. STAGE 4 — Promotion gates + write artifacts.
     let mut promoted_count = 0_usize;
     let mut is_repeat      = false;
     let mut pending_id     = None;
     let mut learned        = false;
 
-    match result.class {
-        EditClass::SttError => {
-            for cand in &result.candidates {
-                let correct = cand.correct_form.trim();
-                if correct.is_empty() { continue; }
+    for cand in &result.candidates {
+        let correct = cand.correct_form().trim();
+        if correct.is_empty() { continue; }
 
-                // Heuristic guard: only auto-promote if the candidate looks
-                // jargon-like OR the classifier is highly confident.  This stops
-                // the LLM from labeling a casual rephrase as STT_ERROR.
-                let jargon  = phonetics::jargon_score(correct);
-                let confident = result.confidence >= 0.7;
-                if jargon < 0.3 && !confident {
-                    info!(
-                        "[classify] STT_ERROR candidate {correct:?} score={jargon:.2} \
-                         conf={:.2} — below auto-promote threshold; skipping",
-                        result.confidence
-                    );
+        match cand.class {
+            EditClass::SttError => {
+                if !stt_promotion_allowed(cand, correct, &body.user_kept, &output_language) {
                     continue;
                 }
-
-                // Already in vocab? bump weight; record repeat.
                 if vocabulary::upsert(&state.pool, &state.default_user_id, correct, 1.0, "auto") {
                     learned = true;
                     promoted_count += 1;
                 }
-
-                // Add (transcript_form → correct_form) replacement when STT
-                // produced a distinct wrong form.
-                let from = cand.transcript_form.trim();
+                let from = cand.transcript_form().trim();
                 if !from.is_empty()
                     && !from.eq_ignore_ascii_case(correct)
                     && stt_replacements::upsert(&state.pool, &state.default_user_id, from, correct, 1.0)
                 {
                     promoted_count += 1;
                 }
-
-                // Repeat detection: if vocab use_count > 1, it had been seen.
-                let counts = vocabulary::top_terms(&state.pool, &state.default_user_id, 200);
-                if counts.iter().any(|t| t.term.eq_ignore_ascii_case(correct) && t.use_count > 1) {
+                if vocabulary::top_terms(&state.pool, &state.default_user_id, 200)
+                    .iter()
+                    .any(|t| t.term.eq_ignore_ascii_case(correct) && t.use_count > 1)
+                {
                     is_repeat = true;
                 }
             }
-        }
-
-        EditClass::PolishError => {
-            // Polish errors are riskier (common-word collisions) — we keep the
-            // pending_edits → manual approval flow for first sightings, but the
-            // backend now promotes automatically when we've seen the same wrong
-            // word before in word_corrections.
-            for cand in &result.candidates {
-                let wrong   = cand.polish_form.trim().to_ascii_lowercase();
-                let correct = cand.correct_form.trim();
-                if wrong.is_empty() || correct.is_empty() || wrong == correct.to_ascii_lowercase() {
+            EditClass::PolishError => {
+                if !polish_promotion_allowed(cand, correct, &body.user_kept, &output_language) {
+                    continue;
+                }
+                let wrong = cand.polish_form().trim().to_ascii_lowercase();
+                if wrong.is_empty() || wrong == correct.to_ascii_lowercase() {
                     continue;
                 }
                 if correction_exists(&state, &wrong) {
                     is_repeat = true;
                     corrections::upsert(
-                        &state.pool,
-                        &state.default_user_id,
-                        &[(wrong.clone(), correct.to_ascii_lowercase())],
+                        &state.pool, &state.default_user_id,
+                        &[(wrong, correct.to_ascii_lowercase())],
                     );
                     learned = true;
                     promoted_count += 1;
                 }
             }
-
-            // Always store as pending so the user can review even single-shot
-            // POLISH_ERRORs in the UI.  This is the safety valve for ambiguous
-            // common-word substitutions.
-            pending_id = pending_edits::insert(
-                &state.pool,
-                &state.default_user_id,
-                Some(&body.recording_id),
-                &body.ai_output,
-                &body.user_kept,
-            );
-        }
-
-        EditClass::UserRephrase | EditClass::UserRewrite => {
-            // No learning artifact.
+            EditClass::UserRephrase | EditClass::UserRewrite => {
+                // No-op; safe defaults already kept by the labeler when uncertain.
+            }
         }
     }
 
-    // 5. Notification policy: notify on STT_ERROR auto-promotion (something
-    //    visible just changed), or on a repeat POLISH_ERROR promotion.
+    // For overall=POLISH_ERROR the user can review pending if no auto-promotion
+    // fired (single-shot first-time correction).  This is the safety valve.
+    if result.class == EditClass::PolishError && !learned {
+        pending_id = pending_edits::insert(
+            &state.pool, &state.default_user_id,
+            Some(&body.recording_id), &body.ai_output, &body.user_kept,
+        );
+    }
+
     let notify = match result.class {
         EditClass::SttError    => promoted_count > 0,
         EditClass::PolishError => learned && is_repeat,
@@ -196,9 +220,9 @@ pub async fn classify(
     };
 
     info!(
-        "[classify] {} class={} promoted={} repeat={} notify={} learned={} pending={:?}",
-        body.recording_id, result.class.as_str(), promoted_count, is_repeat,
-        notify, learned, pending_id,
+        "[classify] {} overall={} hunks={} promoted={} repeat={} notify={} learned={} pending={:?}",
+        body.recording_id, result.class.as_str(), result.candidates.len(),
+        promoted_count, is_repeat, notify, learned, pending_id,
     );
 
     (
@@ -216,9 +240,55 @@ pub async fn classify(
     )
 }
 
-/// Demote vocabulary terms that appear in the polish but are removed/replaced
-/// by the user.  Returns how many terms were demoted.  We intentionally only
-/// look at terms with `source != 'starred'` so user-pinned vocab is safe.
+/// Defense-in-depth gate for STT_ERROR auto-promotion.
+fn stt_promotion_allowed(
+    cand:            &LabelledHunk,
+    correct:         &str,
+    user_kept:       &str,
+    output_language: &str,
+) -> bool {
+    if !promotion_gate::appears_in_user_kept(correct, user_kept) {
+        warn!(
+            "[classify] STT_ERROR rejected — correct_form {correct:?} not in user_kept (LLM hallucination?)"
+        );
+        return false;
+    }
+    if !promotion_gate::script_matches(correct, output_language) {
+        warn!(
+            "[classify] STT_ERROR rejected — script of {correct:?} doesn't match output_language={output_language:?}"
+        );
+        return false;
+    }
+
+    // Plausibility: the candidate must look STT-error-like.
+    // Either phonetic similarity to the wrong form, or independent jargon-ness.
+    let phon_sim = phonetics::similarity(cand.transcript_form(), correct)
+        .max(phonetics::similarity(cand.polish_form(), correct));
+    let jargon   = phonetics::jargon_score(correct);
+    let confident = cand.confidence >= 0.7;
+
+    if phon_sim < 0.5 && jargon < 0.4 && !confident {
+        info!(
+            "[classify] STT_ERROR rejected — weak signal (phon={phon_sim:.2}, jargon={jargon:.2}, conf={:.2}) for {correct:?}",
+            cand.confidence,
+        );
+        return false;
+    }
+    true
+}
+
+/// Gate for POLISH_ERROR auto-promotion.
+fn polish_promotion_allowed(
+    _cand:           &LabelledHunk,
+    correct:         &str,
+    user_kept:       &str,
+    output_language: &str,
+) -> bool {
+    promotion_gate::appears_in_user_kept(correct, user_kept)
+        && promotion_gate::script_matches(correct, output_language)
+}
+
+/// Demote vocabulary terms that appear in polish but are removed in user_kept.
 fn run_demotion_pass(state: &AppState, polish: &str, user_kept: &str) -> usize {
     let polish_lower = polish.to_ascii_lowercase();
     let kept_lower   = user_kept.to_ascii_lowercase();
@@ -228,7 +298,6 @@ fn run_demotion_pass(state: &AppState, polish: &str, user_kept: &str) -> usize {
     for v in vocab {
         if v.source == "starred" { continue; }
         let term_lower = v.term.to_ascii_lowercase();
-        // present in polish, absent in user_kept → user removed it
         if polish_lower.contains(&term_lower)
             && !kept_lower.contains(&term_lower)
             && vocabulary::demote(&state.pool, &state.default_user_id, &v.term, 0.5)
@@ -239,7 +308,6 @@ fn run_demotion_pass(state: &AppState, polish: &str, user_kept: &str) -> usize {
     demoted
 }
 
-/// Has the user previously corrected this exact polish form?
 fn correction_exists(state: &AppState, wrong: &str) -> bool {
     let conn = match state.pool.get() {
         Ok(c) => c,

@@ -1,24 +1,25 @@
-//! End-to-end tests for the learning architecture.
+//! End-to-end tests for the learning pipeline.
 //!
-//! Simulates the classifier output you'd get for the canonical "n8n" case and
-//! drives it through the same code paths the live route uses, verifying that:
-//!   1. STT_ERROR + jargon-like candidate → vocabulary entry created.
-//!   2. STT_ERROR creates a stt_replacement when transcript form differs.
-//!   3. POLISH_ERROR + first-sighting → no promotion (gated on repeat).
-//!   4. USER_REPHRASE → no artifacts written.
-//!   5. Demotion: vocab term present in polish but absent in user_kept → weight ↓.
-//!
-//! These tests skip the network call to Groq — we feed `ClassifyResult` directly
-//! into the same promotion logic that `routes::classify::classify` uses.
+//! These tests bypass the network call to Groq.  They build a `LabelledHunk`
+//! the same way the new pipeline would after diff + LLM, then drive it
+//! through the same promotion/gate code the live route uses.  This covers:
+//!   1. STT_ERROR + jargon candidate → vocabulary + stt_replacement written
+//!   2. Demotion of starred terms is rejected
+//!   3. The email-link bug never reaches promotion (caught at pre_filter)
+//!   4. The Devanagari-hallucination bug never reaches promotion (caught at
+//!      diff stage — hallucinated terms simply aren't in the diff hunks)
+//!   5. Repeat promotion bumps use_count, doesn't duplicate
 
 #![cfg(test)]
 
-use crate::llm::classifier::{Candidate, ClassifyResult, EditClass};
-use crate::llm::phonetics;
+use crate::llm::{
+    classifier::{EditClass, LabelledHunk},
+    edit_diff::{self, Hunk},
+    phonetics, pre_filter, promotion_gate,
+};
 use crate::store::{stt_replacements, vocabulary, DbPool};
 use r2d2_sqlite::SqliteConnectionManager;
 
-/// In-memory pool with the schema needed for the learning-flow tests.
 fn pool() -> DbPool {
     let mgr  = SqliteConnectionManager::memory();
     let pool = r2d2::Pool::builder().max_size(2).build(mgr).unwrap();
@@ -62,22 +63,40 @@ fn pool() -> DbPool {
     pool
 }
 
-/// Promote an STT_ERROR candidate using the same heuristic gate as the route.
-/// Returns (promoted_count, learned).
-fn promote_stt_error(pool: &DbPool, user_id: &str, result: &ClassifyResult) -> (usize, bool) {
+/// Build a labelled hunk identical to what the full pipeline would produce.
+fn label(hunk: Hunk, class: EditClass, confidence: f64) -> LabelledHunk {
+    LabelledHunk { hunk, class, confidence }
+}
+
+/// Stage-4 promotion logic mirroring `routes::classify::classify` (no network).
+fn promote(
+    pool:            &DbPool,
+    user_id:         &str,
+    user_kept:       &str,
+    output_language: &str,
+    cands:           &[LabelledHunk],
+) -> (usize, bool) {
     let mut promoted = 0_usize;
     let mut learned  = false;
-    for cand in &result.candidates {
-        let correct = cand.correct_form.trim();
+    for cand in cands {
+        if cand.class != EditClass::SttError { continue; }
+        let correct = cand.correct_form().trim();
         if correct.is_empty() { continue; }
-        let jargon = phonetics::jargon_score(correct);
-        let confident = result.confidence >= 0.7;
-        if jargon < 0.3 && !confident { continue; }
+
+        if !promotion_gate::appears_in_user_kept(correct, user_kept) { continue; }
+        if !promotion_gate::script_matches(correct, output_language) { continue; }
+
+        let phon_sim = phonetics::similarity(cand.transcript_form(), correct)
+            .max(phonetics::similarity(cand.polish_form(), correct));
+        let jargon   = phonetics::jargon_score(correct);
+        let confident = cand.confidence >= 0.7;
+        if phon_sim < 0.5 && jargon < 0.4 && !confident { continue; }
+
         if vocabulary::upsert(pool, user_id, correct, 1.0, "auto") {
             learned = true;
             promoted += 1;
         }
-        let from = cand.transcript_form.trim();
+        let from = cand.transcript_form().trim();
         if !from.is_empty()
             && !from.eq_ignore_ascii_case(correct)
             && stt_replacements::upsert(pool, user_id, from, correct, 1.0)
@@ -88,106 +107,114 @@ fn promote_stt_error(pool: &DbPool, user_id: &str, result: &ClassifyResult) -> (
     (promoted, learned)
 }
 
+// ── Tests ────────────────────────────────────────────────────────────────────
+
 #[test]
-fn n8n_case_promotes_to_vocabulary_and_replacement() {
-    let pool   = pool();
-    let result = ClassifyResult {
-        class:      EditClass::SttError,
-        reason:     "n8n is jargon, missing from transcript and polish".into(),
-        candidates: vec![Candidate {
-            spoke:           "n8n".into(),
-            transcript_form: "written".into(),
-            polish_form:     "written".into(),
-            correct_form:    "n8n".into(),
-        }],
-        confidence: 0.9,
-    };
+fn n8n_case_promotes_via_full_pipeline() {
+    let pool       = pool();
+    let polish     = "I use written for automation";
+    let user_kept  = "I use n8n for automation";
+    let transcript = polish; // STT misheard
 
-    let (promoted, learned) = promote_stt_error(&pool, "u1", &result);
-    assert!(learned, "should write artifacts");
-    assert_eq!(promoted, 2, "vocab + stt_replacement = 2 promotions");
+    // Stage 1 — pre-filter must let this through.
+    assert_eq!(pre_filter::run(polish, user_kept, "hinglish"), pre_filter::PreFilter::Pass);
 
-    // 1. vocabulary now contains "n8n"
-    let terms = vocabulary::top_term_strings(&pool, "u1", 10);
-    assert!(terms.iter().any(|t| t == "n8n"), "vocab missing n8n: {terms:?}");
+    // Stage 2 — diff produces exactly one hunk with concrete text.
+    let hunks = edit_diff::diff(transcript, polish, user_kept);
+    assert_eq!(hunks.len(), 1);
+    assert_eq!(hunks[0].polish_window, "written");
+    assert_eq!(hunks[0].kept_window,   "n8n");
 
-    // 2. STT replacement now rewrites "written" → "n8n"
-    let rules = stt_replacements::load_all(&pool, "u1");
-    let out   = stt_replacements::apply("I use written for automation", &rules);
-    assert_eq!(out, "I use n8n for automation");
+    // Stage 3 — labeler (simulated) tags as STT_ERROR.
+    let cands = vec![label(hunks[0].clone(), EditClass::SttError, 0.9)];
+
+    // Stage 4 — promotion.
+    let (promoted, learned) = promote(&pool, "u1", user_kept, "hinglish", &cands);
+    assert_eq!(promoted, 2, "vocab + stt_replacement");
+    assert!(learned);
+    assert!(vocabulary::top_term_strings(&pool, "u1", 10).contains(&"n8n".to_string()));
 }
 
 #[test]
-fn user_rephrase_writes_no_artifacts() {
-    let pool   = pool();
-    let result = ClassifyResult {
-        class:      EditClass::UserRephrase,
-        reason:     "stylistic".into(),
-        candidates: vec![],
-        confidence: 0.5,
-    };
-    // Same gate as in route: REPHRASE never reaches promote_stt_error.
-    if matches!(result.class, EditClass::SttError) {
-        promote_stt_error(&pool, "u1", &result);
+fn email_link_prefix_bug_blocked_at_pre_filter() {
+    // The exact production failure that prompted this rebuild.
+    let polish = "Anish at Gmail dot com ka zara batana kaun sa mail ID par bhejna hai";
+    let kept   = "[anish@gmail.com](mailto:anish@gmail.com) Anish at Gmail dot com ka zara batana kaun sa mail ID par bhejna hai";
+
+    match pre_filter::run(polish, kept, "hinglish") {
+        pre_filter::PreFilter::EarlyClass(d) => assert_eq!(d.class, "USER_REWRITE"),
+        other => panic!("expected USER_REWRITE early-exit, got {other:?}"),
     }
-    assert_eq!(vocabulary::count(&pool, "u1"), 0);
-    assert_eq!(stt_replacements::load_all(&pool, "u1").len(), 0);
+    // Pipeline never even reaches the LLM — no hallucinated promotions possible.
 }
 
 #[test]
-fn low_jargon_low_confidence_stt_candidate_is_dropped() {
-    let pool   = pool();
-    let result = ClassifyResult {
-        class:      EditClass::SttError,
-        reason:     "the".into(),
-        candidates: vec![Candidate {
-            spoke:           "the".into(),
-            transcript_form: "thee".into(),
-            polish_form:     "thee".into(),
-            correct_form:    "the".into(), // common word, jargon score ~0
-        }],
-        confidence: 0.4,                       // below 0.7 confident threshold
+fn devanagari_hallucination_blocked_at_diff_stage() {
+    // Even if pre_filter let it through (suppose it did), the diff stage
+    // produces hunks whose text is taken from the actual strings — the
+    // hallucinated "अनीष / का / ज़रा" candidates from the Groq bug cannot
+    // appear because they don't exist in any of the three texts.
+    let transcript = "Anish at Gmail dot com ka zara batana";
+    let polish     = "Anish at Gmail dot com ka zara batana";
+    let kept       = "[anish@gmail.com](mailto:anish@gmail.com) Anish at Gmail dot com ka zara batana";
+
+    let hunks = edit_diff::diff(transcript, polish, kept);
+    for h in &hunks {
+        assert!(!h.kept_window.contains("अनीष"));
+        assert!(!h.kept_window.contains("का"));
+        assert!(!h.kept_window.contains("ज़रा"));
+    }
+}
+
+#[test]
+fn devanagari_in_hinglish_mode_blocked_by_script_gate() {
+    // If a hunk did somehow surface a Devanagari "correct_form" (e.g. user
+    // genuinely typed Devanagari mid-sentence), the script gate refuses to
+    // promote in Hinglish mode.
+    let pool  = pool();
+    let hunk  = Hunk {
+        transcript_window: "ka".into(),
+        polish_window:     "ka".into(),
+        kept_window:       "का".into(),
     };
-    let (promoted, learned) = promote_stt_error(&pool, "u1", &result);
+    let cands = vec![label(hunk, EditClass::SttError, 0.9)];
+    // user_kept contains the Devanagari char so appears_in_user_kept passes,
+    // but script_matches must reject it under hinglish mode.
+    let (promoted, learned) = promote(&pool, "u1", "ka का batana", "hinglish", &cands);
     assert_eq!(promoted, 0);
     assert!(!learned);
     assert_eq!(vocabulary::count(&pool, "u1"), 0);
 }
 
 #[test]
-fn high_confidence_stt_candidate_promotes_even_if_low_jargon() {
-    let pool   = pool();
-    let result = ClassifyResult {
-        class:      EditClass::SttError,
-        reason:     "user said `please`".into(),
-        candidates: vec![Candidate {
-            spoke:           "please".into(),
-            transcript_form: "pleas".into(),
-            polish_form:     "pleas".into(),
-            correct_form:    "please".into(),
-        }],
-        confidence: 0.95,
+fn hallucinated_correct_form_blocked_by_appears_in_user_kept() {
+    // Defense in depth: even if labelling is wrong, a candidate whose
+    // correct_form doesn't actually appear in user_kept never promotes.
+    let pool  = pool();
+    let hunk  = Hunk {
+        transcript_window: "written".into(),
+        polish_window:     "written".into(),
+        kept_window:       "n8n".into(),
     };
-    let (promoted, _) = promote_stt_error(&pool, "u1", &result);
-    assert!(promoted >= 1);
+    // But suppose by some bug the labelled hunk's kept_window claimed a value
+    // that never appeared in the actual user_kept string we hand the gate.
+    let cands = vec![label(hunk, EditClass::SttError, 0.95)];
+    let (promoted, _) = promote(&pool, "u1", "I use something different", "hinglish", &cands);
+    assert_eq!(promoted, 0, "n8n is not in user_kept — promotion must be refused");
 }
 
 #[test]
 fn repeat_promotion_bumps_use_count_not_duplicate_row() {
-    let pool   = pool();
-    let result = ClassifyResult {
-        class:      EditClass::SttError,
-        reason:     "n8n".into(),
-        candidates: vec![Candidate {
-            spoke: "n8n".into(),
-            transcript_form: "written".into(),
-            polish_form: "written".into(),
-            correct_form: "n8n".into(),
-        }],
-        confidence: 0.9,
+    let pool  = pool();
+    let hunk  = Hunk {
+        transcript_window: "written".into(),
+        polish_window:     "written".into(),
+        kept_window:       "n8n".into(),
     };
-    promote_stt_error(&pool, "u1", &result);
-    promote_stt_error(&pool, "u1", &result);
+    let cands = vec![label(hunk, EditClass::SttError, 0.9)];
+    let kept  = "I use n8n for automation";
+    promote(&pool, "u1", kept, "hinglish", &cands);
+    promote(&pool, "u1", kept, "hinglish", &cands);
     let terms = vocabulary::top_terms(&pool, "u1", 10);
     let n8n   = terms.iter().find(|t| t.term == "n8n").expect("n8n missing");
     assert_eq!(n8n.use_count, 2);
@@ -195,36 +222,24 @@ fn repeat_promotion_bumps_use_count_not_duplicate_row() {
 }
 
 #[test]
-fn vocabulary_demotion_on_revert() {
-    let pool = pool();
-    // Pretend we previously learned "n8n" with weight 1.0.
-    vocabulary::upsert(&pool, "u1", "n8n", 1.0, "auto");
-    assert_eq!(vocabulary::count(&pool, "u1"), 1);
-
-    // Polish contained "n8n", user removed it: simulate the demotion pass.
-    let polish    = "I use n8n daily";
-    let user_kept = "I use it daily";
-    let polish_l  = polish.to_ascii_lowercase();
-    let kept_l    = user_kept.to_ascii_lowercase();
-    let vocab     = vocabulary::top_terms(&pool, "u1", 200);
-    for v in vocab {
-        if v.source == "starred" { continue; }
-        let term_l = v.term.to_ascii_lowercase();
-        if polish_l.contains(&term_l) && !kept_l.contains(&term_l) {
-            vocabulary::demote(&pool, "u1", &v.term, 0.5);
-        }
-    }
-
-    let after = vocabulary::top_terms(&pool, "u1", 10);
-    assert_eq!(after.len(), 1, "single demote should not evict yet");
-    assert!(after[0].weight < 1.0);
+fn weak_signal_stt_candidate_is_dropped() {
+    // Common short word, low confidence, no jargon score, no phonetic match —
+    // the gate must refuse.
+    let pool  = pool();
+    let hunk  = Hunk {
+        transcript_window: "good".into(),
+        polish_window:     "good".into(),
+        kept_window:       "ok".into(),  // common, jargon=0
+    };
+    let cands = vec![label(hunk, EditClass::SttError, 0.3)];
+    let (promoted, _) = promote(&pool, "u1", "ok then", "english", &cands);
+    assert_eq!(promoted, 0);
 }
 
 #[test]
 fn starred_vocabulary_immune_to_demotion() {
     let pool = pool();
     vocabulary::upsert(&pool, "u1", "ProjectAtlas", 1.0, "starred");
-    // Even with five demotions, starred terms must stay.
     for _ in 0..5 {
         vocabulary::demote(&pool, "u1", "ProjectAtlas", 1.0);
     }
