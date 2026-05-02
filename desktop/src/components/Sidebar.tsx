@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useState, useRef, useEffect } from "react";
 import {
   LayoutDashboard,
   History,
@@ -7,6 +7,7 @@ import {
   Settings,
   HelpCircle,
   UserPlus,
+  Mail,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { openExternal } from "@/lib/invoke";
@@ -180,19 +181,119 @@ export function Sidebar({ snapshot, activeView, onViewChange, busy, onOpenInvite
           <span className="flex-1 truncate">Settings</span>
         </button>
 
-        {/* Help — opens user's mail app to support */}
-        <button
-          className="nav-item"
-          onClick={() => {
-            openExternal("mailto:support@emiactech.com?subject=Said%20support");
-          }}
-        >
-          <span className="flex-shrink-0 opacity-70">
-            <HelpCircle size={15} />
-          </span>
-          <span className="flex-1 truncate">Help</span>
-        </button>
+        {/* Help — popover beside the button (no auto-open of mail) */}
+        <HelpButton />
       </div>
     </aside>
+  );
+}
+
+// ── Help popover — anchors to the right of the Help nav item ─────────────────
+
+const SUPPORT_EMAIL = "support@emiactech.com";
+
+function HelpButton() {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  // Click-away + ESC to close
+  useEffect(() => {
+    if (!open) return;
+    function onDoc(e: MouseEvent) {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setOpen(false);
+    }
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  return (
+    <div ref={wrapRef} className="relative">
+      <button
+        className={cn("nav-item", open && "active")}
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+      >
+        <span className="flex-shrink-0 opacity-70">
+          <HelpCircle size={15} />
+        </span>
+        <span className="flex-1 truncate text-left">Help</span>
+      </button>
+
+      {/* Popover — sits to the right of the sidebar, vertically aligned with
+          the Help button. Same rounded-[16px] surface + inset stroke + drop
+          shadow as the rest of the app's panels. */}
+      {open && (
+        <div
+          className="absolute z-50 left-full bottom-0 ml-3 w-[260px] rounded-2xl overflow-hidden"
+          style={{
+            background: "hsl(var(--surface-2))",
+            boxShadow:
+              "inset 0 0 0 1px hsl(var(--border)), inset 0 1px 0 hsl(0 0% 100% / 0.06), 0 18px 50px hsl(220 60% 2% / 0.55)",
+            animation: "fadeIn 0.14s ease-out",
+          }}
+        >
+          {/* Header */}
+          <div className="px-4 pt-4 pb-3">
+            <div className="flex items-center gap-2 mb-1">
+              <span
+                className="flex items-center justify-center w-6 h-6 rounded-md flex-shrink-0"
+                style={{
+                  background: "hsl(var(--primary) / 0.16)",
+                  color:      "hsl(var(--primary))",
+                }}
+              >
+                <Mail size={12} />
+              </span>
+              <span className="text-[13px] font-semibold text-foreground leading-tight">
+                Need help?
+              </span>
+            </div>
+            <p className="text-[11.5px] text-muted-foreground leading-relaxed">
+              Drop us a line — we usually reply within a day.
+            </p>
+          </div>
+
+          {/* Email row — selectable text */}
+          <div
+            className="mx-4 mb-3 px-3 py-2 rounded-lg flex items-center"
+            style={{
+              background: "hsl(var(--surface-3))",
+              boxShadow:  "inset 0 0 0 1px hsl(var(--surface-4))",
+            }}
+          >
+            <span
+              className="text-[12px] font-medium text-foreground tabular-nums truncate select-text"
+              title={SUPPORT_EMAIL}
+            >
+              {SUPPORT_EMAIL}
+            </span>
+          </div>
+
+          {/* Action button — same .btn-primary token as every other primary CTA */}
+          <div className="px-4 pb-4">
+            <button
+              onClick={() => {
+                openExternal(`mailto:${SUPPORT_EMAIL}?subject=Said%20support`);
+                setOpen(false);
+              }}
+              className="btn-primary w-full justify-center py-2 rounded-lg"
+              style={{ fontSize: 12.5 }}
+            >
+              <Mail size={12} />
+              Email support
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
