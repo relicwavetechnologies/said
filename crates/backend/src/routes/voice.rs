@@ -100,25 +100,39 @@ pub async fn polish(
         }
     }
 
-    if wav_data.is_empty() {
-        warn!("[voice] received empty audio");
+    // Allow empty WAV when the caller supplied a pre_transcript (P5 / WS path).
+    if wav_data.is_empty() && pre_transcript.is_none() {
+        warn!("[voice] received empty audio and no pre_transcript");
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    // Save audio to disk for 1-day retention (retry support)
+    // Save audio to disk (1-day retention) — fire-and-forget so the response
+    // stream opens without waiting for the filesystem write (~10–20 ms saved).
     let audio_id = Uuid::new_v4().to_string();
-    save_audio(&audio_id, &wav_data);
+    if !wav_data.is_empty() {
+        let aid  = audio_id.clone();
+        let data = wav_data.clone();
+        tokio::task::spawn_blocking(move || { save_audio(&aid, &data); });
+    }
 
     let user_id = state.default_user_id.as_str().to_string();
     let pool    = state.pool.clone();
 
-    // Load prefs, lexicon (corrections + stt_replacements), and grab shared HTTP
-    // client — all BEFORE entering the stream so we don't block on .await inside
-    // async_stream::stream! and to avoid creating a new Client per request.
-    let prefs_opt = crate::get_prefs_cached(&state.prefs_cache, &pool, &user_id).await;
-    let (word_corrections, stt_replacement_rules) =
-        crate::get_lexicon_cached(&state.lexicon_cache, &pool, &user_id).await;
     let http_client = state.http_client.clone();
+
+    // ── Pre-fetch all DB-backed data in parallel, BEFORE opening the SSE stream ──
+    // Prefs (async RwLock), lexicon (async RwLock), and vocab terms (spawn_blocking)
+    // run concurrently so total wait ≈ max(each) instead of their sum (~8 ms saved).
+    let vocab_task = {
+        let pool_c = pool.clone();
+        let uid_c  = user_id.clone();
+        tokio::task::spawn_blocking(move || vocabulary::top_term_strings(&pool_c, &uid_c, 100))
+    };
+    let (prefs_opt, (word_corrections, stt_replacement_rules), vocab_terms) = tokio::join!(
+        crate::get_prefs_cached(&state.prefs_cache, &pool, &user_id),
+        crate::get_lexicon_cached(&state.lexicon_cache, &pool, &user_id),
+        async { vocab_task.await.unwrap_or_default() },
+    );
 
     // ── Build SSE stream ───────────────────────────────────────────────────────
     let audio_id_ref = audio_id.clone();
@@ -158,14 +172,6 @@ pub async fn polish(
             .or_else(|| std::env::var("GROQ_API_KEY").ok())
             .unwrap_or_default();
 
-        // ── Personal STT bias: load top vocabulary terms (capped) ──────────────
-        // rusqlite is synchronous — off-load to a blocking thread so we don't
-        // stall the async executor (avoids jitter on the SSE stream open).
-        let pool_clone = pool.clone();
-        let uid_clone  = user_id.clone();
-        let vocab_terms = tokio::task::spawn_blocking(move || {
-            vocabulary::top_term_strings(&pool_clone, &uid_clone, 100)
-        }).await.unwrap_or_default();
         if !vocab_terms.is_empty() {
             info!("[voice] biasing STT with {} personal term(s)", vocab_terms.len());
         }
@@ -255,10 +261,15 @@ pub async fn polish(
         let embedding  = embed_task.await.unwrap_or(None);
         let embed_ms   = embed_start.elapsed().as_millis() as i64;
 
-        // 4. RAG retrieval (fast, ~5-10 ms)
+        // 4. RAG retrieval — off-loaded to blocking pool (sync SQLite KNN, ~5-10 ms).
         let rag_examples = match &embedding {
             Some(emb) => {
-                let hits = retrieve_similar(&pool, &user_id, emb, 5, 0.65);
+                let emb_clone = emb.clone();
+                let pool_rag  = pool.clone();
+                let uid_rag   = user_id.clone();
+                let hits = tokio::task::spawn_blocking(move || {
+                    retrieve_similar(&pool_rag, &uid_rag, &emb_clone, 5, 0.65)
+                }).await.unwrap_or_default();
                 info!("[rag] {} example(s) retrieved for transcript", hits.len());
                 for (i, ex) in hits.iter().enumerate() {
                     info!("[rag] example {}: ai={:?}  kept={:?}", i + 1, ex.ai_output, ex.user_kept);
@@ -290,9 +301,14 @@ pub async fn polish(
         let usr_m       = user_message.clone();
         let client_c    = http_client.clone();
 
-        // Resolve model string and gather any provider-specific credentials
+        // Resolve model string and gather any provider-specific credentials.
+        // openai_oauth::get_token is a sync SQLite read — off-load to blocking pool.
         let (model_for_llm, openai_token_opt) = if llm_provider == "openai_codex" {
-            let tok = openai_oauth::get_token(&pool, &user_id);
+            let pool_tok = pool.clone();
+            let uid_tok  = user_id.clone();
+            let tok = tokio::task::spawn_blocking(move || openai_oauth::get_token(&pool_tok, &uid_tok))
+                .await
+                .unwrap_or(None);
             // Always use mini — smart model removed
             let m = openai_codex::MODEL_MINI.to_string();
             (m, tok.map(|t| t.access_token))

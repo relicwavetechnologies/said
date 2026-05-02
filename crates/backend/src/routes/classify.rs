@@ -27,7 +27,6 @@
 //! claiming a correction that doesn't exist in the actual edit text.
 
 use axum::{extract::State, http::StatusCode, Json};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -152,7 +151,7 @@ pub async fn classify(
         .and_then(|p| p.groq_api_key.clone())
         .or_else(|| std::env::var("GROQ_API_KEY").ok())
         .unwrap_or_default();
-    let http   = Client::new();
+    let http   = state.http_client.clone();
     let result = match classifier::classify_edit(
         &http, &groq_key, &transcript, &body.ai_output, &body.user_kept,
         &hunks, &output_language,

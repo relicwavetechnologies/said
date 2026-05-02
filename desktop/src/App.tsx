@@ -537,7 +537,10 @@ export default function App() {
 
   /* ── Render ─────────────────────────────────────────────────────────────── */
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-background">
+    <div
+      data-tauri-drag-region
+      className="flex h-screen w-screen overflow-hidden bg-background"
+    >
 
       {/* ── Sidebar — full height left column ────────── */}
       <Sidebar
@@ -571,7 +574,13 @@ export default function App() {
         />
 
         {/* ── The "mat" — elevated content surface ─────── */}
-        <main className="flex-1 overflow-hidden p-3 pt-2">
+        {/* `data-tauri-drag-region` on the padding wrapper so the strip
+            of floor visible AROUND the rounded mat is draggable — gives
+            the user a generous edge to grab the window from. */}
+        <main
+          data-tauri-drag-region
+          className="flex-1 overflow-hidden p-3 pt-2"
+        >
           <div className="h-full rounded-2xl overflow-hidden" style={{ background: "hsl(var(--surface-2))" }}>
             {activeView === "dashboard" && (
               <DashboardView

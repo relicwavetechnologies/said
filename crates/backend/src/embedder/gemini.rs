@@ -61,9 +61,13 @@ pub async fn embed(
     let t0   = Instant::now();
     let hash = sha256_hex(text);
 
-    // ── Cache lookup ──────────────────────────────────────────────────────────
-    if let Some(cached) = read_from_cache(pool, &hash) {
-        // GAP-4 PROOF: cache hit is ~0ms vs ~250ms API call
+    // ── Cache lookup (spawn_blocking: sync SQLite inside async context) ─────────
+    let pool_c = pool.clone();
+    let hash_c = hash.clone();
+    if let Some(cached) = tokio::task::spawn_blocking(move || read_from_cache(&pool_c, &hash_c))
+        .await
+        .unwrap_or(None)
+    {
         info!("[embedder] GAP-4: cache HIT in {}ms ({DIMENSIONS}d, {} chars)",
               t0.elapsed().as_millis(), text.len());
         return Some(cached);
@@ -114,9 +118,13 @@ pub async fn embed(
                             );
                             return None;
                         }
-                        // Persist in cache
-                        store_in_cache(pool, &hash, &values);
-                        // GAP-4 PROOF: API miss — log actual latency
+                        // Persist in cache — fire-and-forget to avoid blocking the return.
+                        {
+                            let pool_s = pool.clone();
+                            let hash_s = hash.clone();
+                            let vals   = values.clone();
+                            tokio::task::spawn_blocking(move || store_in_cache(&pool_s, &hash_s, &vals));
+                        }
                         info!("[embedder] GAP-4: API MISS → {DIMENSIONS}d in {}ms ({} chars)",
                               t0.elapsed().as_millis(), text.len());
                         return Some(values);

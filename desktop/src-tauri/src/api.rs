@@ -142,14 +142,18 @@ where
     let url    = format!("{}/v1/voice/polish", ep.url);
     let client = Client::new();
 
-    let mut form = reqwest::multipart::Form::new()
-        .part(
+    // P5: skip uploading WAV bytes when we already have a pre_transcript — the WS
+    // path already handled STT; sending MBs of audio over localhost is wasted I/O.
+    let mut form = reqwest::multipart::Form::new();
+    if pre_transcript.is_none() {
+        form = form.part(
             "audio",
             reqwest::multipart::Part::bytes(wav_data)
                 .file_name("recording.wav")
                 .mime_str("audio/wav")
                 .map_err(|e| format!("mime error: {e}"))?,
         );
+    }
     if let Some(app) = target_app {
         form = form.text("target_app", app);
     }

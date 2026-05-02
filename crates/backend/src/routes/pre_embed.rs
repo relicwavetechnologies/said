@@ -11,7 +11,7 @@ use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
 use tracing::{debug, info};
 
-use crate::{embedder::gemini, store::prefs::get_prefs, AppState};
+use crate::{embedder::gemini, AppState};
 
 #[derive(Deserialize)]
 pub struct PreEmbedBody {
@@ -32,10 +32,12 @@ pub async fn handler(
     let pool        = state.pool.clone();
     let http_client = state.http_client.clone();
     let user_id     = state.default_user_id.as_str().to_string();
+    let prefs_cache = state.prefs_cache.clone();
 
     // Fire-and-forget — caller gets 202 immediately, embedding stores in SQLite cache.
     tokio::spawn(async move {
-        let gemini_key = get_prefs(&pool, &user_id)
+        // Use the in-memory prefs cache (30 s TTL) — zero SQLite hits on warm path.
+        let gemini_key = crate::get_prefs_cached(&prefs_cache, &pool, &user_id).await
             .and_then(|p| p.gemini_api_key)
             .or_else(|| std::env::var("GEMINI_API_KEY").ok())
             .unwrap_or_default();
