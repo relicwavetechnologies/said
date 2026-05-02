@@ -9,9 +9,10 @@ import {
   HelpCircle,
   UserPlus,
   Mail,
+  Copy,
+  Check,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { openExternal } from "@/lib/invoke";
 import { BrandMark } from "@/components/BrandMark";
 import type { AppSnapshot } from "@/types";
 
@@ -194,10 +195,35 @@ export function Sidebar({ snapshot, activeView, onViewChange, busy, onOpenInvite
 const SUPPORT_EMAIL = "support@emiactech.com";
 
 function HelpButton() {
-  const [open, setOpen] = useState(false);
+  const [open,   setOpen]   = useState(false);
+  const [copied, setCopied] = useState(false);
   const btnRef = useRef<HTMLButtonElement>(null);
   const popRef = useRef<HTMLDivElement>(null);
-  const [pos,  setPos]  = useState<{ left: number; bottom: number } | null>(null);
+  const [pos,   setPos]     = useState<{ left: number; bottom: number } | null>(null);
+
+  // Reset the "Copied!" affordance whenever the popover reopens
+  useEffect(() => { if (!open) setCopied(false); }, [open]);
+
+  async function copyEmail() {
+    try {
+      await navigator.clipboard.writeText(SUPPORT_EMAIL);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1400);
+    } catch {
+      // Clipboard can fail in restricted contexts — fall back to a hidden
+      // textarea + execCommand so we still get something into the buffer.
+      const ta = document.createElement("textarea");
+      ta.value = SUPPORT_EMAIL;
+      ta.style.position = "fixed";
+      ta.style.opacity  = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); } catch {}
+      document.body.removeChild(ta);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1400);
+    }
+  }
 
   // Compute popover position from the anchor button's rect — using a portal
   // so we escape the sidebar's overflow:hidden clipping.
@@ -275,38 +301,53 @@ function HelpButton() {
               </span>
             </div>
             <p className="text-[11.5px] text-muted-foreground leading-relaxed">
-              Drop us a line — we usually reply within a day.
+              Email us — we usually reply within a day.
             </p>
           </div>
 
-          {/* Email row — selectable text */}
-          <div
-            className="mx-4 mb-3 px-3 py-2 rounded-lg flex items-center"
-            style={{
-              background: "hsl(var(--surface-3))",
-              boxShadow:  "inset 0 0 0 1px hsl(var(--surface-4))",
-            }}
-          >
-            <span
-              className="text-[12px] font-medium text-foreground tabular-nums truncate select-text"
-              title={SUPPORT_EMAIL}
-            >
-              {SUPPORT_EMAIL}
-            </span>
-          </div>
-
-          {/* Action button — same .btn-primary token as every other primary CTA */}
+          {/* Email + copy — single click target. Whole row copies the address
+              to the clipboard; mailto is intentionally not used because many
+              setups (browser-as-default-handler, no mail client configured)
+              open an empty Untitled tab instead of a mail composer. */}
           <div className="px-4 pb-4">
             <button
-              onClick={() => {
-                openExternal(`mailto:${SUPPORT_EMAIL}?subject=Said%20support`);
-                setOpen(false);
+              onClick={copyEmail}
+              className="w-full flex items-center justify-between gap-2 px-3 py-2 rounded-lg transition-colors"
+              style={{
+                background: "hsl(var(--surface-3))",
+                boxShadow:  "inset 0 0 0 1px hsl(var(--surface-4))",
               }}
-              className="btn-primary w-full justify-center py-2 rounded-lg"
-              style={{ fontSize: 12.5 }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.background = "hsl(var(--surface-hover))";
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.background = "hsl(var(--surface-3))";
+              }}
             >
-              <Mail size={12} />
-              Email support
+              <span
+                className="text-[12px] font-medium text-foreground truncate select-text text-left"
+                title={SUPPORT_EMAIL}
+              >
+                {SUPPORT_EMAIL}
+              </span>
+              <span
+                className="flex items-center gap-1 text-[11px] font-semibold flex-shrink-0"
+                style={{
+                  color: copied ? "hsl(var(--primary))" : "hsl(var(--muted-foreground))",
+                }}
+              >
+                {copied ? (
+                  <>
+                    <Check size={11} strokeWidth={2.6} />
+                    Copied
+                  </>
+                ) : (
+                  <>
+                    <Copy size={11} />
+                    Copy
+                  </>
+                )}
+              </span>
             </button>
           </div>
         </div>,
