@@ -217,36 +217,13 @@ export function InviteTeamModal({ open, onClose }: Props) {
             </div>
           )}
 
-          {/* Send — black pill, white text. Minimal and quiet so the heart
-              + headline stay the focal point. Hover lifts the inset stroke. */}
+          {/* Send — mint .btn-primary pill, full width. Same glow + hover
+              treatment used by every other primary CTA in the app. */}
           <button
             onClick={handleSend}
             disabled={!canSend || submitting || submitted}
-            className="mt-4 w-full inline-flex items-center justify-center gap-2 py-3 rounded-xl font-semibold transition-all duration-150"
-            style={{
-              fontSize:   13.5,
-              background: !canSend && !submitted
-                ? "hsl(0 0% 12%)"
-                : "hsl(0 0% 6%)",
-              color: !canSend && !submitted
-                ? "hsl(var(--muted-foreground))"
-                : "hsl(var(--foreground))",
-              boxShadow: !canSend && !submitted
-                ? "inset 0 0 0 1px hsl(var(--surface-4))"
-                : "inset 0 0 0 1px hsl(0 0% 100% / 0.08), 0 4px 14px hsl(0 0% 0% / 0.45)",
-              cursor: !canSend || submitting || submitted ? "default" : "pointer",
-              opacity: !canSend && !submitted ? 0.85 : 1,
-            }}
-            onMouseEnter={(e) => {
-              if (!canSend || submitted) return;
-              e.currentTarget.style.boxShadow =
-                "inset 0 0 0 1px hsl(0 0% 100% / 0.14), 0 6px 20px hsl(0 0% 0% / 0.55)";
-            }}
-            onMouseLeave={(e) => {
-              if (!canSend || submitted) return;
-              e.currentTarget.style.boxShadow =
-                "inset 0 0 0 1px hsl(0 0% 100% / 0.08), 0 4px 14px hsl(0 0% 0% / 0.45)";
-            }}
+            className="btn-primary mt-4 w-full justify-center py-3 rounded-xl"
+            style={{ fontSize: 13.5 }}
           >
             {submitting ? (
               <>
