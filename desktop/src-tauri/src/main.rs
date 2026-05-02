@@ -1757,7 +1757,8 @@ async fn watch_for_edit(
                     // includes Undo affordance).  We surface the first term
                     // — most edits produce one; on rare multi-promote edits
                     // the others land silently in vocab.
-                    if let Some(term) = resp.promoted_terms.first() {
+                    let first_term = resp.promoted_terms.first().cloned();
+                    if let Some(ref term) = first_term {
                         if !term.trim().is_empty() {
                             let _ = app.emit("vocab-toast", serde_json::json!({
                                 "kind":   "added",
@@ -1767,12 +1768,27 @@ async fn watch_for_edit(
                         }
                     }
                     // OS-level fallback for when the Said window isn't focused.
-                    let title = match resp.class.as_str() {
-                        "STT_ERROR"    => "Said learned a new word",
-                        "POLISH_ERROR" => "Said updated a polish rule",
-                        _              => "Said learned from your edit",
+                    // Human copy — not the LLM's raw reason string (which is
+                    // diagnostic text like "STT_ERROR due to misheard word
+                    // 'N10' vs 'n8n'").  Mirrors the in-app toast wording.
+                    let (title, body) = match resp.class.as_str() {
+                        "STT_ERROR" => (
+                            "Said learned a new word",
+                            match &first_term {
+                                Some(t) => format!("Added \"{t}\" — auto-learned from your edit"),
+                                None    => "Auto-learned from your edit".to_string(),
+                            },
+                        ),
+                        "POLISH_ERROR" => (
+                            "Said updated a polish rule",
+                            "Saved a polish-layer correction from your edit".to_string(),
+                        ),
+                        _ => (
+                            "Said learned from your edit",
+                            "Saved a new preference".to_string(),
+                        ),
                     };
-                    notify_macos(title, &resp.reason);
+                    notify_macos(title, &body);
                 }
 
                 if resp.learned || resp.pending_id.is_some() {
