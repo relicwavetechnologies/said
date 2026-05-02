@@ -563,7 +563,12 @@ export default function App() {
       {/* ── Right column: topbar + content ───────────── */}
       <div className="flex flex-col flex-1 overflow-hidden min-w-0">
 
-        <Topbar snapshot={snapshotWithHistory} theme={theme} toggleTheme={toggleTheme} />
+        <Topbar
+          snapshot={snapshotWithHistory}
+          theme={theme}
+          toggleTheme={toggleTheme}
+          onLoginClick={() => setNeedsAuth(true)}
+        />
 
         {/* ── The "mat" — elevated content surface ─────── */}
         <main className="flex-1 overflow-hidden p-3 pt-2">

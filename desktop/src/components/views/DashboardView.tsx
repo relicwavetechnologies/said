@@ -8,7 +8,6 @@ import {
   PaceCard,
   RecordingsTable,
   ActivityHeatmap,
-  FilterBar,
 } from "@/components/DashboardCards";
 import { listHistory } from "@/lib/invoke";
 import type { AppSnapshot, PendingEdit, Recording } from "@/types";
@@ -59,10 +58,6 @@ export function DashboardView({
   return (
     <ScrollArea className="h-full">
       <div className="px-7 pt-4 pb-10 max-w-[1280px] mx-auto">
-
-        {/* ── Filter / search bar ─────────────────────── */}
-        <FilterBar onNewRecording={onToggle} />
-
 
         {/* ── Pending learning approvals banner ──────── */}
         {pendingEdits.length > 0 && (

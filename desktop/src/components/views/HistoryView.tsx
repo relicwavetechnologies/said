@@ -1,5 +1,5 @@
-import React, { useEffect, useRef, useState } from "react";
-import { Clock, Copy, Play, Pause, Trash2, MoreHorizontal, Check } from "lucide-react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Clock, Copy, Play, Pause, Trash2, MoreHorizontal, Check, Search, X } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { groupHistory } from "@/types";
 import type { Recording } from "@/types";
@@ -215,11 +215,22 @@ function HistoryRow({ recording, playingId, onPlay, onDelete }: RowProps) {
 
 export function HistoryView() {
   const [recordings, setRecordings] = useState<Recording[]>([]);
+  const [query,      setQuery]      = useState("");
   const { playingId, play, stop }   = useAudioPlayer();
 
   useEffect(() => {
     listHistory(200).then(setRecordings);
   }, []);
+
+  // Filter by query (matches polished, transcript, or final_text — case-insensitive).
+  const filteredRecordings = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (q.length === 0) return recordings;
+    return recordings.filter((r) => {
+      const hay = (r.polished ?? "") + " " + (r.transcript ?? "") + " " + (r.final_text ?? "");
+      return hay.toLowerCase().includes(q);
+    });
+  }, [recordings, query]);
 
   async function handleDelete(rec: Recording) {
     stop();
@@ -231,7 +242,7 @@ export function HistoryView() {
     play(rec.id, rec.audio_id);
   }
 
-  const items = recordings.map((r) => ({
+  const items = filteredRecordings.map((r) => ({
     timestamp_ms:      r.timestamp_ms,
     polished:          r.polished,
     word_count:        r.word_count,
@@ -244,7 +255,7 @@ export function HistoryView() {
   const timeline = groupHistory(items);
 
   // Map group index back to recordings for easy lookup
-  const recByTs = new Map(recordings.map((r) => [r.timestamp_ms, r]));
+  const recByTs = new Map(filteredRecordings.map((r) => [r.timestamp_ms, r]));
 
   if (recordings.length === 0) {
     return (
@@ -268,12 +279,48 @@ export function HistoryView() {
   return (
     <ScrollArea className="h-full">
       <div className="p-7 pb-12 max-w-3xl mx-auto">
-        <div className="mb-7">
+        <div className="mb-5">
           <h1 className="text-[28px] font-bold tracking-tight text-foreground leading-tight">History</h1>
           <p className="text-[13px] text-muted-foreground mt-1 tabular-nums">
             {recordings.length} recording{recordings.length !== 1 ? "s" : ""} · kept for 1 day
           </p>
         </div>
+
+        {/* ── Search bar ───────────────────────────────────────── */}
+        <div
+          className="flex items-center gap-2 px-3 py-2 mb-6 rounded-xl"
+          style={{
+            background:  "hsl(var(--surface-4))",
+            boxShadow:   "inset 0 0 0 1px hsl(var(--border))",
+          }}
+        >
+          <Search size={13} className="text-muted-foreground flex-shrink-0" />
+          <input
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search recordings"
+            className="flex-1 bg-transparent outline-none text-[12.5px] text-foreground placeholder:text-muted-foreground/70"
+          />
+          {query.length > 0 && (
+            <button
+              onClick={() => setQuery("")}
+              className="text-muted-foreground hover:text-foreground transition-colors"
+              title="Clear search"
+            >
+              <X size={12} />
+            </button>
+          )}
+        </div>
+
+        {/* No-results state when filter matches nothing */}
+        {query.trim().length > 0 && filteredRecordings.length === 0 && (
+          <div className="text-center py-10">
+            <p className="text-[12px] text-muted-foreground">
+              No recordings match "{query}".
+            </p>
+          </div>
+        )}
 
         <div className="space-y-7">
           {timeline.map((group) => (
