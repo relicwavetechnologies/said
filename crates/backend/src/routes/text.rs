@@ -12,7 +12,6 @@ use axum::{
     },
     Json,
 };
-use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use std::convert::Infallible;
@@ -60,8 +59,11 @@ pub async fn polish(
     let target_app    = body.target_app.clone();
     let tone_override = body.tone_override.clone();
 
-    // Gap 3: load prefs through cache before entering stream
+    // Load prefs + lexicon from cache and grab shared HTTP client before stream.
     let prefs_opt = crate::get_prefs_cached(&state.prefs_cache, &pool, &user_id).await;
+    let (word_corrections_cached, _) =
+        crate::get_lexicon_cached(&state.lexicon_cache, &pool, &user_id).await;
+    let http_client = state.http_client.clone();
 
     let stream = async_stream::stream! {
         let total_start = Instant::now();
@@ -84,8 +86,8 @@ pub async fn polish(
         let gemini_key = prefs.gemini_api_key.clone()
             .or_else(|| std::env::var("GEMINI_API_KEY").ok())
             .unwrap_or_default();
-        let http_client = Client::new();
-        let e_start     = Instant::now();
+        // http_client is the shared client from AppState (loaded before stream)
+        let e_start = Instant::now();
         let embedding   = gemini::embed(&http_client, &pool, &transcript, &gemini_key).await;
         let embed_ms    = e_start.elapsed().as_millis() as i64;
 
@@ -102,9 +104,9 @@ pub async fn polish(
         };
         let examples_used = rag_examples.len();
 
-        // 2. Load word corrections + build prompt
+        // 2. Word corrections from LexiconCache (loaded before stream started)
         let word_corrections = if tone_override.is_none() {
-            corrections::load_all(&pool, &user_id)
+            word_corrections_cached
         } else {
             vec![]
         };

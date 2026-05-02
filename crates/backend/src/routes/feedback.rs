@@ -8,7 +8,6 @@
 //! 5. Fire-and-forget: embeds transcript → upserts preference_vector.
 
 use axum::{extract::State, http::StatusCode, Json};
-use reqwest::Client;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
@@ -71,6 +70,8 @@ pub async fn submit(
     if !diffs.is_empty() {
         corrections::upsert(&pool, &rec.user_id, &diffs);
         info!("[feedback] stored {} word correction(s)", diffs.len());
+        // Invalidate so next request picks up the new correction immediately
+        crate::invalidate_lexicon_cache(&state.lexicon_cache).await;
     }
 
     info!(
@@ -84,7 +85,7 @@ pub async fn submit(
         let transcript2  = rec.transcript.clone();
         let user_id2     = rec.user_id.clone();
         let event_id2    = edit_event_id.clone();
-        let http_client  = Client::new();
+        let http_client  = state.http_client.clone();
         // Resolve Gemini key from prefs, fall back to env var
         let gemini_key = get_prefs(&pool, &rec.user_id)
             .and_then(|p| p.gemini_api_key)

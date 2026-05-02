@@ -28,6 +28,10 @@ const LOW_CONFIDENCE_THRESHOLD: f64 = 0.85;
 /// - `language`: pass an empty string for auto-detect / Hindi default.
 /// - `keyterms`: words/phrases to boost recognition for (the "right" spellings from
 ///   user's correction history). Appended as `&keyterm=` params (Nova-3 only).
+/// - `pre_embed`: optional `(url, bearer_secret)` for the backend's `/v1/pre-embed`
+///   endpoint.  When set, the current partial transcript is POSTed fire-and-forget
+///   the moment CloseStream is sent — overlapping the 500ms drain window with the
+///   Gemini embed so it's cached by the time `/v1/voice/polish` is called.
 ///
 /// Returns `None` if WS connection fails or Deepgram returns no transcript.
 pub async fn stream_to_deepgram(
@@ -35,6 +39,7 @@ pub async fn stream_to_deepgram(
     deepgram_key: &str,
     language:     &str,
     keyterms:     &[String],
+    pre_embed:    Option<(&str, &str)>,  // (url, bearer_secret)
 ) -> Option<String> {
     if deepgram_key.is_empty() {
         warn!("[dg_stream] no Deepgram API key — WS streaming disabled");
@@ -165,6 +170,31 @@ pub async fn stream_to_deepgram(
                         let close = r#"{"type":"CloseStream"}"#;
                         if let Err(e) = ws_tx.send(Message::Text(close.into())).await {
                             warn!("[dg_stream] CloseStream send failed: {e}");
+                        }
+                        // ── Speculative pre-embed ──────────────────────────────
+                        // Fire before the 500ms drain window so Gemini embedding
+                        // is cached by the time /v1/voice/polish is called.
+                        if let Some((url, secret)) = pre_embed {
+                            let plain = plain_for_embed(&transcript_parts);
+                            if !plain.is_empty() {
+                                let url    = url.to_string();
+                                let secret = secret.to_string();
+                                info!("[dg_stream] firing pre-embed ({} chars)", plain.len());
+                                tokio::spawn(async move {
+                                    let client = reqwest::Client::new();
+                                    let body   = serde_json::json!({"text": plain});
+                                    if let Err(e) = client
+                                        .post(&url)
+                                        .header("Authorization", format!("Bearer {secret}"))
+                                        .json(&body)
+                                        .timeout(std::time::Duration::from_secs(5))
+                                        .send()
+                                        .await
+                                    {
+                                        debug!("[dg_stream] pre-embed request failed: {e}");
+                                    }
+                                });
+                            }
                         }
                         exit_reason = "audio-ended";
                         break;
@@ -389,6 +419,50 @@ fn enrich_from_words(words_val: &Value) -> String {
     }
 
     parts.join(" ")
+}
+
+/// Strip `[word?XX%]` confidence markers and join transcript parts into plain
+/// text suitable for embedding.  The embedding cache key is SHA256 of the plain
+/// transcript, so this must match what voice.rs does in `strip_confidence_markers`.
+fn plain_for_embed(parts: &[String]) -> String {
+    let joined = parts
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // Replace each [word?XX%] marker with just the word before the '?'
+    let mut result = String::with_capacity(joined.len());
+    let mut chars  = joined.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '[' {
+            let mut inner = String::new();
+            let mut closed = false;
+            for ic in chars.by_ref() {
+                if ic == ']' { closed = true; break; }
+                inner.push(ic);
+            }
+            if closed {
+                if let Some(qpos) = inner.rfind('?') {
+                    let after = &inner[qpos + 1..];
+                    if after.ends_with('%') && after[..after.len()-1].parse::<f64>().is_ok() {
+                        result.push_str(&inner[..qpos]);
+                        continue;
+                    }
+                }
+                result.push('[');
+                result.push_str(&inner);
+                result.push(']');
+            } else {
+                result.push('[');
+                result.push_str(&inner);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 /// Minimal URL encoder for query-string values (RFC 3986 unreserved set).

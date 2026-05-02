@@ -1,4 +1,5 @@
 use clap::Parser;
+use reqwest;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -58,11 +59,19 @@ async fn main() {
     let secret  = std::env::var("POLISH_SHARED_SECRET")
         .unwrap_or_else(|_| "dev-secret".into());
 
+    let http_client = reqwest::Client::builder()
+        .pool_max_idle_per_host(4)
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .build()
+        .expect("failed to build shared HTTP client");
+
     let state = polish_backend::AppState {
         pool:            pool.clone(),
         shared_secret:   std::sync::Arc::new(secret),
         default_user_id: std::sync::Arc::new(user_id.clone()),
         prefs_cache:     std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+        lexicon_cache:   std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+        http_client,
     };
 
     // ── Build router ──────────────────────────────────────────────────────────

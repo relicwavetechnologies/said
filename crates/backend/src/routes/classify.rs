@@ -242,6 +242,11 @@ pub async fn classify(
         }
     }
 
+    // Invalidate lexicon cache if any corrections or stt_replacements were written
+    if learned {
+        crate::invalidate_lexicon_cache(&state.lexicon_cache).await;
+    }
+
     // Pending-edit safety valve.  Two reasons to write a pending row:
     //   1. POLISH_ERROR with no auto-promotion fired (single-shot, user reviews).
     //   2. ANY learnable class (STT_ERROR | POLISH_ERROR) when the capture was

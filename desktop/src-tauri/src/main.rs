@@ -857,7 +857,8 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
             *g = Some(transcript_rx);
         }
 
-        let hot_cache_arc = Arc::clone(&app.state::<HotPathCache>().0);
+        let hot_cache_arc  = Arc::clone(&app.state::<HotPathCache>().0);
+        let backend_for_pe = Arc::clone(&app.state::<BackendState>().0);
 
         tauri::async_runtime::spawn(async move {
             // ── P5 hot path: zero HTTP calls before WS connect ─────────────────
@@ -881,7 +882,19 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
                 tracing::info!("[dg_stream] biasing WS with {} cached term(s)", keyterms.len());
             }
 
-            let transcript = dg_stream::stream_to_deepgram(chunk_recv, &deepgram_key, &language, &keyterms).await;
+            // Build pre-embed URL from backend endpoint (fire-and-forget on CloseStream)
+            let pre_embed_info: Option<(String, String)> =
+                backend_for_pe.lock().ok().and_then(|g| g.as_ref().map(|ep| {
+                    (format!("{}/v1/pre-embed", ep.url), ep.secret.clone())
+                }));
+
+            let pre_embed_ref = pre_embed_info
+                .as_ref()
+                .map(|(url, secret)| (url.as_str(), secret.as_str()));
+
+            let transcript = dg_stream::stream_to_deepgram(
+                chunk_recv, &deepgram_key, &language, &keyterms, pre_embed_ref,
+            ).await;
             tracing::info!(
                 "[dg_stream] pre-transcript result: {}",
                 transcript.as_deref().unwrap_or("<none>")

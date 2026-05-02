@@ -23,7 +23,6 @@ use axum::{
         IntoResponse,
     },
 };
-use reqwest::Client;
 use serde_json::json;
 use std::convert::Infallible;
 use std::time::Instant;
@@ -114,9 +113,13 @@ pub async fn polish(
     let user_id = state.default_user_id.as_str().to_string();
     let pool    = state.pool.clone();
 
-    // Gap 3: load prefs through cache BEFORE entering the stream
-    // (async_stream::stream! doesn't support .await on external futures well)
+    // Load prefs, lexicon (corrections + stt_replacements), and grab shared HTTP
+    // client — all BEFORE entering the stream so we don't block on .await inside
+    // async_stream::stream! and to avoid creating a new Client per request.
     let prefs_opt = crate::get_prefs_cached(&state.prefs_cache, &pool, &user_id).await;
+    let (word_corrections, stt_replacement_rules) =
+        crate::get_lexicon_cached(&state.lexicon_cache, &pool, &user_id).await;
+    let http_client = state.http_client.clone();
 
     // ── Build SSE stream ───────────────────────────────────────────────────────
     let audio_id_ref = audio_id.clone();
@@ -155,8 +158,6 @@ pub async fn polish(
         let groq_key = prefs.groq_api_key.clone()
             .or_else(|| std::env::var("GROQ_API_KEY").ok())
             .unwrap_or_default();
-
-        let http_client = Client::new();
 
         // ── Personal STT bias: load top vocabulary terms (capped) ──────────────
         // rusqlite is synchronous — off-load to a blocking thread so we don't
@@ -215,7 +216,7 @@ pub async fn polish(
         // surrounding [...?XX%] punctuation around tokens it rewrites, so a
         // marker like "[written?47%]" becomes "[n8n?47%]" — the LLM still sees
         // the uncertainty signal but on the corrected token.
-        let stt_replacement_rules = stt_replacements::load_all(&pool, &user_id);
+        // stt_replacement_rules loaded from LexiconCache before stream started
         let (stt_transcript, enriched_transcript) = if stt_replacement_rules.is_empty() {
             (stt_transcript_raw, enriched_raw)
         } else {
@@ -272,8 +273,7 @@ pub async fn polish(
         };
         let examples_used = rag_examples.len();
 
-        // 4b. Load deterministic word corrections
-        let word_corrections = corrections::load_all(&pool, &user_id);
+        // 4b. Word corrections loaded from LexiconCache before stream started
         if !word_corrections.is_empty() {
             info!("[voice] {} word correction(s) loaded", word_corrections.len());
         }

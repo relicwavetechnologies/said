@@ -4,6 +4,7 @@ use axum::{
     routing::{get, patch, post},
     Router,
 };
+use reqwest::Client;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -67,6 +68,68 @@ pub async fn invalidate_prefs_cache(cache: &PrefsCache) {
     tracing::debug!("[prefs-cache] invalidated");
 }
 
+// ── Lexicon hot-cache ──────────────────────────────────────────────────────────
+//
+// Caches corrections + stt_replacements together — both change at most once per
+// session, but are read synchronously from SQLite on every voice/text request.
+// TTL = 60 s; invalidated immediately on any write (classify / feedback routes).
+
+const LEXICON_CACHE_TTL: Duration = Duration::from_secs(60);
+
+#[derive(Clone)]
+pub struct CachedLexicon {
+    pub corrections:      Vec<store::corrections::Correction>,
+    pub stt_replacements: Vec<store::stt_replacements::SttReplacement>,
+    pub cached_at:        Instant,
+}
+
+pub type LexiconCache = Arc<RwLock<Option<CachedLexicon>>>;
+
+/// Read corrections + stt_replacements from cache, or SQLite on miss.
+/// On a miss, both reads run in parallel on blocking threads.
+pub async fn get_lexicon_cached(
+    cache:   &LexiconCache,
+    pool:    &store::DbPool,
+    user_id: &str,
+) -> (Vec<store::corrections::Correction>, Vec<store::stt_replacements::SttReplacement>) {
+    // Fast path
+    {
+        let guard = cache.read().await;
+        if let Some(ref entry) = *guard {
+            if entry.cached_at.elapsed() < LEXICON_CACHE_TTL {
+                return (entry.corrections.clone(), entry.stt_replacements.clone());
+            }
+        }
+    }
+    // Slow path — both SQLite reads in parallel, off the async executor
+    let pool1 = pool.clone();
+    let pool2 = pool.clone();
+    let uid1  = user_id.to_string();
+    let uid2  = user_id.to_string();
+    let (c, s) = tokio::join!(
+        tokio::task::spawn_blocking(move || store::corrections::load_all(&pool1, &uid1)),
+        tokio::task::spawn_blocking(move || store::stt_replacements::load_all(&pool2, &uid2)),
+    );
+    let corrections      = c.unwrap_or_default();
+    let stt_replacements = s.unwrap_or_default();
+
+    let mut guard = cache.write().await;
+    *guard = Some(CachedLexicon {
+        corrections:      corrections.clone(),
+        stt_replacements: stt_replacements.clone(),
+        cached_at:        Instant::now(),
+    });
+    tracing::debug!("[lexicon-cache] miss → refreshed from SQLite");
+    (corrections, stt_replacements)
+}
+
+/// Invalidate after any write to corrections or stt_replacements tables.
+pub async fn invalidate_lexicon_cache(cache: &LexiconCache) {
+    let mut guard = cache.write().await;
+    *guard = None;
+    tracing::debug!("[lexicon-cache] invalidated");
+}
+
 // ── Application state ─────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -74,8 +137,12 @@ pub struct AppState {
     pub pool:            store::DbPool,
     pub shared_secret:   Arc<String>,
     pub default_user_id: Arc<String>,
-    /// Gap 3: in-memory preferences cache — avoids SQLite SELECT per request.
+    /// Preferences hot-cache — avoids SQLite SELECT per request.
     pub prefs_cache:     PrefsCache,
+    /// Lexicon hot-cache — corrections + stt_replacements together.
+    pub lexicon_cache:   LexiconCache,
+    /// Shared HTTP client — keeps TCP/TLS connections alive across all requests.
+    pub http_client:     Client,
 }
 
 // ── Router factory ────────────────────────────────────────────────────────────
@@ -87,6 +154,7 @@ pub fn router_with_state(state: AppState) -> Router {
 
     // Authenticated routes (require shared-secret bearer)
     let authenticated = Router::new()
+        .route("/v1/pre-embed",       post(routes::pre_embed::handler))
         .route("/v1/voice/polish",    post(routes::voice::polish))
         .route("/v1/text/polish",     post(routes::text::polish))
         .route("/v1/edit-feedback",        post(routes::feedback::submit))
@@ -139,11 +207,19 @@ pub fn router() -> Router {
     let pool        = store::open(&db_path);
     let user_id     = store::ensure_default_user(&pool);
 
+    let http_client = Client::builder()
+        .pool_max_idle_per_host(4)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build()
+        .expect("failed to build shared HTTP client");
+
     let state = AppState {
         pool,
         shared_secret:   Arc::new(secret),
         default_user_id: Arc::new(user_id),
         prefs_cache:     Arc::new(RwLock::new(None)),
+        lexicon_cache:   Arc::new(RwLock::new(None)),
+        http_client,
     };
 
     router_with_state(state)
