@@ -249,7 +249,7 @@ pub async fn polish(
         let model = voice_polish_core::resolve_model(&prefs.selected_model).to_string();
         // Send the ENRICHED transcript to the LLM (with [word?XX%] markers)
         // so it knows which words to scrutinize for context-based correction.
-        let user_message = build_user_message(&enriched_transcript);
+        let user_message = build_user_message(&enriched_transcript, &prefs.output_language);
 
         // 3. Wait for embedding result (P2: overlapped with prompt prep above)
         let embedding  = embed_task.await.unwrap_or(None);

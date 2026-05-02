@@ -124,7 +124,7 @@ pub async fn polish(
         } else {
             build_system_prompt_with_vocab(&prefs, &rag_examples, &word_corrections, &vocab_terms)
         };
-        let user_message  = build_user_message(&transcript);
+        let user_message  = build_user_message(&transcript, &prefs.output_language);
 
         let (token_tx, mut token_rx) = mpsc::channel::<String>(64);
         let gateway_key = prefs.gateway_api_key.clone()

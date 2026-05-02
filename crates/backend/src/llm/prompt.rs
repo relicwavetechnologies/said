@@ -52,9 +52,10 @@ pub fn build_system_prompt_with_vocab(
     corrections: &[Correction],
     vocabulary_terms: &[String],
 ) -> String {
-    let lang_rule = language_rule(&prefs.output_language);
-    let persona   = persona_block(prefs);
-    let tone      = tone_description(&prefs.tone_preset);
+    let lang_rule    = language_rule(&prefs.output_language);
+    let persona      = persona_block(prefs);
+    let tone         = tone_description(&prefs.tone_preset);
+    let script_check = script_final_check(&prefs.output_language);
 
     // Vocabulary preservation block — instructs the LLM to leave learned
     // jargon untouched.  Empty when the user has no vocab yet.
@@ -176,7 +177,9 @@ pub fn build_system_prompt_with_vocab(
          9. If <polish_preferences> exist, prefer the right-hand form when contextually appropriate.\n\
          10. If <preferences> exist, match the user's style and word choices.\n\n\
          IMPORTANT: Think about what the speaker INTENDED to say based on the overall \
-         topic and sentence meaning. Low-confidence words are hints, not gospel.\n\
+         topic and sentence meaning. Low-confidence words are hints, not gospel.\n\n\
+         SCRIPT FINAL CHECK (read before writing your first character):\n\
+         {script_check}\
          </task>"
     )
 }
@@ -208,8 +211,34 @@ pub fn build_tray_system_prompt(tone_preset: &str) -> String {
 }
 
 /// Build the user message (transcript wrapped in tags — injection-safe).
-pub fn build_user_message(transcript: &str) -> String {
-    format!("<transcript>\n{transcript}\n</transcript>")
+///
+/// `output_language` drives a one-line script reminder prepended to the
+/// message — right before the transcript, closest to where the model
+/// starts generating.  This counters the tendency to echo the script of
+/// the transcript itself on the very first word.
+pub fn build_user_message(transcript: &str, output_language: &str) -> String {
+    let reminder = match output_language {
+        "hindi" => "Output in Devanagari script only.\n",
+        "english" => "Output in English only — no Devanagari, no Roman Hindi.\n",
+        // hinglish / default
+        _ => "Output in Roman script only — NO Devanagari characters anywhere, \
+              including the very first word.\n",
+    };
+    format!("{reminder}<transcript>\n{transcript}\n</transcript>")
+}
+
+/// A sharp per-language script reminder injected at the BOTTOM of the
+/// `<task>` block — closest context before the model starts writing.
+fn script_final_check(output_language: &str) -> &'static str {
+    match output_language {
+        "hindi"   => "Your entire output must be Devanagari. No Roman script.\n",
+        "english" => "Your entire output must be English. No Devanagari, no Roman Hindi.\n",
+        // hinglish / default — the common failure mode is starting with Devanagari
+        _ => "Your entire output must be Roman script. \
+              ZERO Devanagari characters — not even for the very first word. \
+              If the transcript starts with a Devanagari word like \"देख\" or \"भाई\", \
+              write it as \"Dekh\" or \"bhai\". Check your first character before outputting.\n",
+    }
 }
 
 /// Returns the language enforcement block — placed first so no other instruction overrides it.
