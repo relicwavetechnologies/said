@@ -15,6 +15,7 @@ export function Topbar({ snapshot, theme, toggleTheme }: TopbarProps) {
 
   return (
     <header
+      data-tauri-drag-region
       className="flex items-center gap-3 h-[var(--topbar-height)] px-5 flex-shrink-0 drag-region"
       style={{ background: "transparent" }}
     >
@@ -42,7 +43,7 @@ export function Topbar({ snapshot, theme, toggleTheme }: TopbarProps) {
         </span>
       </div>
 
-      <div className="flex-1" />
+      <div data-tauri-drag-region className="flex-1 self-stretch" />
 
       {/* Right actions */}
       <div className="flex items-center gap-2.5 no-drag">

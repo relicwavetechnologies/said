@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import {
   ChevronUp, ChevronDown, ChevronRight,
   Filter, Play, Pause, Check, Copy,
@@ -280,14 +280,58 @@ function relTime(ms: number): string {
   return new Date(ms).toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
+type RecordingsFilter = "all" | "today" | "week" | "month";
+const FILTER_LABEL: Record<RecordingsFilter, string> = {
+  all:   "All time",
+  today: "Today",
+  week:  "This week",
+  month: "This month",
+};
+
 export function RecordingsTable({
   recordings, onSeeAll,
 }: {
   recordings: Recording[];
   onSeeAll:   () => void;
 }) {
-  const items = recordings.slice(0, 4);
   const { playingId, play } = useAudioPlayer();
+
+  const [filter,    setFilter]    = useState<RecordingsFilter>("all");
+  const [filterOpen, setFilterOpen] = useState(false);
+  const filterRef = useRef<HTMLDivElement>(null);
+
+  // Outside-click + escape close
+  useEffect(() => {
+    if (!filterOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (filterRef.current && !filterRef.current.contains(e.target as Node)) setFilterOpen(false);
+    };
+    const onEsc = (e: KeyboardEvent) => { if (e.key === "Escape") setFilterOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onEsc);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onEsc);
+    };
+  }, [filterOpen]);
+
+  // Apply the active filter — narrow the recordings list before slicing
+  const filtered = (() => {
+    if (filter === "all") return recordings;
+    const now = new Date();
+    let start: number;
+    if (filter === "today") {
+      const t = new Date(now); t.setHours(0, 0, 0, 0);
+      start = t.getTime();
+    } else if (filter === "week") {
+      start = now.getTime() - 7 * 86_400_000;
+    } else {
+      start = now.getTime() - 30 * 86_400_000;
+    }
+    return recordings.filter((r) => r.timestamp_ms >= start);
+  })();
+
+  const items = filtered.slice(0, 4);
 
   return (
     <div className="panel p-5">
@@ -298,15 +342,66 @@ export function RecordingsTable({
             Recordings list
           </h3>
           <span style={{ color: "hsl(var(--muted-foreground) / 0.4)" }}>|</span>
-          <button
-            className="flex items-center gap-1 text-[12.5px] font-medium transition-colors"
-            style={{ color: "hsl(var(--muted-foreground))" }}
-            onMouseEnter={(e) => { e.currentTarget.style.color = "hsl(var(--foreground))"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = "hsl(var(--muted-foreground))"; }}
-          >
-            <Filter size={12} />
-            Filter
-          </button>
+
+          {/* Filter dropdown */}
+          <div ref={filterRef} className="relative">
+            <button
+              onClick={() => setFilterOpen((o) => !o)}
+              className="flex items-center gap-1 text-[12.5px] font-medium transition-colors"
+              style={{
+                color: filter === "all"
+                  ? "hsl(var(--muted-foreground))"
+                  : "hsl(var(--primary))",
+              }}
+              onMouseEnter={(e) => {
+                if (filter === "all") e.currentTarget.style.color = "hsl(var(--foreground))";
+              }}
+              onMouseLeave={(e) => {
+                if (filter === "all") e.currentTarget.style.color = "hsl(var(--muted-foreground))";
+              }}
+            >
+              <Filter size={12} />
+              {filter === "all" ? "Filter" : FILTER_LABEL[filter]}
+              <CaretDown
+                size={10}
+                style={{ transition: "transform 0.15s", transform: filterOpen ? "rotate(180deg)" : "none" }}
+              />
+            </button>
+            {filterOpen && (
+              <div
+                className="absolute left-0 top-full mt-1 z-30 rounded-md py-1 min-w-[140px]"
+                style={{
+                  background: "hsl(var(--surface-3))",
+                  boxShadow:
+                    "inset 0 0 0 1px hsl(var(--border)), 0 8px 24px hsl(0 0% 0% / 0.12)",
+                }}
+              >
+                {(Object.keys(FILTER_LABEL) as RecordingsFilter[]).map((k) => {
+                  const active = filter === k;
+                  return (
+                    <button
+                      key={k}
+                      onClick={() => { setFilter(k); setFilterOpen(false); }}
+                      className="w-full flex items-center justify-between gap-2 px-3 py-1.5 text-[12px] font-medium text-left transition-colors"
+                      style={{
+                        color:      active ? "hsl(var(--primary))" : "hsl(var(--foreground))",
+                        background: active ? "hsl(var(--primary) / 0.08)" : "transparent",
+                      }}
+                      onMouseEnter={(e) => {
+                        if (!active) e.currentTarget.style.background = "hsl(var(--surface-hover))";
+                      }}
+                      onMouseLeave={(e) => {
+                        if (!active) e.currentTarget.style.background = "transparent";
+                      }}
+                    >
+                      {FILTER_LABEL[k]}
+                      {active && <Check size={11} strokeWidth={2.5} />}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
         <button
           onClick={onSeeAll}
@@ -338,8 +433,21 @@ export function RecordingsTable({
       {items.length === 0 ? (
         <div className="py-10 text-center">
           <p className="text-[12.5px]" style={{ color: "hsl(var(--muted-foreground))" }}>
-            Press <span className="font-semibold" style={{ color: "hsl(var(--foreground))" }}>⇪ Caps Lock</span>
-            {" "}to record. Recent recordings appear here.
+            {filter === "all" ? (
+              <>Press <span className="font-semibold" style={{ color: "hsl(var(--foreground))" }}>⇪ Caps Lock</span>
+              {" "}to record. Recent recordings appear here.</>
+            ) : (
+              <>No recordings <span style={{ color: "hsl(var(--foreground))", fontWeight: 600 }}>
+                {FILTER_LABEL[filter].toLowerCase()}</span>.{" "}
+              <button
+                onClick={() => setFilter("all")}
+                className="underline"
+                style={{ color: "hsl(var(--primary))" }}
+              >
+                Show all
+              </button>
+              </>
+            )}
           </p>
         </div>
       ) : (
@@ -545,6 +653,15 @@ function SideStat({
   );
 }
 
+type HeatmapRange = "1m" | "3m" | "6m" | "12m";
+const RANGE_COLS:  Record<HeatmapRange, number> = { "1m": 5,  "3m": 13, "6m": 26, "12m": 52 };
+const RANGE_LABEL: Record<HeatmapRange, string> = {
+  "1m":  "Last 30 days",
+  "3m":  "Last 3 months",
+  "6m":  "Last 6 months",
+  "12m": "Last 12 months",
+};
+
 export function ActivityHeatmap({
   snapshot,
   isRecording,
@@ -566,7 +683,30 @@ export function ActivityHeatmap({
     dayMap.set(d, (dayMap.get(d) ?? 0) + h.word_count);
   }
 
-  const COLS    = 26;
+  // Range selector — drives column count and grid width
+  const [range,    setRange]    = useState<HeatmapRange>("6m");
+  const [rangeOpen, setRangeOpen] = useState(false);
+  const rangeRef = useRef<HTMLDivElement>(null);
+
+  // Hover tooltip state — { x/y in viewport, info text }
+  const [hover, setHover] = useState<{ x: number; y: number; words: number; date: string } | null>(null);
+
+  // Close range dropdown on outside click / esc
+  useEffect(() => {
+    if (!rangeOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (rangeRef.current && !rangeRef.current.contains(e.target as Node)) setRangeOpen(false);
+    };
+    const onEsc = (e: KeyboardEvent) => { if (e.key === "Escape") setRangeOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onEsc);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onEsc);
+    };
+  }, [rangeOpen]);
+
+  const COLS    = RANGE_COLS[range];
   const ROWS    = 7;
   const today   = new Date();
   today.setHours(0, 0, 0, 0);
@@ -574,6 +714,9 @@ export function ActivityHeatmap({
   const todayDow = today.getDay();
   const lastSundayIdx = todayIdx - todayDow;
   const startIdx      = lastSundayIdx - (COLS - 1) * 7;
+
+  // Container max-width grows/shrinks with COLS so cells stay ~20px square
+  const gridMaxWidth = Math.min(900, COLS * 22 + (COLS - 1) * 4);
 
   let max = 1;
   for (let c = 0; c < COLS; c++) {
@@ -644,17 +787,58 @@ export function ActivityHeatmap({
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <button
-            className="flex items-center gap-1.5 px-3 h-8 rounded-md text-[12px] font-medium transition-colors"
-            style={{
-              background: "hsl(var(--surface-3))",
-              color:      "hsl(var(--foreground))",
-              boxShadow:  "inset 0 0 0 1px hsl(var(--border))",
-            }}
-          >
-            Last 6 months
-            <CaretDown size={11} />
-          </button>
+          {/* Range dropdown */}
+          <div ref={rangeRef} className="relative">
+            <button
+              onClick={() => setRangeOpen((o) => !o)}
+              className="flex items-center gap-1.5 px-3 h-8 rounded-md text-[12px] font-medium transition-colors"
+              style={{
+                background: rangeOpen ? "hsl(var(--surface-hover))" : "hsl(var(--surface-3))",
+                color:      "hsl(var(--foreground))",
+                boxShadow:  "inset 0 0 0 1px hsl(var(--border))",
+              }}
+            >
+              {RANGE_LABEL[range]}
+              <CaretDown
+                size={11}
+                style={{ transition: "transform 0.15s", transform: rangeOpen ? "rotate(180deg)" : "none" }}
+              />
+            </button>
+            {rangeOpen && (
+              <div
+                className="absolute right-0 top-full mt-1 z-30 rounded-md py-1 min-w-[160px]"
+                style={{
+                  background: "hsl(var(--surface-3))",
+                  boxShadow:
+                    "inset 0 0 0 1px hsl(var(--border)), 0 8px 24px hsl(0 0% 0% / 0.12)",
+                }}
+              >
+                {(Object.keys(RANGE_LABEL) as HeatmapRange[]).map((k) => {
+                  const active = range === k;
+                  return (
+                    <button
+                      key={k}
+                      onClick={() => { setRange(k); setRangeOpen(false); }}
+                      className="w-full flex items-center justify-between gap-2 px-3 py-1.5 text-[12px] font-medium text-left transition-colors"
+                      style={{
+                        color:      active ? "hsl(var(--primary))" : "hsl(var(--foreground))",
+                        background: active ? "hsl(var(--primary) / 0.08)" : "transparent",
+                      }}
+                      onMouseEnter={(e) => {
+                        if (!active) e.currentTarget.style.background = "hsl(var(--surface-hover))";
+                      }}
+                      onMouseLeave={(e) => {
+                        if (!active) e.currentTarget.style.background = "transparent";
+                      }}
+                    >
+                      {RANGE_LABEL[k]}
+                      {active && <Check size={11} strokeWidth={2.5} />}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
           <button
             onClick={onToggle}
             disabled={isProcessing}
@@ -691,8 +875,8 @@ export function ActivityHeatmap({
       {/* Two-column layout: heatmap on the left, derived stats on the right */}
       <div className="flex gap-8 items-stretch">
 
-        {/* Heatmap — fixed-ish width so it keeps its compact original size */}
-        <div className="flex-shrink min-w-0" style={{ flexBasis: 640, maxWidth: 640 }}>
+        {/* Heatmap — width follows the selected range */}
+        <div className="flex-shrink min-w-0" style={{ flexBasis: gridMaxWidth, maxWidth: gridMaxWidth }}>
           {/* Month labels strip */}
           <div
             className="grid mb-2"
@@ -728,6 +912,7 @@ export function ActivityHeatmap({
               columnGap: 4,
               rowGap:    4,
             }}
+            onMouseLeave={() => setHover(null)}
           >
             {Array.from({ length: COLS * ROWS }).map((_, i) => {
               const c   = Math.floor(i / ROWS);
@@ -738,18 +923,34 @@ export function ActivityHeatmap({
               const level  = future ? 0 : wordsToLevel(words, max);
               const isToday = idx === todayIdx;
               const date    = new Date(idx * 86_400_000);
-              const tip = future
-                ? ""
-                : `${words} word${words === 1 ? "" : "s"} on ${date.toLocaleDateString("en-US", { month: "short", day: "numeric" })}`;
               return (
                 <span
                   key={i}
-                  title={tip}
-                  className={`block rounded-full ${isToday ? "heat-current" : `heat-${level}`}`}
+                  className={`block rounded-full transition-transform ${isToday ? "heat-current" : `heat-${level}`}`}
                   style={{
                     aspectRatio: "1 / 1",
                     width:       "100%",
                     opacity:     future ? 0.3 : 1,
+                    cursor:      future ? "default" : "pointer",
+                  }}
+                  onMouseEnter={(e) => {
+                    if (future) return;
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    setHover({
+                      x:     rect.left + rect.width / 2,
+                      y:     rect.top,
+                      words,
+                      date:  date.toLocaleDateString("en-US", {
+                        weekday: "short",
+                        month:   "short",
+                        day:     "numeric",
+                        year:    "numeric",
+                      }),
+                    });
+                    e.currentTarget.style.transform = "scale(1.4)";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.transform = "scale(1)";
                   }}
                 />
               );
@@ -807,6 +1008,28 @@ export function ActivityHeatmap({
           <span>More</span>
         </div>
       </div>
+
+      {/* Floating hover tooltip — fixed-positioned so it lives above everything */}
+      {hover && (
+        <div
+          className="fixed pointer-events-none z-50 px-2.5 py-1.5 rounded-md text-[11.5px] tabular-nums whitespace-nowrap"
+          style={{
+            left: hover.x,
+            top:  hover.y - 10,
+            transform: "translate(-50%, -100%)",
+            background: "hsl(var(--foreground))",
+            color:      "hsl(var(--background))",
+            boxShadow:  "0 6px 20px hsl(0 0% 0% / 0.20)",
+            fontWeight: 500,
+          }}
+        >
+          <span style={{ fontWeight: 700 }}>
+            {hover.words.toLocaleString()} word{hover.words === 1 ? "" : "s"}
+          </span>
+          <span style={{ opacity: 0.6 }}> · </span>
+          {hover.date}
+        </div>
+      )}
     </div>
   );
 }
