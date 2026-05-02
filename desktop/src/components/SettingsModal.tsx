@@ -206,10 +206,9 @@ export function SettingsModal({
           >
             <div>
               <h2
-                className="text-[26px] font-bold tracking-tight leading-none"
+                className="text-[22px] font-extrabold tracking-tight leading-none"
                 style={{
                   color: "hsl(var(--foreground))",
-                  fontFamily: "ui-serif, Georgia, serif",
                   letterSpacing: "-0.02em",
                 }}
               >

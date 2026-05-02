@@ -220,10 +220,9 @@ export function InviteTeamModal({ open, onClose }: Props) {
             style={{ borderBottom: "1px solid hsl(var(--surface-4))" }}
           >
             <h2
-              className="text-[26px] font-bold tracking-tight"
+              className="text-[24px] font-extrabold tracking-tight"
               style={{
                 color: "hsl(var(--foreground))",
-                fontFamily: "ui-serif, Georgia, serif",
                 letterSpacing: "-0.02em",
               }}
             >
@@ -292,10 +291,10 @@ export function InviteTeamModal({ open, onClose }: Props) {
 
             {/* Section heading */}
             <h3
-              className="text-[20px] font-bold tracking-tight mb-5 text-center"
+              className="text-[18px] font-extrabold tracking-tight mb-5 text-center"
               style={{
                 color: "hsl(var(--foreground))",
-                fontFamily: "ui-serif, Georgia, serif",
+                letterSpacing: "-0.02em",
               }}
             >
               Invite your teammates
