@@ -455,22 +455,73 @@ fn tray_polish_message(app: &tauri::AppHandle, tone: &str) {
     tauri::async_runtime::spawn(async move {
         tracing::info!("[tray_polish] polishing {} chars with tone={}", text.len(), tone_owned);
 
+        // Track word-by-word streaming state
+        let typed_any  = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let typed_any2 = typed_any.clone();
+        let fail_count  = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fail_count2 = fail_count.clone();
+        let token_count  = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_count2 = token_count.clone();
+
         let result = api::stream_text_polish(
             &ep,
             text,
             None,
             Some(tone_owned),
-            |_event| {}, // fire-and-forget on events; we paste the final result
+            move |event| {
+                if let api::PolishEvent::Token { ref token } = event {
+                    // Type tokens word-by-word via AX — the first token replaces
+                    // the selected text automatically (macOS selection behavior).
+                    match paster::type_text(token) {
+                        Ok(true) => {
+                            let prev = typed_any2.swap(true, std::sync::atomic::Ordering::Relaxed);
+                            token_count2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if !prev {
+                                tracing::info!("[tray_polish] streaming started — first token: {:?}", token);
+                            }
+                        }
+                        Ok(false) => {
+                            fail_count2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            fail_count2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!("[tray_polish] type_text error: {e}");
+                        }
+                    }
+                }
+            },
         ).await;
 
         match result {
             Ok(done) if !done.polished.is_empty() => {
-                tracing::info!("[tray_polish] done — {} words", done.polished.split_whitespace().count());
-                // Emit tokens to the UI for live preview if the window is visible
+                let n_typed  = token_count.load(std::sync::atomic::Ordering::Relaxed);
+                let n_failed = fail_count.load(std::sync::atomic::Ordering::Relaxed);
+
+                if typed_any.load(std::sync::atomic::Ordering::Relaxed) {
+                    if n_failed > 0 {
+                        // Partial AX failure — do full paste for safety
+                        tracing::warn!(
+                            "[tray_polish] partial stream: {n_typed} ok, {n_failed} failed — clipboard paste"
+                        );
+                        if let Err(e) = paster::paste(&done.polished) {
+                            tracing::warn!("[tray_polish] safety paste failed: {e}");
+                        }
+                    } else {
+                        tracing::info!("[tray_polish] streamed {n_typed} tokens via AX");
+                    }
+                } else {
+                    // AX not available — fall back to clipboard paste
+                    tracing::info!("[tray_polish] AX not granted — clipboard paste ({} chars)", done.polished.len());
+                    if let Err(e) = paster::paste(&done.polished) {
+                        tracing::warn!("[tray_polish] paste failed: {e}");
+                    }
+                }
+
                 let _ = app_clone.emit("voice-done", &done);
-                // Paste the polished text (replaces selection)
-                if let Err(e) = paster::paste(&done.polished) {
-                    tracing::warn!("[tray_polish] paste failed: {e}");
+
+                // Store for Ctrl+Cmd+V re-paste
+                if let Ok(mut g) = app_clone.state::<LatestResult>().0.lock() {
+                    *g = Some(done.polished.clone());
                 }
             }
             Ok(_) => tracing::warn!("[tray_polish] empty result from backend"),
