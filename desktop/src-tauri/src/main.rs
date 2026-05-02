@@ -271,6 +271,21 @@ struct StreamingState(Mutex<Option<tokio::sync::oneshot::Receiver<String>>>);
 /// cleared after it's pasted via Ctrl+Cmd+V or the `paste_latest` Tauri command.
 struct LatestResult(std::sync::Arc<Mutex<Option<String>>>);
 
+/// Hot-path cache: language setting + personal vocabulary keyterms.
+///
+/// Populated once when the backend becomes ready; refreshed in the background
+/// whenever preferences change or new vocabulary is learned.  The WS recording
+/// task reads from this cache — zero HTTP calls on the recording critical path.
+struct HotPathCache(Arc<tokio::sync::RwLock<HotPathCacheInner>>);
+
+#[derive(Default, Clone)]
+struct HotPathCacheInner {
+    /// User's STT language setting (e.g. "hi", "multi", "auto").
+    language: String,
+    /// Personal vocabulary terms sent to Deepgram as `keyterm=` biases.
+    keyterms: Vec<String>,
+}
+
 /// Lightweight cache of tray-relevant prefs so `sync_tray` never needs async.
 struct TrayCache(Mutex<TrayCacheInner>);
 struct TrayCacheInner {
@@ -591,6 +606,7 @@ async fn get_preferences(backend: State<'_, BackendState>) -> Result<api::Prefer
 async fn patch_preferences(
     backend:    State<'_, BackendState>,
     tray_cache: State<'_, TrayCache>,
+    hot_cache:  State<'_, HotPathCache>,
     app:        tauri::AppHandle,
     update:     api::PrefsUpdate,
 ) -> Result<api::Preferences, String> {
@@ -613,6 +629,8 @@ async fn patch_preferences(
                 drop(d);
                 sync_tray(&app, &snap);
             }
+            // Keep hot-path cache language in sync — no HTTP needed next recording.
+            hot_cache.0.write().await.language = p.language.clone();
         }
         Err(e) => tracing::warn!("[patch_prefs] backend error: {e}"),
     }
@@ -631,12 +649,26 @@ async fn get_history(
 #[tauri::command]
 async fn submit_edit_feedback(
     backend:      State<'_, BackendState>,
+    hot_cache:    State<'_, HotPathCache>,
     recording_id: String,
     user_kept:    String,
     target_app:   Option<String>,
 ) -> Result<(), String> {
     let ep = get_endpoint(&backend)?;
-    api::submit_feedback(&ep, &recording_id, &user_kept, target_app.as_deref()).await
+    let result = api::submit_feedback(&ep, &recording_id, &user_kept, target_app.as_deref()).await;
+    // After feedback the backend may have learned new vocabulary — refresh
+    // keyterms in the background so the next recording already has them.
+    if result.is_ok() {
+        let arc = Arc::clone(&hot_cache.0);
+        let ep2 = ep.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Ok(terms) = api::get_vocabulary_terms(&ep2).await {
+                tracing::debug!("[hot_cache] refreshed keyterms after feedback ({} terms)", terms.len());
+                arc.write().await.keyterms = terms;
+            }
+        });
+    }
+    result
 }
 
 #[tauri::command]
@@ -790,7 +822,6 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
     // The transcript will be ready (or close to it) by the time Caps Lock is released.
     let chunk_recv = shared.lock().ok().and_then(|mut d| d.take_chunk_receiver());
     if let Some(chunk_recv) = chunk_recv {
-        let back_arc = app.state::<BackendState>().0.clone();
         let streaming_state = app.state::<StreamingState>();
         let (transcript_tx, transcript_rx) = tokio::sync::oneshot::channel::<String>();
         // Use ok() — a poisoned mutex (from a previous panic) must not cascade
@@ -798,46 +829,29 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
             *g = Some(transcript_rx);
         }
 
+        let hot_cache_arc = Arc::clone(&app.state::<HotPathCache>().0);
+
         tauri::async_runtime::spawn(async move {
-            // ── P5 hot path: minimise time-to-first-audio-byte ─────────────────
+            // ── P5 hot path: zero HTTP calls before WS connect ─────────────────
             //
-            // The backend's `preferences` table does NOT store API keys — they
-            // live in the .env file / process environment.  Fetching prefs here
-            // just for the key added ~100-200 ms of unnecessary HTTP latency
-            // before the WS could connect.  Get the key from the env directly.
-            //
-            // Language still comes from prefs (local HTTP, fast) but is fetched
-            // AFTER we know the key is present, so we fail-fast cheaply.
+            // API key: read from env (instant).
+            // Language + keyterms: read from HotPathCache (in-memory RwLock,
+            // populated at startup and kept fresh by patch_preferences /
+            // submit_edit_feedback).  No network round-trips on this path.
             let deepgram_key = std::env::var("DEEPGRAM_API_KEY").unwrap_or_default();
             if deepgram_key.is_empty() {
                 tracing::warn!("[dg_stream] DEEPGRAM_API_KEY not set — WS streaming disabled");
                 let _ = transcript_tx.send(String::new());
                 return;
             }
-            tracing::debug!("[dg_stream] API key present ({} chars)", deepgram_key.len());
 
-// Fetch language + personal vocabulary in parallel from local
-            // backend (127.0.0.1, <30 ms combined). Vocab terms become Deepgram
-            // `keyterm=` biases — the single most important learning signal,
-            // applied at the source rather than post-hoc.
-            let ep_opt = back_arc.lock().ok().and_then(|g| g.clone());
-            let (language, keyterms): (String, Vec<String>) = if let Some(ref ep) = ep_opt {
-                let (prefs_res, vocab_res) = tokio::join!(
-                    api::get_preferences(ep),
-                    api::get_vocabulary_terms(ep),
-                );
-                let lang = prefs_res.ok().map(|p| p.language.clone()).unwrap_or_default();
-                let vocab = vocab_res.unwrap_or_else(|e| {
-                    tracing::debug!("[dg_stream] vocab fetch skipped: {e}");
-                    Vec::new()
-                });
-                if !vocab.is_empty() {
-                    tracing::info!("[dg_stream] biasing WS with {} personal term(s)", vocab.len());
-                }
-                (lang, vocab)
-            } else {
-                (String::new(), Vec::new())
+            let (language, keyterms) = {
+                let c = hot_cache_arc.read().await;
+                (c.language.clone(), c.keyterms.clone())
             };
+            if !keyterms.is_empty() {
+                tracing::info!("[dg_stream] biasing WS with {} cached term(s)", keyterms.len());
+            }
 
             let transcript = dg_stream::stream_to_deepgram(chunk_recv, &deepgram_key, &language, &keyterms).await;
             tracing::info!(
@@ -1958,10 +1972,15 @@ fn main() {
                         // menu already shows the correct model checkmark.
                         let app_h = app.handle().clone();
                         tauri::async_runtime::spawn(async move {
-                            if let Ok(prefs) = api::get_preferences(&ep).await {
+                            // Fetch prefs + vocab in parallel — both needed at startup.
+                            let (prefs_res, vocab_res) = tokio::join!(
+                                api::get_preferences(&ep),
+                                api::get_vocabulary_terms(&ep),
+                            );
+                            if let Ok(prefs) = &prefs_res {
                                 if let Ok(mut cache) = app_h.state::<TrayCache>().0.lock() {
-                                    cache.custom_prompt   = prefs.custom_prompt;
-                                    cache.output_language = prefs.output_language;
+                                    cache.custom_prompt   = prefs.custom_prompt.clone();
+                                    cache.output_language = prefs.output_language.clone();
                                 }
                                 // Re-render now that we have real data
                                 let shared = app_h.state::<SharedApp>();
@@ -1971,6 +1990,18 @@ fn main() {
                                     sync_tray(&app_h, &snap);
                                 }
                             }
+                            // Seed hot-path cache so the first recording needs zero HTTP.
+                            let language = prefs_res.as_ref().ok()
+                                .map(|p| p.language.clone())
+                                .unwrap_or_default();
+                            let keyterms = vocab_res.unwrap_or_default();
+                            if !keyterms.is_empty() {
+                                tracing::info!("[hot_cache] seeded with {} vocab term(s)", keyterms.len());
+                            }
+                            let hot = app_h.state::<HotPathCache>();
+                            let mut c = hot.0.write().await;
+                            c.language = language;
+                            c.keyterms = keyterms;
                         });
                     }
                     Err(e) => {
@@ -2131,6 +2162,7 @@ fn main() {
         .manage(StreamingState(Mutex::new(None)))
         .manage(TrayCache(Mutex::new(TrayCacheInner::default())))
         .manage(LatestResult(std::sync::Arc::new(Mutex::new(None))))
+        .manage(HotPathCache(Arc::new(tokio::sync::RwLock::new(HotPathCacheInner::default()))))
         .invoke_handler(tauri::generate_handler![
             bootstrap,
             get_snapshot,

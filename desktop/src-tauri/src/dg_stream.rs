@@ -44,32 +44,13 @@ pub async fn stream_to_deepgram(
     let lang = if language.is_empty() || language == "auto" { "hi" } else { language };
 
     // Endpointing: how long Deepgram waits after silence before marking speech_final.
-    // - multi mode:  100ms — Deepgram's recommended value for code-switching; shorter
-    //   checkpoints help the model handle language switches cleanly.
-    // - hi / en etc: 500ms — Hindi speech has longer natural inter-word pauses;
-    //   300ms (old default) was causing premature sentence splits.
-    let endpointing = if lang == "multi" { 100 } else { 500 };
+    // - multi: 100ms — Deepgram's recommended value for code-switching.
+    // - hi/en: 300ms — balanced; 500ms was too slow (added 200ms to every recording).
+    let endpointing = if lang == "multi" { 100 } else { 300 };
 
-    // Build keyterm params — cap at 80 terms (well under Deepgram's 500-token limit)
-    let keyterm_params: String = keyterms
-        .iter()
-        .take(80)
-        .map(|k| format!("&keyterm={}", k.replace(' ', "+")))
-        .collect();
-
-    if !keyterms.is_empty() {
-        info!("[dg_stream] {} keyterm(s) for STT boost: {:?}", keyterms.len(), &keyterms[..keyterms.len().min(5)]);
-    }
-
-    info!("[dg_stream] lang={lang} endpointing={endpointing}ms");
-
-    // Deepgram WS URL with encoding parameters for raw i16 PCM at 16 kHz.
-    // utterance_end_ms=1000: Deepgram emits UtteranceEnd ~1 s after speech stops,
-    // which lets us break the drain loop immediately instead of waiting the full window.
-    //
-    // keyterm=<term> repeated per personal-vocabulary entry — biases the nova-3
-    // decoder toward correctly-spelled jargon, names, and code identifiers.
-    // Capped at 100 to stay under Deepgram's request size limits.
+    // Build WS URL — keyterms appended once via urlencode (RFC-3986 safe).
+    // Previously keyterms were appended twice (once via replace('+') and once via
+    // urlencode loop), doubling the URL size with incorrectly-encoded duplicates.
     let mut url_str = format!(
         "wss://api.deepgram.com/v1/listen\
          ?model=nova-3\
@@ -80,21 +61,21 @@ pub async fn stream_to_deepgram(
          &channels=1\
          &interim_results=true\
          &endpointing={endpointing}\
-         &utterance_end_ms=1000\
-         {keyterm_params}"
+         &utterance_end_ms=1000"
     );
-    let bias_count = keyterms.iter().filter(|t| !t.trim().is_empty()).count().min(100);
+    let mut bias_count = 0usize;
     for term in keyterms.iter().take(100) {
         let cleaned = term.trim();
         if cleaned.is_empty() { continue; }
         url_str.push_str("&keyterm=");
         url_str.push_str(&urlencode(cleaned));
+        bias_count += 1;
+    }
+    if bias_count > 0 {
+        info!("[dg_stream] {} keyterm(s) for STT boost", bias_count);
     }
 
-    info!(
-        "[dg_stream] connecting to Deepgram WS (lang={lang}, 16kHz, bias={bias_count}), key_len={}",
-        deepgram_key.len()
-    );
+    info!("[dg_stream] connecting to Deepgram WS (lang={lang}, endpointing={endpointing}ms, bias={bias_count}), key_len={}", deepgram_key.len());
 
     let mut req = match url_str.into_client_request() {
         Ok(r)  => r,

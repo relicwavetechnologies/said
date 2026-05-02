@@ -159,7 +159,13 @@ pub async fn polish(
         let http_client = Client::new();
 
         // ── Personal STT bias: load top vocabulary terms (capped) ──────────────
-        let vocab_terms = vocabulary::top_term_strings(&pool, &user_id, 100);
+        // rusqlite is synchronous — off-load to a blocking thread so we don't
+        // stall the async executor (avoids jitter on the SSE stream open).
+        let pool_clone = pool.clone();
+        let uid_clone  = user_id.clone();
+        let vocab_terms = tokio::task::spawn_blocking(move || {
+            vocabulary::top_term_strings(&pool_clone, &uid_clone, 100)
+        }).await.unwrap_or_default();
         if !vocab_terms.is_empty() {
             info!("[voice] biasing STT with {} personal term(s)", vocab_terms.len());
         }
