@@ -73,6 +73,60 @@ fn notify_macos(title: &str, body: &str) {
 #[cfg(not(target_os = "macos"))]
 fn notify_macos(_title: &str, _body: &str) {}
 
+/// Translate a raw pipeline error string into one short human sentence.
+///
+/// We never want to surface diagnostic text like "Deepgram error 400:
+/// invalid audio format" or "empty transcript — nothing spoken?" to the
+/// user — those read like log lines.  This function maps the common cases
+/// to plain English and falls back to a generic apology for everything
+/// else.  Keep wording calm and blame-free; no "Error:" prefix, no codes,
+/// no emoji.
+fn humanize_error(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+
+    // STT-side cases
+    if lower.contains("empty transcript") || lower.contains("nothing spoken") {
+        return "We couldn't hear anything in that recording. Try again.".to_string();
+    }
+    if lower.contains("deepgram") && (lower.contains("401") || lower.contains("403") || lower.contains("unauthorized")) {
+        return "Speech recognition is offline because the API key isn't accepted. Check your Deepgram key in Settings.".to_string();
+    }
+    if lower.contains("deepgram") && (lower.contains("429") || lower.contains("rate")) {
+        return "Speech recognition is rate-limited right now. Give it a few seconds and try again.".to_string();
+    }
+    if lower.contains("deepgram") || lower.contains("stt") {
+        return "Speech recognition couldn't process that recording. Try again in a moment.".to_string();
+    }
+
+    // LLM-side cases
+    if lower.contains("openai") && (lower.contains("not connected") || lower.contains("401") || lower.contains("403")) {
+        return "OpenAI isn't connected. Open Settings to sign in again.".to_string();
+    }
+    if lower.contains("groq") && (lower.contains("401") || lower.contains("403")) {
+        return "Groq isn't accepting the API key. Check it in Settings.".to_string();
+    }
+    if lower.contains("gemini") && (lower.contains("401") || lower.contains("403")) {
+        return "Gemini isn't accepting the API key. Check it in Settings.".to_string();
+    }
+    if lower.contains("rate") || lower.contains("429") {
+        return "The polish service is rate-limited right now. Try again in a moment.".to_string();
+    }
+    if lower.contains("preferences not found") {
+        return "Settings aren't loaded yet. Wait a moment and try again.".to_string();
+    }
+
+    // Network / transport
+    if lower.contains("timeout") || lower.contains("timed out") {
+        return "The connection took too long. Check your internet and try again.".to_string();
+    }
+    if lower.contains("dns") || lower.contains("unreachable") || lower.contains("failed to connect") {
+        return "Couldn't reach the network. Check your internet and try again.".to_string();
+    }
+
+    // Generic fallback — never expose raw error text.
+    "Something went wrong with that recording. Please try again.".to_string()
+}
+
 /// (Cmd+Z, Cmd+X).  Mouse clicks are handled by trying every possible cursor
 /// position and picking the candidate that preserves the most surrounding text
 /// (i.e., the smallest local edit).
@@ -1099,7 +1153,13 @@ async fn run_voice_polish_sse(
                 let _ = app_clone.emit("voice-done", done);
             }
             api::PolishEvent::Error { message, audio_id } => {
-                let _ = app_clone.emit("voice-error", serde_json::json!({ "message": message, "audio_id": audio_id }));
+                let human = humanize_error(&message);
+                let _ = app_clone.emit("voice-error", serde_json::json!({
+                    "message":  human.clone(),
+                    "audio_id": audio_id,
+                }));
+                // Native macOS notification — human copy, never raw error text.
+                notify_macos("Said couldn't finish that recording", &human);
             }
         }
     })
@@ -1317,8 +1377,8 @@ async fn add_vocabulary_term(
 
     // OS-level fallback for when the Said window isn't focused.
     notify_macos(
-        "Said vocabulary",
-        &format!("Added \"{term}\" — biasing STT on the next recording"),
+        "Added to vocabulary",
+        &format!("Said will recognise \"{term}\" on your next recording."),
     );
     Ok(())
 }
@@ -1355,8 +1415,8 @@ async fn star_vocabulary_term(
             "kind": "starred", "term": term,
         }));
         notify_macos(
-            "Said vocabulary",
-            &format!("Pinned \"{term}\" — protected from automatic demotion"),
+            "Pinned to vocabulary",
+            &format!("Said will keep \"{term}\" even if you stop using it."),
         );
     }
     Ok(starred)
@@ -1781,24 +1841,25 @@ async fn watch_for_edit(
                         }
                     }
                     // OS-level fallback for when the Said window isn't focused.
-                    // Human copy — not the LLM's raw reason string (which is
-                    // diagnostic text like "STT_ERROR due to misheard word
-                    // 'N10' vs 'n8n'").  Mirrors the in-app toast wording.
+                    // Plain human copy — never the LLM's raw reason string,
+                    // never internal class names, never punctuation flair.
                     let (title, body) = match resp.class.as_str() {
                         "STT_ERROR" => (
                             "Said learned a new word",
                             match &first_term {
-                                Some(t) => format!("Added \"{t}\" — auto-learned from your edit"),
-                                None    => "Auto-learned from your edit".to_string(),
+                                Some(t) => format!(
+                                    "Said will recognise \"{t}\" on your next recording."
+                                ),
+                                None    => "Said remembered your correction.".to_string(),
                             },
                         ),
                         "POLISH_ERROR" => (
-                            "Said updated a polish rule",
-                            "Saved a polish-layer correction from your edit".to_string(),
+                            "Said updated a writing preference",
+                            "Said will use your wording next time.".to_string(),
                         ),
                         _ => (
                             "Said learned from your edit",
-                            "Saved a new preference".to_string(),
+                            "Said remembered your correction.".to_string(),
                         ),
                     };
                     notify_macos(title, &body);

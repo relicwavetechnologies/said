@@ -31,7 +31,7 @@ function SourceBadge({ source }: { source: VocabRow["source"] }) {
           color:      "hsl(var(--chip-amber-fg))",
           background: "hsl(var(--chip-amber-bg))",
         }}
-        title="Starred — immune to demotion"
+        title="Said keeps starred words even if you stop using them"
       >
         <Star size={9} fill="currentColor" />
         Starred
@@ -111,7 +111,7 @@ function VocabRowItem({ row, onStar, onDelete }: RowProps) {
       >
         <button
           onClick={() => onStar(row.term)}
-          title={isStarred ? "Unstar (allow demotion)" : "Star (pin & protect from demotion)"}
+          title={isStarred ? "Unstar this word" : "Star to keep this word permanently"}
           className="w-7 h-7 rounded-lg flex items-center justify-center transition-colors"
           style={{
             color: isStarred ? "hsl(var(--chip-amber-fg))" : "hsl(var(--muted-foreground))",
@@ -183,7 +183,7 @@ function AddTermRow({ onAdd }: { onAdd: (term: string) => Promise<void> }) {
         type="text"
         value={value}
         onChange={(e) => { setValue(e.target.value); setError(null); }}
-        placeholder="Add a name, brand, or jargon term — e.g. n8n, Vipassana, EMIAC"
+        placeholder="Add a name or word Said often gets wrong, like n8n or Vipassana"
         maxLength={64}
         disabled={busy}
         className="flex-1 bg-transparent outline-none text-[13.5px] text-foreground placeholder:text-muted-foreground/70"
@@ -306,7 +306,7 @@ export function VocabularyView() {
             Vocabulary
           </h1>
           <p className="text-[13px] text-muted-foreground mt-1 tabular-nums">
-            {rows.length} term{rows.length !== 1 ? "s" : ""} · biased into speech recognition
+            {rows.length} word{rows.length !== 1 ? "s" : ""} Said remembers when you dictate
           </p>
         </div>
 
@@ -327,8 +327,8 @@ export function VocabularyView() {
                 No vocabulary yet
               </p>
               <p className="text-[12px] text-muted-foreground max-w-xs leading-relaxed">
-                Names, brands, and jargon you add or correct land here automatically
-                — and bias your next dictation toward the right spelling.
+                Names and words you add or correct land here automatically.
+                Said will use them on your next recording.
               </p>
             </div>
           </div>

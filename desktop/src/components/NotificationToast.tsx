@@ -247,11 +247,11 @@ export function VocabularyToast({ kind, term, source, onUndo, onDismiss }: Vocab
   })();
 
   const subtle = (() => {
-    if (kind === "starred") return "Protected from automatic demotion";
-    if (kind === "removed") return "Won't bias future recordings";
+    if (kind === "starred") return "Said will keep this even if you stop using it.";
+    if (kind === "removed") return "Said won't recognise this any more.";
     return source === "manual"
-      ? "Will bias your next recording"
-      : "Auto-learned from your edit";
+      ? "Said will recognise this on your next recording."
+      : "Said remembered your correction.";
   })();
 
   return (
