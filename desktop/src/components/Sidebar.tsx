@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from "react";
+import React from "react";
 import {
   LayoutDashboard,
   History,
@@ -7,9 +7,6 @@ import {
   Settings,
   HelpCircle,
   UserPlus,
-  Gift,
-  Mail,
-  ChevronRight,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { AppSnapshot } from "@/types";
@@ -65,71 +62,6 @@ function NavButton({
   );
 }
 
-// ── Help dropdown — opens upward, glass style ─────────────────────────────────
-
-function HelpDropdown({
-  open,
-  onClose,
-}: {
-  open: boolean;
-  onClose: () => void;
-}) {
-  const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const onDocClick = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
-    };
-    document.addEventListener("mousedown", onDocClick);
-    return () => document.removeEventListener("mousedown", onDocClick);
-  }, [open, onClose]);
-
-  if (!open) return null;
-
-  return (
-    <div
-      ref={ref}
-      className="absolute left-3 right-3 bottom-full mb-2 rounded-xl glass-strong overflow-hidden z-50"
-      style={{ animation: "fadeIn 0.15s ease-out" }}
-    >
-      <button
-        onClick={() => {
-          // Open mailto link to sales — friendly, no telemetry
-          window.open("mailto:sales@said.app?subject=Pricing inquiry", "_blank");
-          onClose();
-        }}
-        className="w-full flex items-center gap-3 px-3.5 py-3 text-left transition-colors"
-        onMouseEnter={(e) => {
-          e.currentTarget.style.background = "hsl(var(--surface-hover))";
-        }}
-        onMouseLeave={(e) => {
-          e.currentTarget.style.background = "transparent";
-        }}
-      >
-        <span
-          className="flex items-center justify-center w-8 h-8 rounded-lg flex-shrink-0"
-          style={{
-            background: "hsl(var(--primary) / 0.15)",
-            color:      "hsl(var(--primary))",
-          }}
-        >
-          <Mail size={14} />
-        </span>
-        <span className="flex-1 min-w-0">
-          <span className="block text-[13px] font-semibold text-foreground leading-tight">
-            Contact sales
-          </span>
-          <span className="block text-[11px] text-muted-foreground leading-tight mt-0.5">
-            Pricing, teams &amp; enterprise
-          </span>
-        </span>
-        <ChevronRight size={13} className="opacity-50 flex-shrink-0" />
-      </button>
-    </div>
-  );
-}
-
 // ── Props ──────────────────────────────────────────────────────────────────────
 
 interface SidebarProps {
@@ -145,7 +77,6 @@ interface SidebarProps {
 export function Sidebar({ snapshot, activeView, onViewChange, busy, onOpenInvite }: SidebarProps) {
   const isRecording  = snapshot?.state === "recording";
   const isProcessing = snapshot?.state === "processing" || busy;
-  const [helpOpen, setHelpOpen] = useState(false);
 
   return (
     <aside
@@ -276,13 +207,10 @@ export function Sidebar({ snapshot, activeView, onViewChange, busy, onOpenInvite
         </div>
       </div>
 
-      {/* ── Footer nav — Invite / Free month / Settings / Help ─────── */}
-      <div className="px-3 py-3 flex-shrink-0 space-y-0.5 relative">
+      {/* ── Footer nav — Invite / Settings / Help ─────────────────── */}
+      <div className="px-3 py-3 flex-shrink-0 space-y-0.5">
 
-        {/* Help dropdown — anchored above the buttons */}
-        <HelpDropdown open={helpOpen} onClose={() => setHelpOpen(false)} />
-
-        {/* Invite team — opens the in-app modal */}
+        {/* Invite a friend — opens the in-app modal */}
         <button
           className="nav-item"
           onClick={() => onOpenInvite?.()}
@@ -290,32 +218,10 @@ export function Sidebar({ snapshot, activeView, onViewChange, busy, onOpenInvite
           <span className="flex-shrink-0 opacity-70">
             <UserPlus size={15} />
           </span>
-          <span className="flex-1 truncate">Invite your team</span>
+          <span className="flex-1 truncate">Invite a friend</span>
         </button>
 
-        {/* Get a free month — promotional, cyan accent on hover */}
-        <button
-          className="nav-item group"
-          onClick={() => {
-            window.open(
-              "mailto:?subject=Get a free month of Said&body=Refer a friend, both of you get a free month of Said Pro. https://said.app/refer",
-              "_blank"
-            );
-          }}
-        >
-          <span
-            className="flex items-center justify-center w-[18px] h-[18px] rounded flex-shrink-0"
-            style={{
-              background: "hsl(var(--primary) / 0.18)",
-              color:      "hsl(var(--primary))",
-            }}
-          >
-            <Gift size={11} />
-          </span>
-          <span className="flex-1 truncate">Get a free month</span>
-        </button>
-
-        {/* Settings — same as before, navigates to settings view */}
+        {/* Settings — navigates to settings view */}
         <button
           className={cn("nav-item", activeView === "settings" && "active")}
           onClick={() => onViewChange("settings")}
@@ -326,20 +232,20 @@ export function Sidebar({ snapshot, activeView, onViewChange, busy, onOpenInvite
           <span className="flex-1 truncate">Settings</span>
         </button>
 
-        {/* Help — opens "Contact sales" dropdown */}
+        {/* Help — opens user's mail app to support */}
         <button
-          className={cn("nav-item", helpOpen && "active")}
-          onClick={() => setHelpOpen((o) => !o)}
+          className="nav-item"
+          onClick={() => {
+            window.open(
+              "mailto:support@emiactech.com?subject=Said%20support",
+              "_blank",
+            );
+          }}
         >
           <span className="flex-shrink-0 opacity-70">
             <HelpCircle size={15} />
           </span>
           <span className="flex-1 truncate">Help</span>
-          <ChevronRight
-            size={11}
-            className="opacity-50 flex-shrink-0 transition-transform"
-            style={{ transform: helpOpen ? "rotate(90deg)" : "rotate(0deg)" }}
-          />
         </button>
       </div>
     </aside>
