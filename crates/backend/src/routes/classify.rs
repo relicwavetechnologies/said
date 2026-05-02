@@ -1,16 +1,20 @@
 //! POST /v1/classify-edit
 //!
-//! Three-way edit classifier: given (recording_id, ai_output, user_kept),
-//! looks up the original transcript, calls the Groq classifier to determine
-//! if the edit is a learnable AI correction, and auto-stores a pending edit
-//! if so.
+//! Hands a (transcript, polished, user_kept) triple to the 4-way classifier and
+//! routes the result into the correct learning store *automatically*:
 //!
-//! **Confidence-based notification tiers:**
-//! - `correction_count >= 2`  → high confidence (notify user)
-//! - `is_repeat == true`      → high confidence (notify user)
-//! - `correction_count == 1 && !is_repeat` → silent learn (store, no notification)
+//!   • STT_ERROR     → vocabulary (STT-layer bias) + stt_replacements (post-STT swap)
+//!   • POLISH_ERROR  → word_corrections (LLM polish substitution)
+//!   • USER_REPHRASE → no learning artifact written
+//!   • USER_REWRITE  → no learning artifact written
 //!
-//! The Tauri side reads `notify` to decide whether to show a macOS notification.
+//! Auto-promotion (no manual approval): STT_ERROR with a clear jargon-like
+//! candidate is promoted on the FIRST sighting.  Why: a single occurrence is
+//! enough — the candidate is by definition a rare/specialized term, and the
+//! cost of a wrong promotion is bounded (we demote on revert).
+//!
+//! For POLISH_ERROR we keep the original "promote on repeat" behavior, because
+//! single-shot promotions there can corrupt common words.
 
 use axum::{extract::State, http::StatusCode, Json};
 use reqwest::Client;
@@ -18,8 +22,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::{
-    llm::classifier,
-    store::{history, pending_edits, prefs::get_prefs},
+    llm::{classifier, classifier::EditClass, phonetics},
+    store::{corrections, history, pending_edits, prefs::get_prefs, stt_replacements, vocabulary},
     AppState,
 };
 
@@ -32,170 +36,233 @@ pub struct ClassifyBody {
 
 #[derive(Serialize)]
 pub struct ClassifyResponse {
-    pub should_learn:     bool,
+    pub class:            String,
     pub reason:           String,
-    pub corrections:      Vec<classifier::Correction>,
-    /// Set only when should_learn=true and the pending edit was stored.
-    pub pending_id:       Option<String>,
-    /// Number of word/phrase corrections the classifier found in this edit.
-    pub correction_count: usize,
-    /// True if any correction in this edit has been seen before in past edit_events.
-    pub is_repeat:        bool,
-    /// True if the Tauri side should show a notification to the user.
-    /// Based on: correction_count >= 2 OR is_repeat.
-    /// Single first-time corrections are stored silently.
+    pub candidates:       Vec<classifier::Candidate>,
+    /// True if any artifact was written (vocab / replacement / correction).
+    pub learned:          bool,
+    /// True if the desktop should show a notification.
     pub notify:           bool,
+    /// Set when a pending_edits row was inserted (POLISH_ERROR first-sighting).
+    pub pending_id:       Option<String>,
+    /// Number of vocabulary or replacement terms promoted on this edit.
+    pub promoted_count:   usize,
+    /// Whether at least one of the candidates matched a previously-seen rule.
+    pub is_repeat:        bool,
 }
 
 pub async fn classify(
     State(state): State<AppState>,
     Json(body): Json<ClassifyBody>,
 ) -> (StatusCode, Json<ClassifyResponse>) {
-    // 1. Look up the transcript from the recording
+    // 1. Look up the transcript from the recording.
     let transcript = match history::get_recording(&state.pool, &body.recording_id) {
         Some(rec) => rec.transcript,
         None => {
             warn!("[classify] recording {} not found", body.recording_id);
             return (
                 StatusCode::NOT_FOUND,
-                Json(ClassifyResponse {
-                    should_learn: false,
-                    reason: "recording not found".into(),
-                    corrections: vec![],
-                    pending_id: None,
-                    correction_count: 0,
-                    is_repeat: false,
-                    notify: false,
-                }),
+                Json(empty_response("USER_REPHRASE", "recording not found")),
             );
         }
     };
 
-    // 2. Get Groq API key from prefs or env
+    // 2. Resolve Groq key.
     let groq_key = get_prefs(&state.pool, &state.default_user_id)
         .and_then(|p| p.groq_api_key)
         .or_else(|| std::env::var("GROQ_API_KEY").ok())
         .unwrap_or_default();
 
-    // 3. Call the classifier
+    // 3. Call the 4-way classifier.
     let http = Client::new();
-    let result = classifier::classify_edit(
-        &http,
-        &groq_key,
-        &transcript,
-        &body.ai_output,
-        &body.user_kept,
-    )
-    .await;
-
-    let result = match result {
+    let result = match classifier::classify_edit(
+        &http, &groq_key, &transcript, &body.ai_output, &body.user_kept,
+    ).await {
         Some(r) => r,
         None => {
-            // Classifier failed (no API key, network error, parse error).
-            // Don't block the user — skip learning silently.
-            info!("[classify] classifier unavailable — skipping learning for {}", body.recording_id);
+            info!("[classify] classifier unavailable — skipping for {}", body.recording_id);
             return (
                 StatusCode::OK,
-                Json(ClassifyResponse {
-                    should_learn: false,
-                    reason: "classifier unavailable".into(),
-                    corrections: vec![],
-                    pending_id: None,
-                    correction_count: 0,
-                    is_repeat: false,
-                    notify: false,
-                }),
+                Json(empty_response("USER_REPHRASE", "classifier unavailable")),
             );
         }
     };
 
-    let correction_count = result.corrections.len();
+    // 3b. Negative-signal demotion: if a previously-promoted vocabulary term
+    //     appears in the polish but is removed/replaced in user_kept, decrement
+    //     its weight.  Pure additive — runs before class-specific routing so
+    //     even a USER_REPHRASE can demote a noisy past promotion.
+    let demoted = run_demotion_pass(&state, &body.ai_output, &body.user_kept);
+    if demoted > 0 {
+        info!("[classify] demoted {demoted} vocabulary term(s) on this edit");
+    }
 
-    // 4. Check for repeat corrections — has the user corrected any of these
-    //    same words before? If so, this is high-confidence.
-    let is_repeat = if result.should_learn && !result.corrections.is_empty() {
-        check_repeat_corrections(&state.pool, &state.default_user_id, &result.corrections)
-    } else {
-        false
-    };
+    // 4. Route to the correct store(s) based on class.
+    let mut promoted_count = 0_usize;
+    let mut is_repeat      = false;
+    let mut pending_id     = None;
+    let mut learned        = false;
 
-    // 5. Decide notification tier:
-    //    - 2+ corrections in one edit → clearly deliberate, notify
-    //    - Repeat correction (same word corrected before) → pattern confirmed, notify
-    //    - Single first-time correction → could be noise, store silently
-    let notify = result.should_learn && (correction_count >= 2 || is_repeat);
+    match result.class {
+        EditClass::SttError => {
+            for cand in &result.candidates {
+                let correct = cand.correct_form.trim();
+                if correct.is_empty() { continue; }
 
-    // 6. If should_learn, auto-store as pending edit
-    let pending_id = if result.should_learn {
-        let id = pending_edits::insert(
-            &state.pool,
-            &state.default_user_id,
-            Some(&body.recording_id),
-            &body.ai_output,
-            &body.user_kept,
-        );
-        if let Some(ref pid) = id {
-            info!(
-                "[classify] stored pending edit {pid} for recording {} (corrections={}, repeat={}, notify={})",
-                body.recording_id, correction_count, is_repeat, notify
+                // Heuristic guard: only auto-promote if the candidate looks
+                // jargon-like OR the classifier is highly confident.  This stops
+                // the LLM from labeling a casual rephrase as STT_ERROR.
+                let jargon  = phonetics::jargon_score(correct);
+                let confident = result.confidence >= 0.7;
+                if jargon < 0.3 && !confident {
+                    info!(
+                        "[classify] STT_ERROR candidate {correct:?} score={jargon:.2} \
+                         conf={:.2} — below auto-promote threshold; skipping",
+                        result.confidence
+                    );
+                    continue;
+                }
+
+                // Already in vocab? bump weight; record repeat.
+                if vocabulary::upsert(&state.pool, &state.default_user_id, correct, 1.0, "auto") {
+                    learned = true;
+                    promoted_count += 1;
+                }
+
+                // Add (transcript_form → correct_form) replacement when STT
+                // produced a distinct wrong form.
+                let from = cand.transcript_form.trim();
+                if !from.is_empty()
+                    && !from.eq_ignore_ascii_case(correct)
+                    && stt_replacements::upsert(&state.pool, &state.default_user_id, from, correct, 1.0)
+                {
+                    promoted_count += 1;
+                }
+
+                // Repeat detection: if vocab use_count > 1, it had been seen.
+                let counts = vocabulary::top_terms(&state.pool, &state.default_user_id, 200);
+                if counts.iter().any(|t| t.term.eq_ignore_ascii_case(correct) && t.use_count > 1) {
+                    is_repeat = true;
+                }
+            }
+        }
+
+        EditClass::PolishError => {
+            // Polish errors are riskier (common-word collisions) — we keep the
+            // pending_edits → manual approval flow for first sightings, but the
+            // backend now promotes automatically when we've seen the same wrong
+            // word before in word_corrections.
+            for cand in &result.candidates {
+                let wrong   = cand.polish_form.trim().to_ascii_lowercase();
+                let correct = cand.correct_form.trim();
+                if wrong.is_empty() || correct.is_empty() || wrong == correct.to_ascii_lowercase() {
+                    continue;
+                }
+                if correction_exists(&state, &wrong) {
+                    is_repeat = true;
+                    corrections::upsert(
+                        &state.pool,
+                        &state.default_user_id,
+                        &[(wrong.clone(), correct.to_ascii_lowercase())],
+                    );
+                    learned = true;
+                    promoted_count += 1;
+                }
+            }
+
+            // Always store as pending so the user can review even single-shot
+            // POLISH_ERRORs in the UI.  This is the safety valve for ambiguous
+            // common-word substitutions.
+            pending_id = pending_edits::insert(
+                &state.pool,
+                &state.default_user_id,
+                Some(&body.recording_id),
+                &body.ai_output,
+                &body.user_kept,
             );
         }
-        id
-    } else {
-        info!(
-            "[classify] not learning for {} — reason: {}",
-            body.recording_id, result.reason
-        );
-        None
+
+        EditClass::UserRephrase | EditClass::UserRewrite => {
+            // No learning artifact.
+        }
+    }
+
+    // 5. Notification policy: notify on STT_ERROR auto-promotion (something
+    //    visible just changed), or on a repeat POLISH_ERROR promotion.
+    let notify = match result.class {
+        EditClass::SttError    => promoted_count > 0,
+        EditClass::PolishError => learned && is_repeat,
+        _                      => false,
     };
+
+    info!(
+        "[classify] {} class={} promoted={} repeat={} notify={} learned={} pending={:?}",
+        body.recording_id, result.class.as_str(), promoted_count, is_repeat,
+        notify, learned, pending_id,
+    );
 
     (
         StatusCode::OK,
         Json(ClassifyResponse {
-            should_learn:     result.should_learn,
-            reason:           result.reason,
-            corrections:      result.corrections,
-            pending_id,
-            correction_count,
-            is_repeat,
+            class:          result.class.as_str().to_string(),
+            reason:         result.reason,
+            candidates:     result.candidates,
+            learned,
             notify,
+            pending_id,
+            promoted_count,
+            is_repeat,
         }),
     )
 }
 
-/// Check if any of the classifier's corrections match a past correction the user
-/// has already made.  Looks at `word_corrections` table (which accumulates all
-/// historic word-level diffs) for matching `wrong_text` values.
-fn check_repeat_corrections(
-    pool:    &crate::store::DbPool,
-    user_id: &str,
-    corrections: &[classifier::Correction],
-) -> bool {
-    let conn = match pool.get() {
+/// Demote vocabulary terms that appear in the polish but are removed/replaced
+/// by the user.  Returns how many terms were demoted.  We intentionally only
+/// look at terms with `source != 'starred'` so user-pinned vocab is safe.
+fn run_demotion_pass(state: &AppState, polish: &str, user_kept: &str) -> usize {
+    let polish_lower = polish.to_ascii_lowercase();
+    let kept_lower   = user_kept.to_ascii_lowercase();
+    let vocab        = vocabulary::top_terms(&state.pool, &state.default_user_id, 200);
+
+    let mut demoted = 0_usize;
+    for v in vocab {
+        if v.source == "starred" { continue; }
+        let term_lower = v.term.to_ascii_lowercase();
+        // present in polish, absent in user_kept → user removed it
+        if polish_lower.contains(&term_lower)
+            && !kept_lower.contains(&term_lower)
+            && vocabulary::demote(&state.pool, &state.default_user_id, &v.term, 0.5)
+        {
+            demoted += 1;
+        }
+    }
+    demoted
+}
+
+/// Has the user previously corrected this exact polish form?
+fn correction_exists(state: &AppState, wrong: &str) -> bool {
+    let conn = match state.pool.get() {
         Ok(c) => c,
         Err(_) => return false,
     };
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM word_corrections
+         WHERE user_id = ?1 AND wrong_text = ?2",
+        rusqlite::params![state.default_user_id.as_str(), wrong],
+        |row| row.get(0),
+    ).unwrap_or(0);
+    count > 0
+}
 
-    for c in corrections {
-        // Normalize to lowercase for matching
-        let ai_word = c.ai_said.trim().to_lowercase();
-        if ai_word.is_empty() { continue; }
-
-        // Check if we've seen this exact wrong word corrected before
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM word_corrections
-             WHERE user_id = ?1 AND wrong_text = ?2",
-            rusqlite::params![user_id, ai_word],
-            |row| row.get(0),
-        ).unwrap_or(0);
-
-        if count > 0 {
-            info!(
-                "[classify] repeat correction detected: '{}' was corrected before (count={})",
-                ai_word, count
-            );
-            return true;
-        }
+fn empty_response(class: &str, reason: &str) -> ClassifyResponse {
+    ClassifyResponse {
+        class:          class.to_string(),
+        reason:         reason.to_string(),
+        candidates:     vec![],
+        learned:        false,
+        notify:         false,
+        pending_id:     None,
+        promoted_count: 0,
+        is_repeat:      false,
     }
-    false
 }

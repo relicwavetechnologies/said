@@ -9,8 +9,10 @@ pub mod history;
 pub mod openai_oauth;
 pub mod pending_edits;
 pub mod prefs;
+pub mod stt_replacements;
 pub mod users;
 pub mod vectors;
+pub mod vocabulary;
 
 pub type DbPool = Pool<SqliteConnectionManager>;
 
@@ -25,6 +27,7 @@ const MIGRATION_008: &str = include_str!("migrations/008_recording_audio_id.sql"
 const MIGRATION_009: &str = include_str!("migrations/009_word_corrections.sql");
 const MIGRATION_010: &str = include_str!("migrations/010_groq_api_key.sql");
 const MIGRATION_011: &str = include_str!("migrations/011_embed_dims_256.sql");
+const MIGRATION_012: &str = include_str!("migrations/012_vocabulary_and_stt_replacements.sql");
 
 /// Open (or create) the SQLite database at `path`, run pending migrations,
 /// and return a connection pool.
@@ -150,6 +153,14 @@ fn run_migrations(pool: &DbPool) {
             .expect("migration 011 failed");
         conn.execute_batch("PRAGMA user_version = 11")
             .expect("failed to set user_version to 11");
+    }
+
+    if version < 12 {
+        info!("running migration 012_vocabulary_and_stt_replacements");
+        conn.execute_batch(MIGRATION_012)
+            .expect("migration 012 failed");
+        conn.execute_batch("PRAGMA user_version = 12")
+            .expect("failed to set user_version to 12");
     }
 }
 

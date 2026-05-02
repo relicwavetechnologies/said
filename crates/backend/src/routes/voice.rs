@@ -71,13 +71,15 @@ pub fn cleanup_old_audio() {
 
 use crate::{
     embedder::gemini,
-    llm::{gateway, gemini_direct, groq, openai_codex, prompt::{build_system_prompt, build_user_message}},
+    llm::{gateway, gemini_direct, groq, openai_codex, prompt::{build_system_prompt_with_vocab, build_user_message}},
     stt::deepgram,
     store::{
         corrections,
         history::{insert_recording, InsertRecording},
         openai_oauth,
+        stt_replacements,
         vectors::retrieve_similar,
+        vocabulary,
     },
     AppState,
 };
@@ -156,19 +158,23 @@ pub async fn polish(
 
         let http_client = Client::new();
 
+        // ── Personal STT bias: load top vocabulary terms (capped) ──────────────
+        let vocab_terms = vocabulary::top_term_strings(&pool, &user_id, 100);
+        if !vocab_terms.is_empty() {
+            info!("[voice] biasing STT with {} personal term(s)", vocab_terms.len());
+        }
+
         // 2. Transcribe (skip if pre_transcript supplied by Tauri WS pipeline)
         //
         // Two transcripts are maintained:
-        //   stt_transcript — plain text (for storage, display, embedding)
-        //   enriched_transcript — same text but with [word?XX%] markers on
-        //                         low-confidence words (sent to the LLM only)
-        let (stt_transcript, enriched_transcript, stt_confidence, transcribe_ms) = if let Some(t) = pre_transcript {
+        //   stt_transcript_raw — plain text from Deepgram (or pre_transcript stripped)
+        //   enriched_raw       — same text but with [word?XX%] markers on
+        //                        low-confidence words (sent to the LLM)
+        let (stt_transcript_raw, enriched_raw, stt_confidence, transcribe_ms) = if let Some(t) = pre_transcript {
             // P5: Tauri already had a transcript from Deepgram WS — skip HTTP STT.
             // The WS path sends an enriched transcript (with [word?XX%] markers)
             // as-is.  It contains both the plain words and the confidence markers.
             info!("[voice] using pre-transcript ({} chars) — STT step skipped", t.len());
-            let status_data = json!({"phase": "polishing", "transcript": &t}).to_string();
-            yield Ok(Event::default().event("status").data(status_data));
             // Strip markers for the plain version (used in DB/embedding)
             let plain = strip_confidence_markers(&t);
             (plain, t, 0.95_f64, 0_i64)
@@ -178,15 +184,13 @@ pub async fn polish(
                 .data(json!({"phase": "transcribing"}).to_string()));
 
             let t_start = Instant::now();
-            match deepgram::transcribe(&http_client, &deepgram_key, wav_data, &prefs.language).await {
+            match deepgram::transcribe(&http_client, &deepgram_key, wav_data, &prefs.language, &vocab_terms).await {
                 Ok(r) => {
                     let ms = t_start.elapsed().as_millis() as i64;
                     info!("[voice] transcript in {ms}ms ({} uncertain words): {}", r.uncertain_count, r.transcript);
                     if r.uncertain_count > 0 {
                         info!("[voice] enriched for LLM: {}", r.enriched_transcript);
                     }
-                    yield Ok(Event::default().event("status")
-                        .data(json!({"phase": "polishing", "transcript": r.transcript}).to_string()));
                     (r.transcript, r.enriched_transcript, r.confidence, ms)
                 }
                 Err(e) => {
@@ -198,6 +202,30 @@ pub async fn polish(
                 }
             }
         };
+
+        // ── Apply post-STT phonetic/literal replacements ───────────────────────
+        // Applied to BOTH the plain transcript (used for storage/embedding) and
+        // the enriched transcript (sent to the LLM).  apply() preserves the
+        // surrounding [...?XX%] punctuation around tokens it rewrites, so a
+        // marker like "[written?47%]" becomes "[n8n?47%]" — the LLM still sees
+        // the uncertainty signal but on the corrected token.
+        let stt_replacement_rules = stt_replacements::load_all(&pool, &user_id);
+        let (stt_transcript, enriched_transcript) = if stt_replacement_rules.is_empty() {
+            (stt_transcript_raw, enriched_raw)
+        } else {
+            let plain_rewritten = stt_replacements::apply(&stt_transcript_raw, &stt_replacement_rules);
+            let enriched_rewritten = stt_replacements::apply(&enriched_raw, &stt_replacement_rules);
+            if plain_rewritten != stt_transcript_raw {
+                info!(
+                    "[voice] post-STT replacement applied: {:?} → {:?}",
+                    stt_transcript_raw, plain_rewritten
+                );
+            }
+            (plain_rewritten, enriched_rewritten)
+        };
+
+        let status_payload = json!({"phase": "polishing", "transcript": &stt_transcript}).to_string();
+        yield Ok(Event::default().event("status").data(status_payload));
 
         // ── P2: Spawn embedding immediately — runs in parallel with prompt building ──
         let transcript_for_embed = stt_transcript.clone();
@@ -244,8 +272,11 @@ pub async fn polish(
             info!("[voice] {} word correction(s) loaded", word_corrections.len());
         }
 
-        // 5. Build full system prompt (with RAG examples + word corrections)
-        let system_prompt = build_system_prompt(&prefs, &rag_examples, &word_corrections);
+        // 5. Build full system prompt — RAG examples + soft polish-layer corrections
+        //    + personal vocabulary (preserve-verbatim instruction).
+        let system_prompt = build_system_prompt_with_vocab(
+            &prefs, &rag_examples, &word_corrections, &vocab_terms,
+        );
 
         // 6. Stream LLM tokens — dispatch to openai_codex / gemini_direct / gateway
         let llm_provider  = prefs.llm_provider.clone();

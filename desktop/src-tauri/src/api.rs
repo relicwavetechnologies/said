@@ -665,30 +665,33 @@ pub async fn store_pending_edit(
     resp["id"].as_str().map(str::to_string).ok_or_else(|| "no id in response".into())
 }
 
-/// Three-way edit classifier response.
+/// Four-way edit classifier response.
+///
+/// `class` is one of `STT_ERROR | POLISH_ERROR | USER_REPHRASE | USER_REWRITE`.
+/// `learned` indicates whether any artifact was written (vocabulary entry,
+/// post-STT replacement, or word correction).  `notify` is the desktop's
+/// notification gate.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ClassifyEditResponse {
-    pub should_learn:     bool,
+    pub class:            String,
     pub reason:           String,
     pub pending_id:       Option<String>,
-    /// Number of word/phrase corrections found in this edit.
     #[serde(default)]
-    pub correction_count: usize,
-    /// True if any correction matches a previously-seen correction.
-    #[serde(default)]
-    pub is_repeat:        bool,
-    /// True if the user should be notified (2+ corrections OR repeat).
-    /// Single first-time corrections are stored silently.
+    pub learned:          bool,
     #[serde(default)]
     pub notify:           bool,
+    #[serde(default)]
+    pub promoted_count:   usize,
+    #[serde(default)]
+    pub is_repeat:        bool,
 }
 
-/// Classify an edit using the Groq-based three-way classifier.
+/// Classify an edit using the four-way classifier.
 ///
 /// Sends (recording_id, ai_output, user_kept) to the backend, which looks up
-/// the original transcript and calls Groq to determine if the edit is a
-/// learnable AI correction.  If `should_learn`, the backend auto-stores a
-/// pending edit and returns the pending_id.
+/// the original transcript and calls Groq.  Promotion happens server-side:
+/// STT_ERROR auto-promotes on first sighting; POLISH_ERROR promotes only on
+/// repeat; REPHRASE/REWRITE do nothing.
 pub async fn classify_edit(
     ep:           &BackendEndpoint,
     recording_id: &str,

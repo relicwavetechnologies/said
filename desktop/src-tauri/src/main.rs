@@ -1539,41 +1539,30 @@ async fn watch_for_edit(
     let ep_opt = back_arc.lock().ok().and_then(|g| g.clone());
     if let Some(ref ep) = ep_opt {
         match api::classify_edit(ep, &recording_id, &polished, &user_kept).await {
-            Ok(resp) if resp.should_learn && resp.notify => {
-                // HIGH confidence: 2+ corrections OR repeat correction.
-                // Store (already done by backend) AND notify user.
-                tracing::info!(
-                    "[edit-watch] classifier: LEARN+NOTIFY — corrections={}, repeat={}, reason={:?}, pending_id={:?}",
-                    resp.correction_count, resp.is_repeat, resp.reason, resp.pending_id
-                );
-                use tauri_plugin_notification::NotificationExt;
-                let _ = app.notification()
-                    .builder()
-                    .title("Said learned from your edit")
-                    .body(&resp.reason)
-                    .show();
-                // Refresh frontend badge
-                let _ = app.emit("pending-edits-changed", ());
-            }
-            Ok(resp) if resp.should_learn => {
-                // LOW confidence: single first-time correction.
-                // Store silently — no notification, no badge refresh.
-                // If the same correction appears again later, it will be promoted
-                // to notify-tier via the repeat detection.
-                tracing::info!(
-                    "[edit-watch] classifier: SILENT LEARN — corrections={}, reason={:?}, pending_id={:?}",
-                    resp.correction_count, resp.reason, resp.pending_id
-                );
-                // Still refresh the frontend badge so the count updates,
-                // but don't show a macOS notification.
-                let _ = app.emit("pending-edits-changed", ());
-            }
             Ok(resp) => {
                 tracing::info!(
-                    "[edit-watch] classifier: SKIP — reason={:?}",
-                    resp.reason
+                    "[edit-watch] classifier: class={} promoted={} repeat={} learned={} notify={} reason={:?} pending={:?}",
+                    resp.class, resp.promoted_count, resp.is_repeat, resp.learned, resp.notify, resp.reason, resp.pending_id
                 );
-                // Not a learnable edit — no notification, no storage.
+
+                if resp.notify {
+                    // Surface only meaningful events: STT auto-promotion or repeat polish fix.
+                    let title = match resp.class.as_str() {
+                        "STT_ERROR"    => "Said learned a new word",
+                        "POLISH_ERROR" => "Said updated a polish rule",
+                        _              => "Said learned from your edit",
+                    };
+                    use tauri_plugin_notification::NotificationExt;
+                    let _ = app.notification()
+                        .builder()
+                        .title(title)
+                        .body(&resp.reason)
+                        .show();
+                }
+
+                if resp.learned || resp.pending_id.is_some() {
+                    let _ = app.emit("pending-edits-changed", ());
+                }
             }
             Err(e) => {
                 tracing::warn!("[edit-watch] classify_edit call failed: {e}");

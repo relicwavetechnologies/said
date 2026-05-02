@@ -25,13 +25,14 @@ use crate::{
     embedder::gemini,
     llm::{
         gateway, gemini_direct, groq, openai_codex,
-        prompt::{build_system_prompt, build_tray_system_prompt, build_user_message},
+        prompt::{build_system_prompt_with_vocab, build_tray_system_prompt, build_user_message},
     },
     store::{
         corrections,
         history::{insert_recording, InsertRecording},
         openai_oauth,
         vectors::retrieve_similar,
+        vocabulary,
     },
     AppState,
 };
@@ -113,10 +114,15 @@ pub async fn polish(
 
         // tone_override → use tray-specific English-locked prompt (no RAG, no persona)
         // Otherwise → use full RACC prompt with user prefs + RAG examples + corrections
+        let vocab_terms = if tone_override.is_none() {
+            vocabulary::top_term_strings(&pool, &user_id, 100)
+        } else {
+            vec![]
+        };
         let system_prompt = if let Some(ref tone) = tone_override {
             build_tray_system_prompt(tone)
         } else {
-            build_system_prompt(&prefs, &rag_examples, &word_corrections)
+            build_system_prompt_with_vocab(&prefs, &rag_examples, &word_corrections, &vocab_terms)
         };
         let user_message  = build_user_message(&transcript);
 

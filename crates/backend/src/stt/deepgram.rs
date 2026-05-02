@@ -54,17 +54,34 @@ pub struct TranscriptResult {
 
 /// Send WAV audio bytes to Deepgram and return the top transcript.
 /// `language` defaults to `"hi"` (Hindi/Hinglish) if empty.
+/// `keyterms` are personal-vocabulary terms that Deepgram should bias toward
+/// (Nova-3 keyterm prompting; falls back to the older `keywords=` parameter
+/// for legacy models).  Pass an empty slice for no biasing.
 pub async fn transcribe(
     client:   &Client,
     api_key:  &str,
     wav_data: Vec<u8>,
     language: &str,
+    keyterms: &[String],
 ) -> Result<TranscriptResult, String> {
     let lang = if language.is_empty() || language == "auto" { "hi" } else { language };
 
-    let url = format!(
+    // Build URL with one repeated `keyterm=` parameter per personal vocabulary
+    // term.  URL-encoded; we cap at 100 to stay under Deepgram's request size
+    // limits (caller should already have limited).
+    let mut url = format!(
         "{DEEPGRAM_URL}?model=nova-3&language={lang}&smart_format=true&punctuate=true"
     );
+    let bias_count = keyterms.len().min(100);
+    for term in keyterms.iter().take(100) {
+        let cleaned = term.trim();
+        if cleaned.is_empty() { continue; }
+        url.push_str("&keyterm=");
+        url.push_str(&urlencode(cleaned));
+    }
+    if bias_count > 0 {
+        debug!("[stt] biasing Deepgram with {bias_count} personal term(s)");
+    }
 
     debug!("[stt] sending {} bytes to Deepgram (lang={lang})", wav_data.len());
 
@@ -147,4 +164,37 @@ fn enrich_words(words: &[DGWord]) -> (String, usize) {
     }
 
     (parts.join(" "), uncertain)
+}
+
+/// Minimal URL encoder for query-string values: percent-encode anything that
+/// isn't unreserved per RFC 3986 (alphanumerics, `-`, `_`, `.`, `~`).  Spaces
+/// become `%20` (not `+`) for path/query consistency.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(out, "%{:02X}", b);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::urlencode;
+
+    #[test]
+    fn urlencode_basics() {
+        assert_eq!(urlencode("hello"), "hello");
+        assert_eq!(urlencode("n8n"),   "n8n");
+        assert_eq!(urlencode("hi there"), "hi%20there");
+        assert_eq!(urlencode("a&b"),  "a%26b");
+        assert_eq!(urlencode("a=b"),  "a%3Db");
+    }
 }

@@ -16,6 +16,9 @@ pub mod routes;
 pub mod stt;
 pub mod store;
 
+#[cfg(test)]
+mod learning_flow_tests;
+
 // ── Preferences hot-cache (Gap 3) ─────────────────────────────────────────────
 //
 // Avoids a SQLite SELECT on every voice/text/feedback request.

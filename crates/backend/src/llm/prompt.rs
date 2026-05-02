@@ -21,18 +21,68 @@ pub struct RagExample {
 }
 
 /// Build the full system-prompt string.
-/// `corrections` are deterministic word-level substitutions (always applied).
+///
+/// `corrections` are LLM-polish substitutions learned from past POLISH_ERRORs.
+/// They are applied *contextually* (not mandatorily) — the LLM is told to
+/// prefer the right-hand form when the left-hand form would otherwise appear,
+/// but is allowed to skip when context makes the substitution unnatural. This
+/// is intentional: a hard always-replace rule on a common English word would
+/// corrupt unrelated sentences.
+///
+/// `vocabulary` is the user's personal STT-bias vocabulary.  We pass it into
+/// the polish prompt as well, so the LLM is told: "if you see any of these
+/// terms in the transcript, KEEP THEM VERBATIM."  This stops the polish step
+/// from helpfully "fixing" learned jargon back into a wrong common word.
+///
 /// `rag_examples` are embedding-based similar past edits (contextual).
 pub fn build_system_prompt(
     prefs: &Preferences,
     rag_examples: &[RagExample],
     corrections: &[Correction],
 ) -> String {
+    build_system_prompt_with_vocab(prefs, rag_examples, corrections, &[])
+}
+
+/// Variant that also injects the personal vocabulary list as a preserve-verbatim
+/// instruction.  Existing call sites can keep using `build_system_prompt`; new
+/// callers should switch to this and pass the vocabulary terms.
+pub fn build_system_prompt_with_vocab(
+    prefs: &Preferences,
+    rag_examples: &[RagExample],
+    corrections: &[Correction],
+    vocabulary_terms: &[String],
+) -> String {
     let lang_rule = language_rule(&prefs.output_language);
     let persona   = persona_block(prefs);
     let tone      = tone_description(&prefs.tone_preset);
 
-    // Deterministic word substitutions — always applied, no similarity threshold
+    // Vocabulary preservation block — instructs the LLM to leave learned
+    // jargon untouched.  Empty when the user has no vocab yet.
+    let vocab_block = if vocabulary_terms.is_empty() {
+        String::new()
+    } else {
+        let table = vocabulary_terms
+            .iter()
+            .map(|t| format!("  {t}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "<personal_vocabulary>\n\
+             The following terms are part of the user's personal vocabulary \
+             (names, brands, code identifiers, technical terms).\n\
+             RULES:\n\
+             1. If any of these terms appears in the transcript, KEEP IT VERBATIM \
+             in the output — same spelling, same case.\n\
+             2. Do NOT translate, expand, or substitute these terms.\n\
+             3. If the transcript contains a phonetically-similar wrong word \
+             (e.g. transcript says \"written\" where the user meant a vocabulary \
+             term like \"n8n\"), prefer the vocabulary term.\n\n\
+             {table}\n\
+             </personal_vocabulary>\n\n"
+        )
+    };
+
+    // Polish-layer corrections — soft, contextual.  No "MANDATORY".
     let corrections_block = if corrections.is_empty() {
         String::new()
     } else {
@@ -42,12 +92,13 @@ pub fn build_system_prompt(
             .collect::<Vec<_>>()
             .join("\n");
         format!(
-            "<word_corrections>\n\
-             MANDATORY — always apply these exact word substitutions.\n\
-             Whenever you see the left-hand word in the transcript, replace it with \
-             the right-hand word in your output. No exceptions.\n\n\
+            "<polish_preferences>\n\
+             The user has previously reverted these polish-layer substitutions. \
+             When the same situation arises, prefer the right-hand form unless \
+             the surrounding context makes it grammatically wrong.  Do not apply \
+             blindly to unrelated sentences.\n\n\
              {table}\n\
-             </word_corrections>\n\n"
+             </polish_preferences>\n\n"
         )
     };
 
@@ -78,6 +129,7 @@ pub fn build_system_prompt(
         "<output_language>\n{lang_rule}\n</output_language>\n\n\
          <role>\n{persona}\n</role>\n\n\
          <tone>\n{tone}\n</tone>\n\n\
+         {vocab_block}\
          {corrections_block}\
          {prefs_block}\
          <task>\n\
@@ -92,14 +144,17 @@ pub fn build_system_prompt(
          the SURROUNDING CONTEXT to figure out what the speaker actually meant.\n\
          Examples: [dog?47%] in a tech discussion → \"doc\" (documentation). \
          [male?52%] in an email context → \"mail\". [affect?61%] → \"effect\" or vice versa.\n\
-         2. Even unmarked words can be wrong — use common sense for the whole sentence.\n\
-         3. Remove disfluencies (um, uh, matlab, basically, you know, toh, like).\n\
-         4. Polish into clean, natural text.\n\
-         5. Output ONLY the polished text — no preamble, no commentary, no markdown, \
+         2. If <personal_vocabulary> exists, KEEP those exact tokens unchanged. \
+         When a [word?XX%] marker is phonetically similar to a vocabulary term, prefer \
+         the vocabulary term — that is exactly the case the personal dictionary exists for.\n\
+         3. Even unmarked words can be wrong — use common sense for the whole sentence.\n\
+         4. Remove disfluencies (um, uh, matlab, basically, you know, toh, like).\n\
+         5. Polish into clean, natural text.\n\
+         6. Output ONLY the polished text — no preamble, no commentary, no markdown, \
          and NO [word?XX%] markers in the output.\n\
-         6. The output_language rule above is ABSOLUTE — follow it for script and language.\n\
-         7. If <word_corrections> exist, apply those substitutions unconditionally.\n\
-         8. If <preferences> exist, match the user's style and word choices.\n\n\
+         7. The output_language rule above is ABSOLUTE — follow it for script and language.\n\
+         8. If <polish_preferences> exist, prefer the right-hand form when contextually appropriate.\n\
+         9. If <preferences> exist, match the user's style and word choices.\n\n\
          IMPORTANT: Think about what the speaker INTENDED to say based on the overall \
          topic and sentence meaning. Low-confidence words are hints, not gospel.\n\
          </task>"
@@ -189,4 +244,65 @@ fn tone_description(tone_preset: &str) -> String {
         _              => "Tone: neutral and clear.",
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{corrections::Correction, prefs::Preferences};
+
+    fn prefs() -> Preferences {
+        Preferences {
+            user_id:           "u1".into(),
+            selected_model:    "smart".into(),
+            tone_preset:       "neutral".into(),
+            custom_prompt:     None,
+            language:          "auto".into(),
+            output_language:   "english".into(),
+            auto_paste:        true,
+            edit_capture:      true,
+            polish_text_hotkey:"cmd+shift+p".into(),
+            deepgram_api_key:  None,
+            gemini_api_key:    None,
+            gateway_api_key:   None,
+            groq_api_key:      None,
+            llm_provider:      "gateway".into(),
+            updated_at:        0,
+        }
+    }
+
+    #[test]
+    fn vocab_block_appears_when_terms_present() {
+        let p = prefs();
+        let prompt = build_system_prompt_with_vocab(
+            &p, &[], &[], &["n8n".into(), "Vipassana".into()],
+        );
+        assert!(prompt.contains("<personal_vocabulary>"), "vocab block should be emitted");
+        assert!(prompt.contains("n8n"));
+        assert!(prompt.contains("Vipassana"));
+        assert!(prompt.contains("KEEP IT VERBATIM"));
+    }
+
+    #[test]
+    fn vocab_block_absent_when_no_terms() {
+        let p = prefs();
+        let prompt = build_system_prompt_with_vocab(&p, &[], &[], &[]);
+        // The opening tag (which only appears in the actual block, not the
+        // conditional reference in <task>) must not be present.
+        assert!(!prompt.contains("<personal_vocabulary>\n"),
+                "expected no vocabulary block when terms are empty");
+        assert!(!prompt.contains("KEEP IT VERBATIM"),
+                "vocab instructions should be gated on having terms");
+    }
+
+    #[test]
+    fn polish_corrections_block_is_soft_not_mandatory() {
+        let p = prefs();
+        let corr = vec![Correction { wrong: "kindly".into(), right: "please".into(), count: 1 }];
+        let prompt = build_system_prompt_with_vocab(&p, &[], &corr, &[]);
+        assert!(prompt.contains("<polish_preferences>"));
+        // The old MANDATORY language must be gone — that was the semantic bug.
+        assert!(!prompt.contains("MANDATORY"));
+        assert!(!prompt.contains("No exceptions"));
+    }
 }

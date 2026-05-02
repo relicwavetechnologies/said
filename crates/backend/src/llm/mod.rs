@@ -3,6 +3,7 @@ pub mod gateway;
 pub mod gemini_direct;
 pub mod groq;
 pub mod openai_codex;
+pub mod phonetics;
 pub mod prompt;
 
 /// Shared result type returned by all LLM streaming clients.
