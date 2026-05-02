@@ -637,6 +637,9 @@ pub struct PendingEditsResponse {
 }
 
 /// Store a detected edit for user review (called right after detection, before notifying).
+/// NOTE: In normal flow, `classify_edit` is used instead (which auto-stores if should_learn).
+/// This is kept for manual/direct storage if needed.
+#[allow(dead_code)]
 pub async fn store_pending_edit(
     ep:           &BackendEndpoint,
     recording_id: Option<&str>,
@@ -660,6 +663,45 @@ pub async fn store_pending_edit(
         .await
         .map_err(|e| format!("parse pending edit response: {e}"))?;
     resp["id"].as_str().map(str::to_string).ok_or_else(|| "no id in response".into())
+}
+
+/// Three-way edit classifier response.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ClassifyEditResponse {
+    pub should_learn: bool,
+    pub reason:       String,
+    pub pending_id:   Option<String>,
+}
+
+/// Classify an edit using the Groq-based three-way classifier.
+///
+/// Sends (recording_id, ai_output, user_kept) to the backend, which looks up
+/// the original transcript and calls Groq to determine if the edit is a
+/// learnable AI correction.  If `should_learn`, the backend auto-stores a
+/// pending edit and returns the pending_id.
+pub async fn classify_edit(
+    ep:           &BackendEndpoint,
+    recording_id: &str,
+    ai_output:    &str,
+    user_kept:    &str,
+) -> Result<ClassifyEditResponse, String> {
+    let url  = format!("{}/v1/classify-edit", ep.url);
+    let body = serde_json::json!({
+        "recording_id": recording_id,
+        "ai_output":    ai_output,
+        "user_kept":    user_kept,
+    });
+    Client::new()
+        .post(&url)
+        .header("Authorization", ep.bearer())
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| format!("classify edit failed: {e}"))?
+        .json::<ClassifyEditResponse>()
+        .await
+        .map_err(|e| format!("parse classify response: {e}"))
 }
 
 pub async fn get_pending_edits(ep: &BackendEndpoint) -> Result<PendingEditsResponse, String> {

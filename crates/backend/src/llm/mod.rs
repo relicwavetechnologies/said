@@ -1,3 +1,4 @@
+pub mod classifier;
 pub mod gateway;
 pub mod gemini_direct;
 pub mod groq;

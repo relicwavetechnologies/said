@@ -8,7 +8,6 @@ import {
   PaceCard,
   RecordingsTable,
   ActivityHeatmap,
-  WorkspaceTopBar,
   FilterBar,
 } from "@/components/DashboardCards";
 import { listHistory } from "@/lib/invoke";
@@ -22,7 +21,6 @@ interface DashboardViewProps {
   onToggle:        () => void;
   onAccessibility: () => void;
   onNavigate?:     (view: string) => void;
-  onOpenInvite?:   () => void;
   statusPhase?:    string;
   liveText?:       string;
   pendingEdits?:   PendingEdit[];
@@ -37,7 +35,6 @@ export function DashboardView({
   onToggle,
   onAccessibility,
   onNavigate,
-  onOpenInvite,
   statusPhase    = "",
   liveText       = "",
   pendingEdits   = [],
@@ -62,9 +59,6 @@ export function DashboardView({
   return (
     <ScrollArea className="h-full">
       <div className="px-7 pt-4 pb-10 max-w-[1280px] mx-auto">
-
-        {/* ── Workspace top bar ──────────────────────── */}
-        <WorkspaceTopBar onInvite={() => onOpenInvite?.()} />
 
         {/* ── Filter / search bar ─────────────────────── */}
         <FilterBar onNewRecording={onToggle} />

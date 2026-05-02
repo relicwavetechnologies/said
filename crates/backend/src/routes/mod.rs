@@ -1,3 +1,4 @@
+pub mod classify;
 pub mod cloud;
 pub mod feedback;
 pub mod health;

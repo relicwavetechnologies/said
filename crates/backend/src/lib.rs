@@ -87,6 +87,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/v1/voice/polish",    post(routes::voice::polish))
         .route("/v1/text/polish",     post(routes::text::polish))
         .route("/v1/edit-feedback",        post(routes::feedback::submit))
+        .route("/v1/classify-edit",         post(routes::classify::classify))
         .route("/v1/pending-edits",        post(routes::pending_edits::create))
         .route("/v1/pending-edits",        get(routes::pending_edits::list))
         .route("/v1/pending-edits/:id/resolve", post(routes::pending_edits::resolve))

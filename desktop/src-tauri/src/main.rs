@@ -1442,12 +1442,14 @@ async fn watch_for_edit(
         }
     }
 
+    // ── Pre-flight gates (cheap, no API call) ─────────────────────────────────
+
     if user_kept.is_empty() || user_kept.trim() == polished.trim() {
-        tracing::info!("[edit-watch] no meaningful diff for {recording_id} — skipping");
+        tracing::info!("[edit-watch] no diff for {recording_id} — skipping");
         return;
     }
 
-    // Sanity-check: if user_kept shares zero words with polished it is likely
+    // Garbage check: if user_kept shares zero words with polished it's likely
     // a UI placeholder (e.g. Slack's "Type / for commands") that leaked through.
     if !shares_word_overlap(&user_kept, &polished) {
         tracing::info!(
@@ -1457,44 +1459,55 @@ async fn watch_for_edit(
         return;
     }
 
-    // ── Meaningful edit gate ──────────────────────────────────────────────────
-    // Filter out whitespace-only, case-only, punctuation-only, and AX-jitter
-    // diffs that are NOT real user edits.
+    // Whitespace / punctuation / AX-jitter filter (no API call needed).
     if !is_meaningful_edit(&polished, &user_kept) {
         tracing::info!(
-            "[edit-watch] edit not meaningful for {recording_id} — skipping notification"
+            "[edit-watch] edit not meaningful for {recording_id} — skipping"
         );
         return;
     }
 
-    // ── 1. Store as pending edit in the backend ────────────────────────────────
-    tracing::info!("[edit-watch] storing pending edit for {recording_id}");
+    // ── Three-way classifier (Groq LLM call) ────────────────────────────────
+    // Sends (recording_id, ai_output, user_kept) to the backend which looks up
+    // the original transcript and asks Groq: "Is this an AI mistake correction
+    // that we should learn from, or just user rephrasing / adding context?"
+    tracing::info!(
+        "[edit-watch] classifying edit for {recording_id}: polished={:?} → kept={:?}",
+        polished.chars().take(50).collect::<String>(),
+        user_kept.chars().take(50).collect::<String>(),
+    );
+
     let ep_opt = back_arc.lock().ok().and_then(|g| g.clone());
     if let Some(ref ep) = ep_opt {
-        match api::store_pending_edit(ep, Some(&recording_id), &polished, &user_kept).await {
-            Ok(pending_id) => {
-                tracing::info!("[edit-watch] pending_edit stored: {pending_id}");
-                // Send OS notification from Rust — the webview may be throttled
-                // when backgrounded, so JS sendNotification is unreliable here.
+        match api::classify_edit(ep, &recording_id, &polished, &user_kept).await {
+            Ok(resp) if resp.should_learn => {
+                tracing::info!(
+                    "[edit-watch] classifier: LEARN — reason={:?}, pending_id={:?}",
+                    resp.reason, resp.pending_id
+                );
+                // Notify user
                 use tauri_plugin_notification::NotificationExt;
-                let short_kept = if user_kept.chars().count() > 60 {
-                    format!("{}…", user_kept.chars().take(60).collect::<String>())
-                } else {
-                    user_kept.clone()
-                };
                 let _ = app.notification()
                     .builder()
-                    .title("Said noticed an edit — tap to review")
-                    .body(&short_kept)
+                    .title("Said learned from your edit")
+                    .body(&resp.reason)
                     .show();
+                // Refresh frontend badge
+                let _ = app.emit("pending-edits-changed", ());
             }
-            Err(e) => tracing::warn!("[edit-watch] failed to store pending edit: {e}"),
+            Ok(resp) => {
+                tracing::info!(
+                    "[edit-watch] classifier: SKIP — reason={:?}",
+                    resp.reason
+                );
+                // Not a learnable edit — no notification, no storage.
+            }
+            Err(e) => {
+                tracing::warn!("[edit-watch] classify_edit call failed: {e}");
+                // Classifier unavailable — fail open (don't store, don't notify).
+            }
         }
     }
-
-    // ── 3. Emit to frontend so the dashboard badge refreshes ──────────────────
-    // (window is NOT force-shown — user opens it in their own time)
-    let _ = app.emit("pending-edits-changed", ());
     let _ = back_arc; // keep arc alive until end of scope
 }
 
