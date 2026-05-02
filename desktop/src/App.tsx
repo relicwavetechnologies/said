@@ -30,10 +30,13 @@ import {
   initiateOpenAIOAuth,
   requestInputMonitoring,
   submitEditFeedback,
+  onVocabToast,
+  deleteVocabularyTerm,
+  type VocabToastPayload,
 } from "@/lib/invoke";
 import { useTheme } from "@/lib/useTheme";
 import type { AppSnapshot, HistoryItem, PendingEdit, Recording } from "@/types";
-import { RetryToast, EditConfirmToast } from "@/components/NotificationToast";
+import { RetryToast, EditConfirmToast, VocabularyToast } from "@/components/NotificationToast";
 
 export type ActiveView = "dashboard" | "history" | "vocabulary" | "insights" | "settings";
 const VALID_VIEWS: ActiveView[] = ["dashboard", "history", "vocabulary", "insights", "settings"];
@@ -92,6 +95,9 @@ export default function App() {
   const [editToast, setEditToast] = useState<{
     recordingId: string; aiOutput: string; userKept: string;
   } | null>(null);
+
+  // ── Vocabulary toast (manual add, auto-promote, star) ─────────────────────
+  const [vocabToast, setVocabToast] = useState<VocabToastPayload | null>(null);
 
   // ── Pending edits ─────────────────────────────────────────────────────────
   const [pendingEdits, setPendingEdits] = useState<PendingEdit[]>([]);
@@ -254,6 +260,10 @@ export default function App() {
     refreshPending();
     const unsubPending = onPendingEditsChanged(refreshPending);
 
+    // Vocabulary toast — fires on auto-promote during dictation,
+    // manual add via the Vocabulary panel, and star toggles.
+    const unsubVocabToast = onVocabToast(setVocabToast);
+
     // Tray menu → navigate to Settings
     const unsubNav = onNavSettings(() => setSettingsOpen(true));
 
@@ -290,6 +300,7 @@ export default function App() {
       unsubError();
       unsubEdit();
       unsubPending();
+      unsubVocabToast();
     };
   }, [refreshHistory]);
 
@@ -611,6 +622,23 @@ export default function App() {
             } catch { /* non-critical */ }
           }}
           onDismiss={() => setEditToast(null)}
+        />
+      )}
+
+      {/* ── Vocabulary toast (bottom-center) ─────────── */}
+      {vocabToast && !retryToast && !editToast && (
+        <VocabularyToast
+          kind={vocabToast.kind}
+          term={vocabToast.term}
+          source={vocabToast.source}
+          onUndo={vocabToast.kind === "added" ? async () => {
+            const t = vocabToast.term;
+            setVocabToast(null);
+            try {
+              await deleteVocabularyTerm(t);
+            } catch { /* non-critical */ }
+          } : undefined}
+          onDismiss={() => setVocabToast(null)}
         />
       )}
 

@@ -1297,7 +1297,12 @@ async fn add_vocabulary_term(
     api::add_vocabulary_term(&ep, &term).await?;
     let _ = app.emit("vocabulary-changed", ());
 
-    // Native macOS notification (osascript-backed for dev-mode reliability).
+    // In-app toast (matches the website's design language) — primary surface.
+    let _ = app.emit("vocab-toast", serde_json::json!({
+        "kind": "added", "term": term, "source": "manual",
+    }));
+
+    // OS-level fallback for when the Said window isn't focused.
     notify_macos(
         "Said vocabulary",
         &format!("Added \"{term}\" — biasing STT on the next recording"),
@@ -1314,6 +1319,9 @@ async fn delete_vocabulary_term(
     let ep = get_endpoint(&backend)?;
     api::delete_vocabulary_term(&ep, &term).await?;
     let _ = app.emit("vocabulary-changed", ());
+    let _ = app.emit("vocab-toast", serde_json::json!({
+        "kind": "removed", "term": term,
+    }));
     Ok(())
 }
 
@@ -1330,6 +1338,9 @@ async fn star_vocabulary_term(
     // Lightweight confirmation toast for star/unstar — only on STAR (positive
     // affirmation), not on unstar (silent).
     if starred {
+        let _ = app.emit("vocab-toast", serde_json::json!({
+            "kind": "starred", "term": term,
+        }));
         notify_macos(
             "Said vocabulary",
             &format!("Pinned \"{term}\" — protected from automatic demotion"),
@@ -1742,7 +1753,20 @@ async fn watch_for_edit(
                 );
 
                 if resp.notify {
-                    // Surface only meaningful events: STT auto-promotion or repeat polish fix.
+                    // In-app toast per learnable term (matches website UI,
+                    // includes Undo affordance).  We surface the first term
+                    // — most edits produce one; on rare multi-promote edits
+                    // the others land silently in vocab.
+                    if let Some(term) = resp.promoted_terms.first() {
+                        if !term.trim().is_empty() {
+                            let _ = app.emit("vocab-toast", serde_json::json!({
+                                "kind":   "added",
+                                "term":   term,
+                                "source": "auto",
+                            }));
+                        }
+                    }
+                    // OS-level fallback for when the Said window isn't focused.
                     let title = match resp.class.as_str() {
                         "STT_ERROR"    => "Said learned a new word",
                         "POLISH_ERROR" => "Said updated a polish rule",

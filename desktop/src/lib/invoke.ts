@@ -637,6 +637,20 @@ export function onVocabularyChanged(handler: () => void): () => void {
   return () => unsub();
 }
 
+/** In-app vocabulary toast event payload (emitted by backend on add/promote/star). */
+export interface VocabToastPayload {
+  kind:   "added" | "starred" | "removed";
+  term:   string;
+  source?: "auto" | "manual" | "starred";
+}
+
+export function onVocabToast(handler: (p: VocabToastPayload) => void): () => void {
+  if (!isTauriRuntime()) return () => {};
+  let unsub: () => void = () => {};
+  listen<VocabToastPayload>("vocab-toast", (e) => handler(e.payload)).then((fn) => { unsub = fn; });
+  return () => unsub();
+}
+
 // Suppress unused-import warnings for types only used in exported signatures
 export type {
   CloudAuthResponse,

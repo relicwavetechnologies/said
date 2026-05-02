@@ -698,6 +698,10 @@ pub struct ClassifyEditResponse {
     pub promoted_count:   usize,
     #[serde(default)]
     pub is_repeat:        bool,
+    /// Flat correct_form values that were just promoted to vocabulary.
+    /// Driven by the toast event the desktop emits to the frontend.
+    #[serde(default)]
+    pub promoted_terms:   Vec<String>,
 }
 
 /// Classify an edit using the four-way classifier.

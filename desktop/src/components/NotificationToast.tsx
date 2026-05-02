@@ -1,5 +1,5 @@
-import React from "react";
-import { X, RotateCcw, Check } from "lucide-react";
+import React, { useEffect } from "react";
+import { X, RotateCcw, Check, Sparkles, BookOpen, Star, Undo2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 // ── Retry Toast ───────────────────────────────────────────────────────────────
@@ -138,6 +138,142 @@ export function EditConfirmToast({ aiOutput, userKept, onSave, onDismiss }: Edit
         >
           <Check size={11} />
           Save preference
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Vocabulary Added Toast ────────────────────────────────────────────────────
+//
+// Replaces the previous OS-level "looks like a log" notification with an
+// in-app toast that matches RetryToast's design exactly: bottom-center,
+// surface-3 panel, drop shadow, dismiss + primary action affordances.
+//
+// Variants:
+//   • "added"   — auto-promoted from STT_ERROR or manually added
+//   • "starred" — pinned by the user
+//   • "removed" — deleted (used by Undo confirmation)
+//
+// Auto-dismisses after 6 seconds; the host (App.tsx) controls visibility.
+
+export type VocabToastKind = "added" | "starred" | "removed";
+
+interface VocabToastProps {
+  kind:     VocabToastKind;
+  term:     string;
+  source?:  "auto" | "manual" | "starred";   // present for "added"
+  onUndo?:  () => void;
+  onDismiss: () => void;
+}
+
+export function VocabularyToast({ kind, term, source, onUndo, onDismiss }: VocabToastProps) {
+  // Auto-dismiss after 6s. User can interact with Undo before then.
+  useEffect(() => {
+    const t = setTimeout(onDismiss, 6000);
+    return () => clearTimeout(t);
+  }, [onDismiss]);
+
+  // Icon + accent color per kind ───────────────────────────────────────────
+  const accent = (() => {
+    if (kind === "starred") {
+      return {
+        icon:  <Star size={11} fill="currentColor" />,
+        color: "hsl(var(--chip-amber-fg))",
+        bg:    "hsl(var(--chip-amber-bg))",
+      };
+    }
+    if (kind === "removed") {
+      return {
+        icon:  <BookOpen size={11} />,
+        color: "hsl(var(--muted-foreground))",
+        bg:    "hsl(var(--surface-4))",
+      };
+    }
+    // added — sparkle if auto, plus if manual
+    return {
+      icon:  source === "manual"
+        ? <BookOpen size={11} />
+        : <Sparkles size={11} />,
+      color: "hsl(var(--chip-mint-fg))",
+      bg:    "hsl(var(--chip-mint-bg))",
+    };
+  })();
+
+  // Headline text per kind ─────────────────────────────────────────────────
+  const headline = (() => {
+    if (kind === "starred") return "Pinned to vocabulary";
+    if (kind === "removed") return "Removed from vocabulary";
+    return source === "manual"
+      ? "Added to vocabulary"
+      : "Said learned a new word";
+  })();
+
+  const subtle = (() => {
+    if (kind === "starred") return "Protected from automatic demotion";
+    if (kind === "removed") return "Won't bias future recordings";
+    return source === "manual"
+      ? "Will bias your next recording"
+      : "Auto-learned from your edit";
+  })();
+
+  return (
+    <div
+      className="fixed bottom-5 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 px-4 py-3 rounded-2xl shadow-xl max-w-sm"
+      style={{
+        background:  "hsl(var(--surface-3))",
+        border:      "1px solid hsl(var(--border))",
+        boxShadow:   "0 8px 32px hsl(0 0% 0% / 0.28)",
+        animation:   "fadeIn 0.18s ease-out",
+      }}
+    >
+      {/* Accent circle with kind icon */}
+      <span
+        className="w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0"
+        style={{ background: accent.bg, color: accent.color }}
+      >
+        {accent.icon}
+      </span>
+
+      {/* Two-line message */}
+      <div className="flex-1 min-w-0">
+        <p className="text-[12px] font-semibold text-foreground leading-tight">
+          {headline}
+        </p>
+        <p className="text-[11px] text-muted-foreground leading-tight mt-0.5 truncate">
+          <span
+            className="font-mono px-1.5 py-0.5 rounded"
+            style={{ background: "hsl(var(--surface-4))" }}
+          >
+            {term}
+          </span>
+          <span className="ml-1.5">· {subtle}</span>
+        </p>
+      </div>
+
+      {/* Actions */}
+      <div className="flex items-center gap-1.5 flex-shrink-0">
+        {onUndo && (
+          <button
+            onClick={onUndo}
+            className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-colors"
+            style={{
+              background: "hsl(var(--surface-4))",
+              color:      "hsl(var(--foreground))",
+            }}
+            onMouseEnter={(e) => { e.currentTarget.style.background = "hsl(var(--surface-hover))"; }}
+            onMouseLeave={(e) => { e.currentTarget.style.background = "hsl(var(--surface-4))"; }}
+          >
+            <Undo2 size={11} />
+            Undo
+          </button>
+        )}
+        <button
+          onClick={onDismiss}
+          className="w-6 h-6 rounded-lg flex items-center justify-center transition-colors opacity-50 hover:opacity-100"
+          style={{ background: "hsl(var(--surface-4))" }}
+        >
+          <X size={11} />
         </button>
       </div>
     </div>

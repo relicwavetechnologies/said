@@ -75,6 +75,11 @@ pub struct ClassifyResponse {
     pub pending_id:     Option<String>,
     pub promoted_count: usize,
     pub is_repeat:      bool,
+    /// Flat list of correct_form values that survived all gates and were
+    /// promoted to vocabulary.  The desktop uses this for the in-app toast
+    /// so it doesn't have to deserialize the full LabelledHunk schema.
+    #[serde(default)]
+    pub promoted_terms: Vec<String>,
 }
 
 pub async fn classify(
@@ -167,6 +172,7 @@ pub async fn classify(
     let mut is_repeat      = false;
     let mut pending_id     = None;
     let mut learned        = false;
+    let mut promoted_terms: Vec<String> = Vec::new();
 
     // Capture-confidence master switch.  When false, no auto-promotion regardless
     // of class — we store as pending and let the user review.  This is the
@@ -194,6 +200,7 @@ pub async fn classify(
                 if vocabulary::upsert(&state.pool, &state.default_user_id, correct, 1.0, "auto") {
                     learned = true;
                     promoted_count += 1;
+                    promoted_terms.push(correct.to_string());
                 }
                 let from = cand.transcript_form().trim();
                 if !from.is_empty()
@@ -226,6 +233,7 @@ pub async fn classify(
                     );
                     learned = true;
                     promoted_count += 1;
+                    promoted_terms.push(correct.to_string());
                 }
             }
             EditClass::UserRephrase | EditClass::UserRewrite => {
@@ -272,6 +280,7 @@ pub async fn classify(
             pending_id,
             promoted_count,
             is_repeat,
+            promoted_terms,
         }),
     )
 }
@@ -386,6 +395,7 @@ fn empty_response(class: &str, reason: &str) -> ClassifyResponse {
         pending_id:     None,
         promoted_count: 0,
         is_repeat:      false,
+        promoted_terms: vec![],
     }
 }
 

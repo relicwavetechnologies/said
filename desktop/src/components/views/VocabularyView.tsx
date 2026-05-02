@@ -7,7 +7,6 @@ import {
   Plus,
   Search,
   X,
-  Check,
   AlertCircle,
 } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -247,39 +246,16 @@ function SearchBar({
   );
 }
 
-// ── Toast for delete confirmation ────────────────────────────────────────────
-
-function Toast({ message }: { message: string }) {
-  return (
-    <div
-      className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 px-4 py-2 rounded-xl shadow-xl"
-      style={{
-        background:  "hsl(var(--surface-3))",
-        color:       "hsl(var(--foreground))",
-        boxShadow:   "0 8px 32px rgba(0,0,0,0.4)",
-        animation:   "fadeIn 0.15s ease-out",
-      }}
-    >
-      <Check size={13} style={{ color: "hsl(var(--chip-mint-fg))" }} />
-      <span className="text-[13px]">{message}</span>
-    </div>
-  );
-}
-
 // ── Main view ────────────────────────────────────────────────────────────────
 
 export function VocabularyView() {
   const [rows,    setRows]    = useState<VocabRow[]>([]);
   const [filter,  setFilter]  = useState("");
   const [loading, setLoading] = useState(true);
-  const [toast,   setToast]   = useState<string | null>(null);
 
-  // Auto-dismiss toast
-  useEffect(() => {
-    if (!toast) return;
-    const t = setTimeout(() => setToast(null), 1800);
-    return () => clearTimeout(t);
-  }, [toast]);
+  // Note: confirmation toasts (add / star / delete) are emitted by the
+  // backend as `vocab-toast` events and handled by the global toast in
+  // App.tsx — no inline toast state needed here.
 
   async function refresh() {
     const resp = await listVocabulary();
@@ -291,16 +267,12 @@ export function VocabularyView() {
     refresh();
     const unsub = onVocabularyChanged(refresh);
     // Quietly request macOS notification permission on first mount.
-    // No-op if already granted; opens the macOS prompt if undecided; no-op if
-    // already denied (in which case the user must enable in System Settings).
-    // Without this, manual-add and auto-promote notifications silently fail.
     requestNotifications().catch(() => {});
     return () => unsub();
   }, []);
 
   async function handleAdd(term: string) {
     await addVocabularyTerm(term);
-    setToast(`Added "${term}"`);
     await refresh();
   }
 
@@ -311,7 +283,6 @@ export function VocabularyView() {
 
   async function handleDelete(term: string) {
     await deleteVocabularyTerm(term);
-    setToast(`Removed "${term}"`);
     setRows((prev) => prev.filter((r) => r.term !== term));
   }
 
@@ -438,7 +409,6 @@ export function VocabularyView() {
         )}
       </div>
 
-      {toast && <Toast message={toast} />}
     </ScrollArea>
   );
 }
