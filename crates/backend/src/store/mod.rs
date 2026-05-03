@@ -14,6 +14,7 @@ pub mod stt_replacements;
 pub mod users;
 pub mod vectors;
 pub mod vocab_embeddings;
+pub mod vocab_fts;
 pub mod vocabulary;
 
 pub type DbPool = Pool<SqliteConnectionManager>;
@@ -34,6 +35,7 @@ const MIGRATION_013: &str = include_str!("migrations/013_pending_promotions_and_
 const MIGRATION_014: &str = include_str!("migrations/014_vocabulary_example_context.sql");
 const MIGRATION_015: &str = include_str!("migrations/015_vocab_embeddings.sql");
 const MIGRATION_016: &str = include_str!("migrations/016_vocab_term_type.sql");
+const MIGRATION_017: &str = include_str!("migrations/017_centroid_decay_fts.sql");
 
 /// Open (or create) the SQLite database at `path`, run pending migrations,
 /// and return a connection pool.
@@ -199,6 +201,14 @@ fn run_migrations(pool: &DbPool) {
             .expect("migration 016 failed");
         conn.execute_batch("PRAGMA user_version = 16")
             .expect("failed to set user_version to 16");
+    }
+
+    if version < 17 {
+        info!("running migration 017_centroid_decay_fts");
+        conn.execute_batch(MIGRATION_017)
+            .expect("migration 017 failed");
+        conn.execute_batch("PRAGMA user_version = 17")
+            .expect("failed to set user_version to 17");
     }
 }
 

@@ -296,9 +296,17 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
             const K_RELEVANT:   usize = 12;
             const MAX_TOTAL:    usize = 25;
             const MIN_SIM:      f32   = 0.55;
+            let txt_v = stt_transcript.clone();
             let chosen = tokio::task::spawn_blocking(move || {
-                vocab_embeddings::select_for_polish(
-                    &pool_v, &uid_v, &lang_v, emb_v.as_deref(),
+                // Hybrid selector: dense (cosine on time-decayed centroids)
+                // ⊕ sparse (BM25 on term + example_context) fused via RRF.
+                // Dense alone misses exact-match jargon (acronyms, IDs);
+                // BM25 alone misses semantic neighbours. Together they
+                // catch ~15-30% more relevant entries (Weaviate / OpenSearch
+                // hybrid-search docs).
+                vocab_embeddings::select_for_polish_hybrid(
+                    &pool_v, &uid_v, &lang_v,
+                    emb_v.as_deref(), Some(&txt_v),
                     N_TOP_WEIGHT, K_RELEVANT, MAX_TOTAL, MIN_SIM,
                 )
             }).await.unwrap_or_default();
@@ -440,6 +448,19 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
             if !inserted {
                 warn!("[voice] failed to insert recording history row");
             }
+
+            // Reinforcement-on-use: bump last_used + use_count for vocab
+            // terms that were in this polish prompt. This is the "use
+            // signal" half of the time-decay scoring — terms that get
+            // surfaced AND retained (the polish completed without error)
+            // get rewarded, freshening their decay clock and pushing them
+            // up the rank for future similar transcripts.
+            let pool3  = pool.clone();
+            let uid3   = user_id.clone();
+            let terms3: Vec<String> = vocab_entries.iter().map(|e| e.term.clone()).collect();
+            tokio::task::spawn_blocking(move || {
+                vocab_embeddings::bump_last_used(&pool3, &uid3, &terms3);
+            });
         }
 
         yield Ok(Event::default().event("done").data(

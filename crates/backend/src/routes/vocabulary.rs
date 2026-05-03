@@ -15,7 +15,7 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::{store::{vocabulary, vocab_embeddings, prefs::get_prefs, now_ms}, AppState};
+use crate::{store::{vocabulary, vocab_embeddings, vocab_fts, prefs::get_prefs, now_ms}, AppState};
 
 // ── GET /v1/vocabulary/terms (hot path) ──────────────────────────────────────
 
@@ -99,6 +99,10 @@ pub async fn create(
     // user-curated terms outrank a fresh auto-promoted one.
     let ok = vocabulary::upsert(&state.pool, &state.default_user_id, trimmed, 1.5, "manual");
     if ok {
+        // Sync FTS index for BM25 retrieval. Manual adds usually have no
+        // example_context yet — the FTS row is keyed on the term alone
+        // until a future sighting fills in context.
+        vocab_fts::upsert(&state.pool, &state.default_user_id, trimmed, None);
         info!("[vocab] manual add: {trimmed:?}");
         (StatusCode::CREATED, Json(serde_json::json!({ "term": trimmed })))
     } else {
@@ -127,10 +131,12 @@ pub async fn delete(
         "DELETE FROM vocabulary WHERE user_id = ?1 AND term = ?2",
         params![state.default_user_id.as_str(), trimmed],
     ).unwrap_or(0);
-    // Cascade-clean the embedding row so future relevance retrieval doesn't
-    // surface a stale match for a term that no longer exists in vocabulary.
+    // Cascade-clean both the dense embedding and the FTS row so future
+    // hybrid retrieval doesn't surface a stale match for a term that no
+    // longer exists in vocabulary.
     drop(conn);
     vocab_embeddings::delete(&state.pool, &state.default_user_id, trimmed);
+    vocab_fts::delete(&state.pool, &state.default_user_id, trimmed);
     info!("[vocab] delete term={trimmed:?} rows={n}");
     if n > 0 { StatusCode::NO_CONTENT } else { StatusCode::NOT_FOUND }
 }

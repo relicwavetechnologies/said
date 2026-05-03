@@ -38,7 +38,8 @@ use crate::{
     },
     store::{
         corrections, history, pending_edits, pending_promotions,
-        prefs::get_prefs, stt_replacements, vocab_embeddings, vocabulary,
+        prefs::get_prefs, stt_replacements, vocab_embeddings, vocab_fts,
+        vocabulary,
     },
     AppState,
 };
@@ -367,10 +368,17 @@ pub async fn classify(
                     promoted_count += 1;
                     promoted_terms.push(correct.to_string());
 
-                    // Fire-and-forget: embed the new term + its context so it
-                    // participates in relevance retrieval at polish time.
-                    // Failure here is non-fatal — the term still works via
-                    // weight-based selection, just not via vector relevance.
+                    // Sync FTS index so BM25 retrieval (the keyword half of
+                    // hybrid retrieval) can find this term. Cheap, sync.
+                    vocab_fts::upsert(
+                        &state.pool, &state.default_user_id, correct, example_ctx.as_deref(),
+                    );
+
+                    // Fire-and-forget: embed the new sighting and recompute
+                    // the term's centroid (mean of up to 10 example
+                    // embeddings). Failure here is non-fatal — the term
+                    // still works via weight-based selection, just not via
+                    // vector relevance until it's embedded.
                     spawn_vocab_embedding(
                         state.clone(),
                         correct.to_string(),
@@ -711,11 +719,30 @@ fn spawn_vocab_embedding(
         else {
             return;
         };
-        let pool  = state.pool.clone();
-        let uid   = state.default_user_id.clone();
-        let term2 = term.clone();
+        let pool      = state.pool.clone();
+        let uid       = state.default_user_id.clone();
+        let term2     = term.clone();
+        let example   = text.clone();
         tokio::task::spawn_blocking(move || {
-            vocab_embeddings::upsert_embedding(&pool, &uid, &term2, &embedding);
+            // Append this sighting to the per-term FIFO ring (cap N=10) and
+            // recompute the centroid. The centroid replaces the legacy
+            // single-embedding representation in vocab_embeddings.embedding
+            // so retrieval still uses one vector per term — but that vector
+            // is now the mean of the user's recent usages, not just the
+            // first one we saw.
+            vocab_embeddings::record_example_and_recentre(
+                &pool, &uid, &term2, &embedding, &example,
+            );
+            // Diagnostic: log cluster spread so we can see when a term is
+            // being used in semantically distinct contexts (future: trigger
+            // an auto-split into two prototypes).
+            let spread = vocab_embeddings::cluster_spread(&pool, &uid, &term2);
+            if spread > 0.5 {
+                tracing::info!(
+                    "[vocab-emb] high cluster spread for {term2:?}: {:.2} — bimodal usage",
+                    spread,
+                );
+            }
         });
     });
 }
