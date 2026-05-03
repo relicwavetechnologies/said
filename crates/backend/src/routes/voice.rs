@@ -82,7 +82,8 @@ use crate::{
     store::{
         history::{InsertRecording, insert_recording},
         openai_oauth, stt_replacements,
-        vocabulary,
+        vectors::retrieve_similar,
+        vocab_embeddings, vocabulary,
     },
     stt::deepgram,
 };
@@ -157,10 +158,15 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
         crate::get_lexicon_cached(&state.lexicon_cache, &pool, &user_id),
         async { vocab_task.await.unwrap_or_default() },
     );
-    // Bare term strings for Deepgram keyterm bias.
+    // Bare term strings for Deepgram keyterm bias (always all top terms by
+    // weight — Deepgram bias has no context awareness, so we feed it the
+    // most-trusted slate).
     let vocab_terms: Vec<String> = vocab_full.iter().map(|v| v.term.clone()).collect();
-    // (term, context) entries for the polish prompt.
-    let vocab_entries: Vec<VocabEntry> = vocab_full
+    // The polish-prompt vocab slice is computed below, AFTER the transcript
+    // embedding lands, so we can do relevance retrieval. Reserve the binding
+    // here so the existing build_system_prompt_with_vocab_entries call site
+    // doesn't need to move.
+    let vocab_entries_pre: Vec<VocabEntry> = vocab_full
         .iter()
         .map(|v| VocabEntry {
             term:    v.term.clone(),
@@ -241,33 +247,76 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
         let status_payload = json!({"phase": "polishing", "transcript": &stt_transcript}).to_string();
         yield Ok(Event::default().event("status").data(status_payload));
 
-        // ── STEP 2: Embed (fire-and-forget — updates DB for future recordings) ──────
-        // We don't await embed: word corrections from LexiconCache already cover
-        // personalization for this recording. Embed result populates the vector DB
-        // so RAG benefits the NEXT recording instead of blocking this one.
+        // ── STEP 2: Embed (awaited — needed for vocab relevance selection) ─────────
+        // Earlier this was fire-and-forget for hot-path latency. We now await
+        // it because vocab relevance selection (step 4) needs a query
+        // embedding to pick the right vocab entries. The embedding still
+        // populates the cache so the NEXT recording's RAG benefits too.
+        // Cache hits are < 1ms; cold call is 50-150ms.
         let transcript_for_embed = stt_transcript.clone();
         let http_for_embed       = http_client.clone();
         let pool_for_embed       = pool.clone();
         let gemini_key_embed     = gemini_key.clone();
-
-        tokio::spawn(async move {
-            let t = tokio::time::Instant::now();
-            let hit = gemini::embed(&http_for_embed, &pool_for_embed, &transcript_for_embed, &gemini_key_embed).await.is_some();
-            info!("[timing] embed={}ms (bg, {})", t.elapsed().as_millis(), if hit { "ok" } else { "skip/no-key" });
-        });
-
-        let embed_ms: i64 = 0; // non-blocking, not on critical path
+        let embed_t0 = tokio::time::Instant::now();
+        let embedding = gemini::embed(&http_for_embed, &pool_for_embed, &transcript_for_embed, &gemini_key_embed).await;
+        let embed_ms = embed_t0.elapsed().as_millis() as i64;
+        info!("[timing] embed={}ms ({})", embed_ms, if embedding.is_some() { "ok" } else { "skip/no-key" });
 
         let model        = voice_polish_core::resolve_model(&prefs.selected_model).to_string();
         let user_message = build_user_message(&enriched_transcript, &prefs.output_language);
 
-        // ── STEP 3: RAG — skipped (embed is async, use LexiconCache corrections) ──
-        let rag_examples: Vec<crate::llm::prompt::RagExample> = vec![];
-        let rag_ms: u128 = 0;
-        let examples_used = 0usize;
-        info!("[timing] RAG=0ms (skipped — embed async)");
+        // ── STEP 3: RAG retrieval — k-NN over preference_vectors ──────────────────
+        let rag_examples = match &embedding {
+            Some(emb) => {
+                let emb_clone = emb.clone();
+                let pool_rag  = pool.clone();
+                let uid_rag   = user_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    retrieve_similar(&pool_rag, &uid_rag, &emb_clone, 5, 0.65)
+                }).await.unwrap_or_default()
+            }
+            None => vec![],
+        };
+        let rag_ms: u128 = 0; // included in embed_ms above
+        let examples_used = rag_examples.len();
+        info!("[rag] {} example(s) retrieved", examples_used);
 
-        // ── STEP 4: Build prompt ──────────────────────────────────────────────────
+        // ── STEP 4: Relevance-aware vocabulary slice ──────────────────────────────
+        // Use the transcript embedding to pick the vocab entries that match
+        // what the user actually said. Skip flooding the prompt with all 200
+        // vocab rows — pick starred + top-weight + top-relevance (deduped,
+        // capped at 25). Falls back to starred + top-weight when no embedding.
+        let vocab_entries: Vec<VocabEntry> = {
+            let pool_v   = pool.clone();
+            let uid_v    = user_id.clone();
+            let lang_v   = prefs.output_language.clone();
+            let emb_v    = embedding.clone();
+            const N_TOP_WEIGHT: usize = 8;
+            const K_RELEVANT:   usize = 12;
+            const MAX_TOTAL:    usize = 25;
+            const MIN_SIM:      f32   = 0.55;
+            let chosen = tokio::task::spawn_blocking(move || {
+                vocab_embeddings::select_for_polish(
+                    &pool_v, &uid_v, &lang_v, emb_v.as_deref(),
+                    N_TOP_WEIGHT, K_RELEVANT, MAX_TOTAL, MIN_SIM,
+                )
+            }).await.unwrap_or_default();
+            if chosen.is_empty() {
+                // Fresh install / no embeddings yet — fall back to the full
+                // pre-computed slate so existing users aren't degraded.
+                info!("[voice] vocab selector empty — using full slate ({} entries)",
+                      vocab_entries_pre.len());
+                vocab_entries_pre.clone()
+            } else {
+                info!("[voice] vocab selector picked {}/{} entries (relevance-aware)",
+                      chosen.len(), vocab_full.len());
+                chosen.into_iter().map(|v| VocabEntry {
+                    term:    v.term,
+                    context: v.example_context,
+                }).collect()
+            }
+        };
+
         let system_prompt = build_system_prompt_with_vocab_entries(
             &prefs, &rag_examples, &word_corrections, &vocab_entries,
         );

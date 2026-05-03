@@ -27,6 +27,7 @@ pub struct RagExample {
 /// `term="MACOBS"` with `context="MACOBS ka IPO ka 12 hazaar batana"`,
 /// the LLM can match the *context shape* and output MACOBS even though
 /// the literal "main course" isn't a stored alias.
+#[derive(Clone)]
 pub struct VocabEntry {
     pub term:    String,
     pub context: Option<String>,

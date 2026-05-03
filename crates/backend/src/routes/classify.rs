@@ -38,7 +38,7 @@ use crate::{
     },
     store::{
         corrections, history, pending_edits, pending_promotions,
-        prefs::get_prefs, stt_replacements, vocabulary,
+        prefs::get_prefs, stt_replacements, vocab_embeddings, vocabulary,
     },
     AppState,
 };
@@ -366,6 +366,16 @@ pub async fn classify(
                     learned = true;
                     promoted_count += 1;
                     promoted_terms.push(correct.to_string());
+
+                    // Fire-and-forget: embed the new term + its context so it
+                    // participates in relevance retrieval at polish time.
+                    // Failure here is non-fatal — the term still works via
+                    // weight-based selection, just not via vector relevance.
+                    spawn_vocab_embedding(
+                        state.clone(),
+                        correct.to_string(),
+                        example_ctx.clone(),
+                    );
                 }
                 // Foundational: store BOTH the polish-side span AND the
                 // raw transcript-side span as aliases for the canonical.
@@ -663,6 +673,51 @@ fn merge_triage_with_llm(
     };
 
     classifier::ClassifyResult { class: overall, reason, candidates, confidence }
+}
+
+/// Fire-and-forget: embed a newly learned vocab term (with its context)
+/// and persist the vector so polish-time relevance retrieval can find it.
+///
+/// Why fire-and-forget: the embedder is a Gemini network call (~50–150 ms).
+/// Blocking the classify response on it would slow every learning event
+/// and tie the user-visible "learned a new word" toast to an external
+/// API's availability. If the embedder is down, the term is still useful
+/// (fallback to starred + weight selection); it just won't get the
+/// relevance boost until a future re-embed.
+fn spawn_vocab_embedding(
+    state:           AppState,
+    term:            String,
+    example_context: Option<String>,
+) {
+    tokio::spawn(async move {
+        // Resolve Gemini key from prefs, fall back to env var.
+        let key = get_prefs(&state.pool, &state.default_user_id)
+            .and_then(|p| p.gemini_api_key)
+            .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+            .unwrap_or_default();
+        if key.is_empty() {
+            // No key — silent skip. Term still works without embedding.
+            return;
+        }
+        // Embed `"{term}. {example}"` so the vector captures both the
+        // canonical surface form and the situation it's used in. When the
+        // user has no example yet, embed the bare term.
+        let text = match &example_context {
+            Some(ctx) if !ctx.trim().is_empty() => format!("{term}. {ctx}"),
+            _ => term.clone(),
+        };
+        let Some(embedding) =
+            crate::embedder::gemini::embed(&state.http_client, &state.pool, &text, &key).await
+        else {
+            return;
+        };
+        let pool  = state.pool.clone();
+        let uid   = state.default_user_id.clone();
+        let term2 = term.clone();
+        tokio::task::spawn_blocking(move || {
+            vocab_embeddings::upsert_embedding(&pool, &uid, &term2, &embedding);
+        });
+    });
 }
 
 /// Find the sentence inside `text` that contains `term`, returning it

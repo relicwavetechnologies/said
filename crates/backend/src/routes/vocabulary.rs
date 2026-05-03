@@ -15,7 +15,7 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::{store::{vocabulary, prefs::get_prefs, now_ms}, AppState};
+use crate::{store::{vocabulary, vocab_embeddings, prefs::get_prefs, now_ms}, AppState};
 
 // ── GET /v1/vocabulary/terms (hot path) ──────────────────────────────────────
 
@@ -127,6 +127,10 @@ pub async fn delete(
         "DELETE FROM vocabulary WHERE user_id = ?1 AND term = ?2",
         params![state.default_user_id.as_str(), trimmed],
     ).unwrap_or(0);
+    // Cascade-clean the embedding row so future relevance retrieval doesn't
+    // surface a stale match for a term that no longer exists in vocabulary.
+    drop(conn);
+    vocab_embeddings::delete(&state.pool, &state.default_user_id, trimmed);
     info!("[vocab] delete term={trimmed:?} rows={n}");
     if n > 0 { StatusCode::NO_CONTENT } else { StatusCode::NOT_FOUND }
 }
