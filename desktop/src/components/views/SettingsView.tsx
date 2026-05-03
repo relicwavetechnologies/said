@@ -416,10 +416,10 @@ export function SettingsView({
                     className="text-left px-3 py-2.5 rounded-xl transition-all"
                     style={{
                       background: isActive
-                        ? "hsl(var(--chip-lime-bg))"
+                        ? "hsl(var(--surface-4))"
                         : "hsl(var(--surface-4))",
                       color: isActive
-                        ? "hsl(var(--chip-lime-fg))"
+                        ? "hsl(var(--muted-foreground))"
                         : "hsl(var(--muted-foreground))",
                     }}
                   >
@@ -583,10 +583,10 @@ export function SettingsView({
                 className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0"
                 style={{
                   background: axGranted
-                    ? "hsl(var(--chip-lime-bg))"
+                    ? "hsl(var(--surface-4))"
                     : "hsl(var(--surface-4))",
                   color: axGranted
-                    ? "hsl(var(--chip-lime-fg))"
+                    ? "hsl(var(--muted-foreground))"
                     : "hsl(var(--muted-foreground))",
                 }}
               >
@@ -605,7 +605,7 @@ export function SettingsView({
                   axGranted ? (
                     <span
                       className="text-[12px] font-semibold px-3 py-1.5 rounded-lg flex items-center gap-1"
-                      style={{ background: "hsl(var(--chip-lime-bg))", color: "hsl(var(--chip-lime-fg))" }}
+                      style={{ background: "hsl(var(--surface-4))", color: "hsl(var(--muted-foreground))" }}
                     >
                       <Check size={11} /> Granted
                     </span>
@@ -633,10 +633,10 @@ export function SettingsView({
                 className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0"
                 style={{
                   background: notifPerm === "granted"
-                    ? "hsl(var(--chip-lime-bg))"
+                    ? "hsl(var(--surface-4))"
                     : "hsl(var(--surface-4))",
                   color: notifPerm === "granted"
-                    ? "hsl(var(--chip-lime-fg))"
+                    ? "hsl(var(--muted-foreground))"
                     : "hsl(var(--muted-foreground))",
                 }}
               >
@@ -657,7 +657,7 @@ export function SettingsView({
                   notifPerm === "granted" ? (
                     <span
                       className="text-[12px] font-semibold px-3 py-1.5 rounded-lg flex items-center gap-1"
-                      style={{ background: "hsl(var(--chip-lime-bg))", color: "hsl(var(--chip-lime-fg))" }}
+                      style={{ background: "hsl(var(--surface-4))", color: "hsl(var(--muted-foreground))" }}
                     >
                       <Check size={11} /> Granted
                     </span>
@@ -687,10 +687,10 @@ export function SettingsView({
                 className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0"
                 style={{
                   background: imGranted
-                    ? "hsl(var(--chip-lime-bg))"
+                    ? "hsl(var(--surface-4))"
                     : "hsl(var(--surface-4))",
                   color: imGranted
-                    ? "hsl(var(--chip-lime-fg))"
+                    ? "hsl(var(--muted-foreground))"
                     : "hsl(var(--muted-foreground))",
                 }}
               >
@@ -709,7 +709,7 @@ export function SettingsView({
                   imGranted ? (
                     <span
                       className="text-[12px] font-semibold px-3 py-1.5 rounded-lg flex items-center gap-1"
-                      style={{ background: "hsl(var(--chip-lime-bg))", color: "hsl(var(--chip-lime-fg))" }}
+                      style={{ background: "hsl(var(--surface-4))", color: "hsl(var(--muted-foreground))" }}
                     >
                       <Check size={11} /> Granted
                     </span>
@@ -831,7 +831,7 @@ export function SettingsView({
                 <Zap size={12} className="text-muted-foreground" />
                 Groq API Key
                 <span className="ml-1 px-1.5 py-0.5 rounded text-[10px] font-medium"
-                      style={{ background: "hsl(var(--chip-lime-bg))", color: "hsl(var(--chip-lime-fg))" }}>
+                      style={{ background: "hsl(var(--surface-4))", color: "hsl(var(--muted-foreground))" }}>
                   Fast
                 </span>
               </p>
@@ -867,7 +867,7 @@ export function SettingsView({
               )}
               <div className="ml-auto flex items-center gap-3">
                 {keySaved && (
-                  <span className="text-[12px] flex items-center gap-1" style={{ color: "hsl(var(--chip-lime-fg))" }}>
+                  <span className="text-[12px] flex items-center gap-1" style={{ color: "hsl(var(--muted-foreground))" }}>
                     <Check size={12} /> Saved
                   </span>
                 )}
@@ -947,7 +947,7 @@ export function SettingsView({
                           ? "border-transparent text-background"
                           : "border-border text-muted-foreground hover:text-foreground hover:border-foreground/30"
                       }`}
-                      style={isActive ? { background: "hsl(var(--chip-lime-fg))" } : {}}
+                      style={isActive ? { background: "hsl(var(--muted-foreground))" } : {}}
                     >
                       {isActive ? "✓ Active" : "Use"}
                     </button>
@@ -972,9 +972,9 @@ export function SettingsView({
                 <div className="flex items-center gap-2.5">
                   <div
                     className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0"
-                    style={{ background: "hsl(var(--chip-lime-fg) / 0.12)" }}
+                    style={{ background: "hsl(var(--surface-4))" }}
                   >
-                    <Check size={16} style={{ color: "hsl(var(--chip-lime-fg))" }} />
+                    <Check size={16} style={{ color: "hsl(var(--muted-foreground))" }} />
                   </div>
                   <div>
                     <p className="text-[13px] font-semibold text-foreground leading-tight">ChatGPT Connected</p>

@@ -488,8 +488,7 @@ function Row({
   onPlay:     () => void;
   onDownloadSuccess?: (path: string) => void;
 }) {
-  const firstDot = rec.polished.search(/[.?!]/);
-  const title    = firstDot > 0 ? rec.polished.slice(0, firstDot + 1) : rec.polished;
+  const title    = rec.polished;
   const model    = modelLabel(rec.model_used);
 
   const isRecent = Date.now() - rec.timestamp_ms < 5 * 60_000;
@@ -544,6 +543,7 @@ function Row({
         <span
           className="text-[13.5px] font-medium leading-snug truncate"
           style={{ color: "hsl(var(--foreground))" }}
+          title={title}
         >
           {title}
         </span>

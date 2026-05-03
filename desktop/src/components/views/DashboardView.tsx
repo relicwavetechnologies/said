@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Mic, BookOpen } from "lucide-react";
+import { Mic } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   HeroStat,
@@ -60,90 +60,6 @@ export function DashboardView({
   return (
     <ScrollArea className="h-full">
       <div className="px-7 pt-4 pb-10 max-w-[1280px] mx-auto">
-
-        {/* ── Pending learning approvals banner ──────── */}
-        {pendingEdits.length > 0 && (
-          <div
-            className="mb-5 rounded-2xl px-4 py-3 flex items-center justify-between gap-3"
-            style={{
-              background: "hsl(var(--chip-mint-bg))",
-              boxShadow:  "inset 0 0 0 1px hsl(var(--chip-mint-fg) / 0.20)",
-            }}
-          >
-            <div className="flex items-center gap-2.5">
-              <BookOpen size={15} style={{ color: "hsl(var(--chip-mint-fg))" }} />
-              <p className="text-[12px] font-medium" style={{ color: "hsl(var(--chip-mint-fg))" }}>
-                {pendingEdits.length} learning approval{pendingEdits.length > 1 ? "s" : ""} pending
-              </p>
-            </div>
-            <button
-              onClick={() => setReviewOpen((o) => !o)}
-              className="text-[11px] font-semibold px-3 py-1 rounded-lg transition-colors"
-              style={{
-                background: "hsl(var(--chip-mint-fg) / 0.18)",
-                color:      "hsl(var(--chip-mint-fg))",
-              }}
-            >
-              {reviewOpen ? "Close" : "Review"}
-            </button>
-          </div>
-        )}
-
-        {/* ── Pending edits review panel ──────────────── */}
-        {reviewOpen && pendingEdits.length > 0 && (
-          <div className="mb-6 panel overflow-hidden">
-            {pendingEdits.map((pe, i) => (
-              <div
-                key={pe.id}
-                className="px-4 py-3 flex flex-col gap-2"
-                style={{
-                  borderBottom: i < pendingEdits.length - 1
-                    ? "1px solid hsl(var(--surface-4))"
-                    : undefined,
-                }}
-              >
-                <div className="flex flex-col gap-1 text-[11px]">
-                  <div className="flex gap-2 items-start">
-                    <span className="opacity-40 font-semibold w-5 text-right flex-shrink-0">AI</span>
-                    <span
-                      className="leading-snug px-2 py-1 rounded-lg text-muted-foreground line-through flex-1"
-                      style={{ background: "hsl(0 50% 50% / 0.08)" }}
-                    >
-                      {pe.ai_output.length > 80 ? pe.ai_output.slice(0, 80) + "…" : pe.ai_output}
-                    </span>
-                  </div>
-                  <div className="flex gap-2 items-start">
-                    <span className="opacity-40 font-semibold w-5 text-right flex-shrink-0">You</span>
-                    <span
-                      className="leading-snug px-2 py-1 rounded-lg flex-1"
-                      style={{
-                        background: "hsl(var(--chip-mint-fg) / 0.10)",
-                        color:      "hsl(var(--chip-mint-fg))",
-                      }}
-                    >
-                      {pe.user_kept.length > 80 ? pe.user_kept.slice(0, 80) + "…" : pe.user_kept}
-                    </span>
-                  </div>
-                </div>
-                <div className="flex gap-2 justify-end">
-                  <button
-                    onClick={() => onResolvePending?.(pe.id, "skip")}
-                    className="px-3 py-1 rounded-lg text-[11px] font-medium text-muted-foreground transition-colors"
-                    style={{ background: "hsl(var(--surface-4))" }}
-                  >
-                    Skip
-                  </button>
-                  <button
-                    onClick={() => onResolvePending?.(pe.id, "approve")}
-                    className="btn-primary px-3 py-1 text-[11px]"
-                  >
-                    Save to learning
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
 
         {/* ── Live streaming preview ──────────────────── */}
         {(statusPhase || liveText) && (
