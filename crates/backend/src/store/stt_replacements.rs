@@ -33,7 +33,43 @@ pub struct SttReplacement {
 /// repeats bump weight + use_count; conflicting pairs (same transcript_form,
 /// different correct_form) coexist as separate rows so we can see the
 /// distribution and pick the highest-weight one at apply time.
+///
+/// Compaction-aware: when the transcript_form is multi-word and the
+/// correct_form is a single token (the canonical "STT spelled it out"
+/// pattern: "Main corps" → "MACOBS"), we ALSO insert each distinctive
+/// single-word fragment as its own rule. Without this, the multi-word
+/// rule can never match a single-token transcript ("corps" alone), so
+/// the learning never gets applied — exactly the bug we hit when
+/// MACOBS learned but next recording still heard "corps".
 pub fn upsert(
+    pool:            &DbPool,
+    user_id:         &str,
+    transcript_form: &str,
+    correct_form:    &str,
+    bump:            f64,
+) -> bool {
+    let primary = upsert_one(pool, user_id, transcript_form, correct_form, bump);
+
+    // Compaction case: multi-word source → single-token target.  Also store
+    // each non-trivial single word from the source so future single-token
+    // STT outputs trigger the rule.  Lower weight than the primary rule so
+    // the exact multi-word match still wins when both could apply.
+    let from = transcript_form.trim();
+    let to   = correct_form.trim();
+    let words: Vec<&str> = from.split_whitespace().collect();
+    let to_is_single = !to.contains(char::is_whitespace);
+    if words.len() >= 2 && to_is_single {
+        for w in words {
+            if is_distinctive_fragment(w) {
+                let _ = upsert_one(pool, user_id, w, correct_form, bump * 0.5);
+            }
+        }
+    }
+
+    primary
+}
+
+fn upsert_one(
     pool:            &DbPool,
     user_id:         &str,
     transcript_form: &str,
@@ -64,6 +100,38 @@ pub fn upsert(
 
     info!("[stt-repl] upsert {from:?} → {to:?} (key={key}, bump={bump}, rows={rows})");
     rows > 0
+}
+
+/// True if `word` is distinctive enough to use as a single-token replacement
+/// rule on its own.  We skip the most common English + Hinglish particles
+/// (which would over-fire on every sentence) and very short tokens.
+///
+/// This list is kept small + conservative on purpose — false positives here
+/// (e.g. user once corrected "the" → "MACOBS" by accident) would be loud
+/// because we'd start replacing "the" everywhere.  When in doubt, keep.
+fn is_distinctive_fragment(word: &str) -> bool {
+    let w = word.trim().to_ascii_lowercase();
+    if w.chars().count() < 4 { return false; }
+    // Common English + Hinglish stopwords.  Hinglish particles ("main", "hai",
+    // "kar", "raha") are critical — they appear in almost every dictation.
+    const STOPWORDS: &[&str] = &[
+        // English
+        "the", "and", "but", "for", "you", "are", "was", "this", "that",
+        "with", "from", "what", "when", "where", "they", "them", "their",
+        "have", "has", "had", "will", "would", "could", "should", "about",
+        "into", "than", "then", "very", "just", "some", "make", "made",
+        "your", "yours", "mine", "ours", "his", "her", "its", "all",
+        // Hinglish particles
+        "main", "hai", "hain", "tha", "thi", "the", "raha", "rahi", "rahe",
+        "kar", "karo", "kiya", "karna", "karta", "karte", "karti", "kya",
+        "kaise", "kab", "kaha", "kahan", "kuch", "kuchh", "koi", "yaha",
+        "yahan", "vahan", "vaha", "wahan", "isko", "usko", "iska", "uska",
+        "iski", "uski", "iske", "uske", "mera", "tera", "uska", "hamara",
+        "tumhara", "abhi", "phir", "lekin", "magar", "jaise", "vaise",
+        "sirf", "saath", "pehle", "baad", "zara", "thoda", "bahut",
+        "matlab", "yaani", "haan", "nahi", "nahin", "bilkul",
+    ];
+    !STOPWORDS.contains(&w.as_str())
 }
 
 /// Decrement weight on revert; delete when ≤ 0.
@@ -295,6 +363,63 @@ mod tests {
         assert_eq!(rules[0].transcript_form, "written"); // lowercased
         let out = super::apply("I use written for automation", &rules);
         assert_eq!(out, "I use n8n for automation");
+    }
+
+    #[test]
+    fn multi_word_to_single_word_creates_fragment_rules() {
+        // The MACOBS regression case.  When STT spelled out "Main corps"
+        // and the user collapsed it to "MACOBS", we should store BOTH the
+        // multi-word rule AND a single-word rule for the distinctive
+        // fragment "corps" so future single-token outputs trigger.
+        let pool = mem_pool();
+        super::upsert(&pool, "u1", "Main corps", "MACOBS", 1.0);
+        let rules = super::load_all(&pool, "u1");
+
+        // Should have the multi-word rule + at least the "corps" fragment.
+        let has_multi    = rules.iter().any(|r| r.transcript_form == "main corps");
+        let has_fragment = rules.iter().any(|r| r.transcript_form == "corps");
+        // "main" is in the stopword list, so it must NOT be inserted.
+        let has_main     = rules.iter().any(|r| r.transcript_form == "main");
+        assert!(has_multi,    "multi-word rule should exist");
+        assert!(has_fragment, "single-word fragment 'corps' should exist");
+        assert!(!has_main,    "'main' is a stopword and must not be inserted");
+
+        // Apply on a single-token transcript should now fire.
+        let out = super::apply("मैं corps का password क्या है", &rules);
+        assert!(out.contains("MACOBS"), "single-token apply should now hit: got {out:?}");
+    }
+
+    #[test]
+    fn single_word_to_single_word_no_fragments_inserted() {
+        // Plain single-word case: no fragment expansion needed.
+        let pool = mem_pool();
+        super::upsert(&pool, "u1", "written", "n8n", 1.0);
+        let rules = super::load_all(&pool, "u1");
+        assert_eq!(rules.len(), 1, "no fragments expected for single-word source");
+    }
+
+    #[test]
+    fn multi_word_to_multi_word_no_fragments_inserted() {
+        // When the correct_form is also multi-word (a phrase replacement,
+        // not a compaction), don't fragment — fragmenting would lose meaning.
+        let pool = mem_pool();
+        super::upsert(&pool, "u1", "Cloud Code", "Claude Code", 1.0);
+        let rules = super::load_all(&pool, "u1");
+        assert_eq!(rules.len(), 1, "multi→multi should not fragment");
+        assert_eq!(rules[0].transcript_form, "cloud code");
+    }
+
+    #[test]
+    fn fragment_filter_skips_stopwords_and_short_tokens() {
+        let pool = mem_pool();
+        super::upsert(&pool, "u1", "the big distinctive_word", "BAR", 1.0);
+        let rules = super::load_all(&pool, "u1");
+        let frags: Vec<&str> = rules.iter().map(|r| r.transcript_form.as_str()).collect();
+        assert!(!frags.contains(&"the"),               "stopword filtered out");
+        assert!(!frags.contains(&"big"),               "3-char token filtered out (< 4)");
+        assert!(frags.contains(&"distinctive_word"),   "≥4-char non-stopword passes through");
+        // Original multi-word rule must still exist.
+        assert!(rules.iter().any(|r| r.transcript_form == "the big distinctive_word"));
     }
 
     #[test]
