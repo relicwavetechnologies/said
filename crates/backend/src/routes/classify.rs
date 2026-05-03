@@ -361,12 +361,22 @@ pub async fn classify(
                     promoted_count += 1;
                     promoted_terms.push(correct.to_string());
                 }
-                if !from.is_empty()
-                    && !from.eq_ignore_ascii_case(correct)
-                    && stt_replacements::upsert(&state.pool, &state.default_user_id, from, correct, 1.0)
-                {
-                    promoted_count += 1;
-                }
+                // Foundational: store BOTH the polish-side span AND the
+                // raw transcript-side span as aliases for the canonical.
+                // The polish span ("Main corps") matches future polish-shaped
+                // transcripts; the transcript span ("मैं Corps") matches the
+                // raw STT output before polish runs. Without storing both,
+                // the rule stored on one shape can never fire on the other —
+                // the bug we hit when MACOBS learned but next recording's
+                // raw STT ("मैं corps") didn't match the polish-side rule.
+                let aliases_written = stt_replacements::upsert_aliases(
+                    &state.pool, &state.default_user_id,
+                    cand.hunk.transcript_window.as_str(),  // raw STT span
+                    from,                                   // polish span
+                    correct,
+                    1.0,
+                );
+                promoted_count += aliases_written;
                 pending_promotions::delete(
                     &state.pool, &state.default_user_id, correct, &output_language,
                 );

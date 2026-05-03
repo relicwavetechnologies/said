@@ -29,47 +29,25 @@ pub struct SttReplacement {
     pub last_used:       i64,
 }
 
-/// Upsert a (transcript_form → correct_form) replacement rule.  Same-pair
-/// repeats bump weight + use_count; conflicting pairs (same transcript_form,
-/// different correct_form) coexist as separate rows so we can see the
-/// distribution and pick the highest-weight one at apply time.
+/// Upsert a (transcript_form → correct_form) replacement rule.
 ///
-/// Compaction-aware: when the transcript_form is multi-word and the
-/// correct_form is a single token (the canonical "STT spelled it out"
-/// pattern: "Main corps" → "MACOBS"), we ALSO insert each distinctive
-/// single-word fragment as its own rule. Without this, the multi-word
-/// rule can never match a single-token transcript ("corps" alone), so
-/// the learning never gets applied — exactly the bug we hit when
-/// MACOBS learned but next recording still heard "corps".
+/// Same-pair repeats bump weight + use_count; conflicting pairs (same
+/// transcript_form, different correct_form) coexist as separate rows so we
+/// can see the distribution and pick the highest-weight one at apply time.
+///
+/// Each row in `stt_replacements` is one **alias** for the canonical
+/// `correct_form`. A canonical can have many aliases — different shapes STT
+/// has been observed producing for the same intended utterance. Aliases are
+/// learned from BOTH the polish span (what the LLM thought STT said) AND
+/// the raw transcript span (what STT actually emitted) — see
+/// `upsert_aliases` in this module for the foundational caller.
+///
+/// Apply (`apply()` below) does longest-match phrase replacement, so a
+/// multi-word alias will match a multi-word transcript span and a
+/// single-word alias matches a single token. No language-specific stopword
+/// list, no fragmenting heuristic — just learn the actual STT output shape
+/// and match against it directly.
 pub fn upsert(
-    pool:            &DbPool,
-    user_id:         &str,
-    transcript_form: &str,
-    correct_form:    &str,
-    bump:            f64,
-) -> bool {
-    let primary = upsert_one(pool, user_id, transcript_form, correct_form, bump);
-
-    // Compaction case: multi-word source → single-token target.  Also store
-    // each non-trivial single word from the source so future single-token
-    // STT outputs trigger the rule.  Lower weight than the primary rule so
-    // the exact multi-word match still wins when both could apply.
-    let from = transcript_form.trim();
-    let to   = correct_form.trim();
-    let words: Vec<&str> = from.split_whitespace().collect();
-    let to_is_single = !to.contains(char::is_whitespace);
-    if words.len() >= 2 && to_is_single {
-        for w in words {
-            if is_distinctive_fragment(w) {
-                let _ = upsert_one(pool, user_id, w, correct_form, bump * 0.5);
-            }
-        }
-    }
-
-    primary
-}
-
-fn upsert_one(
     pool:            &DbPool,
     user_id:         &str,
     transcript_form: &str,
@@ -83,6 +61,10 @@ fn upsert_one(
     let from = transcript_form.trim().to_ascii_lowercase();
     let to   = correct_form.trim().to_string();
     if from.is_empty() || to.is_empty() {
+        return false;
+    }
+    // Don't learn no-op rules (alias == canonical, case-insensitive ASCII).
+    if from.is_ascii() && to.is_ascii() && from == to.to_ascii_lowercase() {
         return false;
     }
     let key = phonetics::phonetic_key(&from);
@@ -102,36 +84,46 @@ fn upsert_one(
     rows > 0
 }
 
-/// True if `word` is distinctive enough to use as a single-token replacement
-/// rule on its own.  We skip the most common English + Hinglish particles
-/// (which would over-fire on every sentence) and very short tokens.
+/// Upsert all known aliases for a canonical correct_form in one shot.
 ///
-/// This list is kept small + conservative on purpose — false positives here
-/// (e.g. user once corrected "the" → "MACOBS" by accident) would be loud
-/// because we'd start replacing "the" everywhere.  When in doubt, keep.
-fn is_distinctive_fragment(word: &str) -> bool {
-    let w = word.trim().to_ascii_lowercase();
-    if w.chars().count() < 4 { return false; }
-    // Common English + Hinglish stopwords.  Hinglish particles ("main", "hai",
-    // "kar", "raha") are critical — they appear in almost every dictation.
-    const STOPWORDS: &[&str] = &[
-        // English
-        "the", "and", "but", "for", "you", "are", "was", "this", "that",
-        "with", "from", "what", "when", "where", "they", "them", "their",
-        "have", "has", "had", "will", "would", "could", "should", "about",
-        "into", "than", "then", "very", "just", "some", "make", "made",
-        "your", "yours", "mine", "ours", "his", "her", "its", "all",
-        // Hinglish particles
-        "main", "hai", "hain", "tha", "thi", "the", "raha", "rahi", "rahe",
-        "kar", "karo", "kiya", "karna", "karta", "karte", "karti", "kya",
-        "kaise", "kab", "kaha", "kahan", "kuch", "kuchh", "koi", "yaha",
-        "yahan", "vahan", "vaha", "wahan", "isko", "usko", "iska", "uska",
-        "iski", "uski", "iske", "uske", "mera", "tera", "uska", "hamara",
-        "tumhara", "abhi", "phir", "lekin", "magar", "jaise", "vaise",
-        "sirf", "saath", "pehle", "baad", "zara", "thoda", "bahut",
-        "matlab", "yaani", "haan", "nahi", "nahin", "bilkul",
-    ];
-    !STOPWORDS.contains(&w.as_str())
+/// This is the foundational learning entrypoint. Given the (transcript_window,
+/// polish_window) pair from a learning event, it stores BOTH spans as aliases
+/// for the canonical. Why both:
+///
+///   • `polish_window` — what the LLM polish step output for the misheard
+///     region. Future runs that go through identical polish behaviour will
+///     match this exact form.
+///
+///   • `transcript_window` — what Deepgram (or any STT) actually emitted.
+///     Future runs in which polish behaves differently — or in which we
+///     bypass polish entirely (debug, alt models) — will match this.
+///
+/// Both spans are stored at full weight; the longest-match phrase apply
+/// handles overlap correctly (the longer alias wins per starting position).
+///
+/// `transcript_window` may be empty (positional alignment failed in the
+/// diff stage) — we just skip it in that case.
+pub fn upsert_aliases(
+    pool:              &DbPool,
+    user_id:           &str,
+    transcript_window: &str,
+    polish_window:     &str,
+    correct_form:      &str,
+    bump:              f64,
+) -> usize {
+    let mut written = 0;
+    if !polish_window.trim().is_empty()
+        && upsert(pool, user_id, polish_window, correct_form, bump)
+    {
+        written += 1;
+    }
+    if !transcript_window.trim().is_empty()
+        && transcript_window.trim() != polish_window.trim()
+        && upsert(pool, user_id, transcript_window, correct_form, bump)
+    {
+        written += 1;
+    }
+    written
 }
 
 /// Decrement weight on revert; delete when ≤ 0.
@@ -198,63 +190,199 @@ pub fn load_all(pool: &DbPool, user_id: &str) -> Vec<SttReplacement> {
     .unwrap_or_default()
 }
 
-/// Apply replacements to a transcript.  Pure function; safe to unit-test.
+/// Apply replacements to a transcript. Pure function; safe to unit-test.
 ///
-/// Algorithm:
-///   1. For each whitespace-separated token, find the highest-weight rule
-///      whose `transcript_form` equals the lowercased token (exact pass).
-///   2. If no exact match, compute the token's phonetic key and look for a
-///      rule with the same key; require similarity ≥ 0.85 to apply (fuzzy).
-///   3. Replace the token (preserving any trailing punctuation it carried).
+/// Algorithm — **longest-match phrase replacement** with phonetic fallback:
+///
+///   1. Tokenise the transcript into (word, original_chunk) pairs preserving
+///      whitespace + punctuation around each word.
+///
+///   2. Sort rules by `transcript_form` token-count DESC (longest first), so
+///      a 3-word alias gets a chance to match before a 1-word alias on the
+///      same starting position.
+///
+///   3. Walk left-to-right. At each cursor position:
+///        a. Try the longest rule whose tokens equal the next N tokens
+///           (case-insensitive on the WORD CORES — punctuation around them
+///           is preserved verbatim from the input). If hit, emit the
+///           canonical, advance N tokens, continue.
+///        b. Otherwise try a single-token phonetic match (key-based,
+///           similarity ≥ 0.85). If hit, emit the canonical for that one
+///           token, advance 1, continue.
+///        c. Otherwise emit the current chunk verbatim, advance 1.
+///
+/// This handles BOTH single-word rules ("corps" → "MACOBS") and multi-word
+/// rules ("Main corps" → "MACOBS") uniformly — no token-only / phrase-only
+/// fork, and no language-specific stopword tricks. Whatever STT span we
+/// learned, we match the same span shape.
 pub fn apply(transcript: &str, rules: &[SttReplacement]) -> String {
     if rules.is_empty() {
         return transcript.to_string();
     }
-    transcript
-        .split_inclusive(char::is_whitespace)
-        .map(|chunk| apply_to_chunk(chunk, rules))
-        .collect()
+
+    // Pre-compute (word_count, lowercased_words) for each rule so the inner
+    // loop is cheap. Sort by word_count DESC so longest-match wins.
+    let mut indexed: Vec<(Vec<String>, &SttReplacement)> = rules
+        .iter()
+        .map(|r| {
+            let words: Vec<String> = r.transcript_form
+                .split_whitespace()
+                .map(|w| w.to_ascii_lowercase())
+                .collect();
+            (words, r)
+        })
+        .filter(|(w, _)| !w.is_empty())
+        .collect();
+    indexed.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+    // Tokenise the transcript while preserving each token's original chunk
+    // (the word + any trailing whitespace and punctuation glued to it).
+    let chunks: Vec<&str> = split_chunks(transcript);
+    let cores:  Vec<String> = chunks
+        .iter()
+        .map(|c| word_core(c).to_ascii_lowercase())
+        .collect();
+
+    let mut out = String::with_capacity(transcript.len());
+    let mut i = 0;
+    while i < chunks.len() {
+        // Empty cores (pure-whitespace / pure-punct chunks) can't match anything.
+        if cores[i].is_empty() {
+            out.push_str(chunks[i]);
+            i += 1;
+            continue;
+        }
+
+        // Try multi-token rules at this position (longest first).
+        let mut matched = None;
+        for (rule_words, rule) in &indexed {
+            let n = rule_words.len();
+            if i + n > chunks.len() { continue; }
+            // Compare rule words to the cores starting at i.
+            let mut ok = true;
+            let mut consumed = 0;
+            let mut k = i;
+            while consumed < n && k < chunks.len() {
+                if cores[k].is_empty() {
+                    // Skip pure-punct chunks inside the window — they don't
+                    // count against the rule's word index.
+                    k += 1;
+                    continue;
+                }
+                if cores[k] != rule_words[consumed] {
+                    ok = false;
+                    break;
+                }
+                consumed += 1;
+                k += 1;
+            }
+            if ok && consumed == n {
+                matched = Some((rule, k));
+                break;
+            }
+        }
+
+        if let Some((rule, end)) = matched {
+            // Replace the matched span with the canonical, preserving the
+            // leading punctuation of the first chunk and the trailing
+            // whitespace/punct of the last consumed chunk.
+            let first = chunks[i];
+            let last  = chunks[end - 1];
+            let (lead, _) = split_punct(first);
+            let (_, trail) = split_punct_trailing(last);
+            out.push_str(lead);
+            out.push_str(&rule.correct_form);
+            out.push_str(trail);
+            i = end;
+            continue;
+        }
+
+        // Fall back to single-token phonetic match.
+        let chunk = chunks[i];
+        let core  = &cores[i];
+        let key   = phonetics::phonetic_key(core);
+        let mut phonetic_hit = None;
+        if !key.is_empty() {
+            for (_, rule) in &indexed {
+                if rule.phonetic_key == key {
+                    let sim = phonetics::similarity(core, &rule.transcript_form);
+                    if sim >= 0.85 {
+                        phonetic_hit = Some(rule);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(rule) = phonetic_hit {
+            let (lead, trail) = split_punct(chunk);
+            let (_, trail2)   = split_punct_trailing(trail);
+            out.push_str(lead);
+            out.push_str(&rule.correct_form);
+            out.push_str(trail2);
+            i += 1;
+            continue;
+        }
+
+        out.push_str(chunk);
+        i += 1;
+    }
+
+    out
 }
 
-fn apply_to_chunk(chunk: &str, rules: &[SttReplacement]) -> String {
-    // Split chunk into core word + trailing whitespace/punct.
-    let trimmed_end = chunk.trim_end();
-    let trailing    = &chunk[trimmed_end.len()..];
-
-    let core_end = trimmed_end
-        .rfind(|c: char| c.is_alphanumeric())
-        .map(|i| i + trimmed_end[i..].chars().next().unwrap().len_utf8())
-        .unwrap_or(trimmed_end.len());
-    let leading_punct = trimmed_end
-        .find(|c: char| c.is_alphanumeric())
-        .unwrap_or(trimmed_end.len());
-
-    let prefix_punct = &trimmed_end[..leading_punct];
-    let suffix_punct = &trimmed_end[core_end..];
-    let core         = &trimmed_end[leading_punct..core_end];
-
-    if core.is_empty() {
-        return chunk.to_string();
+/// Split a transcript into chunks where each chunk is one whitespace-bounded
+/// segment INCLUDING the trailing whitespace. Empty chunks are skipped.
+fn split_chunks(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Walk to next whitespace
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() { i += 1; }
+        // Walk through the whitespace
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+        out.push(&text[start..i]);
+        start = i;
     }
-    let core_lower = core.to_ascii_lowercase();
-
-    // Pass 1: exact match (highest weight wins; rules already sorted DESC).
-    if let Some(r) = rules.iter().find(|r| r.transcript_form == core_lower) {
-        return format!("{prefix_punct}{}{suffix_punct}{trailing}", r.correct_form);
+    if start < text.len() {
+        out.push(&text[start..]);
     }
+    out
+}
 
-    // Pass 2: phonetic match.
-    let key = phonetics::phonetic_key(&core_lower);
-    if !key.is_empty()
-        && let Some(r) = rules.iter().find(|r| r.phonetic_key == key)
-    {
-        let sim = phonetics::similarity(&core_lower, &r.transcript_form);
-        if sim >= 0.85 {
-            return format!("{prefix_punct}{}{suffix_punct}{trailing}", r.correct_form);
-        }
+/// The "core" word of a chunk: alphanumeric+_+- substring with leading and
+/// trailing punctuation stripped. Empty if the chunk has no word characters.
+fn word_core(chunk: &str) -> &str {
+    let trimmed = chunk.trim();
+    let leading = trimmed
+        .find(|c: char| c.is_alphanumeric() || c == '_' || c == '-')
+        .unwrap_or(trimmed.len());
+    let trailing = trimmed
+        .rfind(|c: char| c.is_alphanumeric() || c == '_' || c == '-')
+        .map(|i| i + trimmed[i..].chars().next().unwrap().len_utf8())
+        .unwrap_or(trimmed.len());
+    if leading >= trailing {
+        return "";
     }
+    &trimmed[leading..trailing]
+}
 
-    chunk.to_string()
+/// Returns `(leading_punct_or_whitespace, rest)` for a chunk.
+fn split_punct(chunk: &str) -> (&str, &str) {
+    let split = chunk
+        .find(|c: char| c.is_alphanumeric() || c == '_' || c == '-')
+        .unwrap_or(chunk.len());
+    (&chunk[..split], &chunk[split..])
+}
+
+/// Returns `(rest, trailing_punct_and_whitespace)` for a chunk.
+fn split_punct_trailing(chunk: &str) -> (&str, &str) {
+    let split = chunk
+        .rfind(|c: char| c.is_alphanumeric() || c == '_' || c == '-')
+        .map(|i| i + chunk[i..].chars().next().unwrap().len_utf8())
+        .unwrap_or(0);
+    (&chunk[..split], &chunk[split..])
 }
 
 #[cfg(test)]
@@ -365,61 +493,102 @@ mod tests {
         assert_eq!(out, "I use n8n for automation");
     }
 
+    // ── Foundational learning + apply behavior ─────────────────────────────
+
     #[test]
-    fn multi_word_to_single_word_creates_fragment_rules() {
-        // The MACOBS regression case.  When STT spelled out "Main corps"
-        // and the user collapsed it to "MACOBS", we should store BOTH the
-        // multi-word rule AND a single-word rule for the distinctive
-        // fragment "corps" so future single-token outputs trigger.
+    fn upsert_aliases_stores_both_polish_and_transcript_spans() {
+        // Foundational case: STT emitted "मैं Corps" (raw transcript span),
+        // polish rendered it as "Main corps", user fixed to "MACOBS".
+        // BOTH spans should land as aliases so we match either shape later.
         let pool = mem_pool();
-        super::upsert(&pool, "u1", "Main corps", "MACOBS", 1.0);
+        let n = super::upsert_aliases(
+            &pool, "u1",
+            /* transcript_window */ "मैं Corps",
+            /* polish_window     */ "Main corps",
+            /* correct_form      */ "MACOBS",
+            1.0,
+        );
+        assert_eq!(n, 2, "expected both spans stored");
         let rules = super::load_all(&pool, "u1");
-
-        // Should have the multi-word rule + at least the "corps" fragment.
-        let has_multi    = rules.iter().any(|r| r.transcript_form == "main corps");
-        let has_fragment = rules.iter().any(|r| r.transcript_form == "corps");
-        // "main" is in the stopword list, so it must NOT be inserted.
-        let has_main     = rules.iter().any(|r| r.transcript_form == "main");
-        assert!(has_multi,    "multi-word rule should exist");
-        assert!(has_fragment, "single-word fragment 'corps' should exist");
-        assert!(!has_main,    "'main' is a stopword and must not be inserted");
-
-        // Apply on a single-token transcript should now fire.
-        let out = super::apply("मैं corps का password क्या है", &rules);
-        assert!(out.contains("MACOBS"), "single-token apply should now hit: got {out:?}");
+        assert!(rules.iter().any(|r| r.transcript_form == "main corps"));
+        assert!(rules.iter().any(|r| r.transcript_form == "मैं corps"));
     }
 
     #[test]
-    fn single_word_to_single_word_no_fragments_inserted() {
-        // Plain single-word case: no fragment expansion needed.
+    fn upsert_aliases_skips_empty_transcript_window() {
+        // Diff couldn't positionally align — transcript_window is empty.
+        // We still store the polish span as an alias.
         let pool = mem_pool();
-        super::upsert(&pool, "u1", "written", "n8n", 1.0);
-        let rules = super::load_all(&pool, "u1");
-        assert_eq!(rules.len(), 1, "no fragments expected for single-word source");
+        let n = super::upsert_aliases(&pool, "u1", "", "Main corps", "MACOBS", 1.0);
+        assert_eq!(n, 1);
     }
 
     #[test]
-    fn multi_word_to_multi_word_no_fragments_inserted() {
-        // When the correct_form is also multi-word (a phrase replacement,
-        // not a compaction), don't fragment — fragmenting would lose meaning.
+    fn upsert_aliases_dedupes_when_polish_equals_transcript() {
+        // STT and polish were identical (no polish rewrite for this region).
+        // Don't double-count — store once.
         let pool = mem_pool();
-        super::upsert(&pool, "u1", "Cloud Code", "Claude Code", 1.0);
+        let n = super::upsert_aliases(&pool, "u1", "Main corps", "Main corps", "MACOBS", 1.0);
+        assert_eq!(n, 1);
         let rules = super::load_all(&pool, "u1");
-        assert_eq!(rules.len(), 1, "multi→multi should not fragment");
-        assert_eq!(rules[0].transcript_form, "cloud code");
+        assert_eq!(rules.len(), 1);
     }
 
     #[test]
-    fn fragment_filter_skips_stopwords_and_short_tokens() {
+    fn upsert_skips_no_op_rule() {
+        // Don't waste a row on alias == canonical.
         let pool = mem_pool();
-        super::upsert(&pool, "u1", "the big distinctive_word", "BAR", 1.0);
-        let rules = super::load_all(&pool, "u1");
-        let frags: Vec<&str> = rules.iter().map(|r| r.transcript_form.as_str()).collect();
-        assert!(!frags.contains(&"the"),               "stopword filtered out");
-        assert!(!frags.contains(&"big"),               "3-char token filtered out (< 4)");
-        assert!(frags.contains(&"distinctive_word"),   "≥4-char non-stopword passes through");
-        // Original multi-word rule must still exist.
-        assert!(rules.iter().any(|r| r.transcript_form == "the big distinctive_word"));
+        assert!(!super::upsert(&pool, "u1", "macobs", "MACOBS", 1.0));
+        assert_eq!(super::load_all(&pool, "u1").len(), 0);
+    }
+
+    #[test]
+    fn apply_matches_multi_word_phrase_at_any_position() {
+        // The MACOBS regression: a "Main corps" rule must fire on
+        // "मैं Main corps का IPO" when those two words appear together.
+        let rules = vec![rule("Main corps", "MACOBS")];
+        let out = super::apply("मैं Main corps का IPO", &rules);
+        assert_eq!(out, "मैं MACOBS का IPO");
+    }
+
+    #[test]
+    fn apply_longest_match_wins_at_overlapping_starts() {
+        // Two rules could both match starting from "Main corps" — the longer
+        // one ("Main corps detailed") should win when its full span is present.
+        let rules = vec![
+            rule("Main corps detailed", "MACOBS_DETAILED"),
+            rule("Main corps", "MACOBS"),
+        ];
+        let out = super::apply("Please Main corps detailed today", &rules);
+        assert_eq!(out, "Please MACOBS_DETAILED today");
+    }
+
+    #[test]
+    fn apply_falls_back_to_shorter_when_longer_misses() {
+        // "Main corps detailed" rule exists but transcript has only
+        // "Main corps". Shorter "Main corps" rule must still fire.
+        let rules = vec![
+            rule("Main corps detailed", "MACOBS_DETAILED"),
+            rule("Main corps", "MACOBS"),
+        ];
+        let out = super::apply("Today Main corps please", &rules);
+        assert_eq!(out, "Today MACOBS please");
+    }
+
+    #[test]
+    fn apply_handles_devanagari_alias() {
+        // Raw STT alias contains Devanagari — must match a Devanagari span.
+        let rules = vec![rule("मैं corps", "MACOBS")];
+        let out = super::apply("मैं corps का password", &rules);
+        assert_eq!(out, "MACOBS का password");
+    }
+
+    #[test]
+    fn apply_preserves_punctuation_around_match() {
+        let rules = vec![rule("Main corps", "MACOBS")];
+        let out = super::apply("Hi (Main corps), today", &rules);
+        // Leading "(" and trailing "," + space preserved
+        assert_eq!(out, "Hi (MACOBS), today");
     }
 
     #[test]
