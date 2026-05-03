@@ -25,10 +25,15 @@ const LOW_CONFIDENCE_THRESHOLD: f64 = 0.85;
 /// Stored in `PrewarmedWsState` between recordings to eliminate the TLS handshake
 /// from the hot path (~150ms saved, up to 3s saved under rapid use).
 pub struct PrewarmedWs {
-    pub ws:       tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    pub language: String,
-    pub keyterms: Vec<String>,
+    pub ws:         tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    pub language:   String,
+    pub keyterms:   Vec<String>,
+    pub created_at: std::time::Instant,
 }
+
+/// Deepgram closes idle sockets after ~10s with no audio or KeepAlive.
+/// Discard pre-warms older than this to avoid handing a dead socket to streaming.
+const PREWARM_MAX_AGE: Duration = Duration::from_secs(8);
 
 /// Build the Deepgram WS URL for the given language and keyterms.
 fn build_ws_url(lang: &str, keyterms: &[String]) -> (String, usize) {
@@ -82,7 +87,12 @@ pub async fn connect_ws(deepgram_key: &str, language: &str, keyterms: &[String])
         Ok(Err(e)) => { warn!("[dg_stream] WS connect failed: {e}"); None }
         Ok(Ok((ws, _))) => {
             info!("[dg_stream] ✓ WS connected in {ms}ms (lang={lang} keyterms={bias_count})");
-            Some(PrewarmedWs { ws, language: lang.to_string(), keyterms: keyterms.to_vec() })
+            Some(PrewarmedWs {
+                ws,
+                language:   lang.to_string(),
+                keyterms:   keyterms.to_vec(),
+                created_at: std::time::Instant::now(),
+            })
         }
     }
 }
@@ -107,14 +117,18 @@ pub async fn stream_to_deepgram(
 
     let lang = if language.is_empty() || language == "auto" { "hi" } else { language };
 
-    // Use pre-warmed WS if params match; otherwise connect fresh.
+    // Use pre-warmed WS if params match AND it's still fresh enough.
     let ws = if let Some(pw) = prewarmed {
-        if pw.language == lang && pw.keyterms == keyterms {
-            info!("[dg_stream] ✓ using pre-warmed WS (0ms connect)");
-            pw.ws
-        } else {
+        let age = pw.created_at.elapsed();
+        if pw.language != lang || pw.keyterms != keyterms {
             info!("[dg_stream] pre-warm params mismatch — connecting fresh");
             connect_ws(deepgram_key, lang, keyterms).await?.ws
+        } else if age > PREWARM_MAX_AGE {
+            info!("[dg_stream] pre-warm stale (age={}ms) — connecting fresh", age.as_millis());
+            connect_ws(deepgram_key, lang, keyterms).await?.ws
+        } else {
+            info!("[dg_stream] ✓ using pre-warmed WS (0ms connect, age={}ms)", age.as_millis());
+            pw.ws
         }
     } else {
         info!("[dg_stream] no pre-warm — connecting fresh");

@@ -21,6 +21,60 @@ use voice_polish_paster as paster;
 #[cfg(target_os = "macos")]
 use voice_polish_hotkey as hotkey;
 
+#[cfg(target_os = "macos")]
+fn configure_status_bar_macos(win: &tauri::WebviewWindow) {
+    use objc::Message;
+    use objc::runtime::{Object, Sel};
+
+    let Ok(ns_window) = win.ns_window() else {
+        tracing::warn!("[status-bar] macOS tune failed: ns_window unavailable");
+        return;
+    };
+    if ns_window.is_null() {
+        tracing::warn!("[status-bar] macOS tune failed: ns_window was null");
+        return;
+    }
+
+    // Match a global HUD-style utility window: available on every Space,
+    // allowed over fullscreen apps, stationary during Space transitions, and
+    // kept out of Cmd-` window cycling. Tauri's visible_on_all_workspaces only
+    // sets CanJoinAllSpaces, which is not enough for the three-finger Spaces
+    // swipe behavior users expect from always-hovering status pills.
+    const CAN_JOIN_ALL_SPACES: usize = 1 << 0;
+    const STATIONARY: usize = 1 << 4;
+    const IGNORES_CYCLE: usize = 1 << 6;
+    const FULL_SCREEN_AUXILIARY: usize = 1 << 8;
+    const NS_STATUS_WINDOW_LEVEL: isize = 25;
+
+    unsafe {
+        let ns_window = &*(ns_window as *mut Object);
+        let current: usize = ns_window
+            .send_message(Sel::register("collectionBehavior"), ())
+            .unwrap_or(0);
+        let behavior =
+            current | CAN_JOIN_ALL_SPACES | STATIONARY | IGNORES_CYCLE | FULL_SCREEN_AUXILIARY;
+        let _: Result<(), _> =
+            ns_window.send_message(Sel::register("setCollectionBehavior:"), (behavior,));
+        let _: Result<(), _> =
+            ns_window.send_message(Sel::register("setLevel:"), (NS_STATUS_WINDOW_LEVEL,));
+        let _: Result<(), _> =
+            ns_window.send_message(Sel::register("orderFrontRegardless"), ());
+        tracing::info!(
+            "[status-bar] macOS tuned behavior={behavior:#x} level={NS_STATUS_WINDOW_LEVEL}"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn schedule_status_bar_macos_tune(win: &tauri::WebviewWindow) {
+    let win_for_main = win.clone();
+    if let Err(e) = win.run_on_main_thread(move || {
+        configure_status_bar_macos(&win_for_main);
+    }) {
+        tracing::warn!("[status-bar] could not schedule macOS tune on main thread: {e}");
+    }
+}
+
 // ── Keystroke reconstruction (edit detection for AX-blind apps) ──────────────
 //
 // The existing CGEventTap in the hotkey crate is extended to also capture
@@ -676,6 +730,8 @@ fn sync_status_bar(handle: &tauri::AppHandle, state: &str) {
         Ok(_) => tracing::info!("[status-bar] set_focusable(false) ok"),
         Err(e) => tracing::warn!("[status-bar] set_focusable(false) failed: {e}"),
     }
+    #[cfg(target_os = "macos")]
+    schedule_status_bar_macos_tune(&win);
     match win.show() {
         Ok(_) => tracing::info!("[status-bar] show ok for state={state}"),
         Err(e) => tracing::warn!("[status-bar] show failed for state={state}: {e}"),
@@ -761,6 +817,8 @@ fn create_status_bar(app: &tauri::AppHandle) {
                 Ok(url) => tracing::info!("[status-bar] resolved url={url}"),
                 Err(e) => tracing::warn!("[status-bar] could not read window url: {e}"),
             }
+            #[cfg(target_os = "macos")]
+            schedule_status_bar_macos_tune(&win);
             sync_status_bar(app, "idle");
         }
         Err(e) => tracing::warn!("[status-bar] could not create window: {e}"),
@@ -1271,6 +1329,30 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
                 if let Some(pw) = dg_stream::connect_ws(&key2, &lang2, &terms2).await {
                     *pw_arc2.lock().await = Some(pw);
                     tracing::info!("[dg_stream] next WS pre-warmed and ready");
+
+                    // ── Keepalive heartbeat ─────────────────────────────────────
+                    // Deepgram kills idle connections after ~10s. Send KeepAlive
+                    // every 7s to hold this pre-warm alive until the next recording
+                    // takes it. Stops when the Mutex is empty (recording consumed
+                    // it) or on any send error (connection died).
+                    let pw_ka = Arc::clone(&pw_arc2);
+                    tauri::async_runtime::spawn(async move {
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(7)).await;
+                            let mut guard = pw_ka.lock().await;
+                            let Some(pw) = guard.as_mut() else { break };
+                            use futures::SinkExt;
+                            let ka = tokio_tungstenite::tungstenite::Message::Text(
+                                r#"{"type":"KeepAlive"}"#.into(),
+                            );
+                            if pw.ws.send(ka).await.is_err() {
+                                tracing::warn!("[dg_stream] pre-warm keepalive failed — dropping stale WS");
+                                *guard = None;
+                                break;
+                            }
+                            tracing::debug!("[dg_stream] pre-warm keepalive sent");
+                        }
+                    });
                 }
             });
         });
