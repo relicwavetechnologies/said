@@ -245,7 +245,7 @@ export function EditConfirmToast({ aiOutput, userKept, onSave, onDismiss }: Edit
 //
 // Auto-dismisses after 6 seconds; the host (App.tsx) controls visibility.
 
-export type VocabToastKind = "added" | "starred" | "removed";
+export type VocabToastKind = "added" | "starred" | "removed" | "queued";
 
 interface VocabToastProps {
   kind:     VocabToastKind;
@@ -278,6 +278,14 @@ export function VocabularyToast({ kind, term, source, onUndo, onDismiss }: Vocab
         bg:    "hsl(var(--surface-4))",
       };
     }
+    if (kind === "queued") {
+      // Quieter palette than "added" — we noticed but haven't committed yet.
+      return {
+        icon:  <Sparkles size={11} />,
+        color: "hsl(var(--muted-foreground))",
+        bg:    "hsl(var(--surface-4))",
+      };
+    }
     // added — sparkle if auto, plus if manual
     return {
       icon:  source === "manual"
@@ -292,6 +300,7 @@ export function VocabularyToast({ kind, term, source, onUndo, onDismiss }: Vocab
   const headline = (() => {
     if (kind === "starred") return "Pinned to vocabulary";
     if (kind === "removed") return "Removed from vocabulary";
+    if (kind === "queued")  return "Noticed your correction";
     return source === "manual"
       ? "Added to vocabulary"
       : "Said learned a new word";
@@ -300,6 +309,7 @@ export function VocabularyToast({ kind, term, source, onUndo, onDismiss }: Vocab
   const subtle = (() => {
     if (kind === "starred") return "Said will keep this even if you stop using it.";
     if (kind === "removed") return "Said won't recognise this any more.";
+    if (kind === "queued")  return "Make this fix once more and Said will remember it.";
     return source === "manual"
       ? "Said will recognise this on your next recording."
       : "Said remembered your correction.";

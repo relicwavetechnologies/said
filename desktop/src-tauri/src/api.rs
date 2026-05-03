@@ -770,6 +770,11 @@ pub struct ClassifyEditResponse {
     /// Driven by the toast event the desktop emits to the frontend.
     #[serde(default)]
     pub promoted_terms: Vec<String>,
+    /// Terms recorded into the pending-promotions queue but not yet promoted
+    /// (k-threshold not met). The desktop surfaces these as a soft "noticed"
+    /// toast so the user knows the system saw the correction.
+    #[serde(default)]
+    pub queued_terms: Vec<String>,
 }
 
 /// Classify an edit using the four-way classifier.

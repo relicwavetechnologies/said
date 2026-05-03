@@ -311,6 +311,12 @@ export function Topbar({ snapshot: _snapshot, theme, toggleTheme, onLoginClick }
           title: "Removed from vocabulary",
           body:  `Said won't recognise "${payload.term}" any more.`,
         });
+      } else if (payload.kind === "queued") {
+        push({
+          kind:  "info",
+          title: "Noticed your correction",
+          body:  `Make this fix once more and Said will remember "${payload.term}".`,
+        });
       }
     });
 

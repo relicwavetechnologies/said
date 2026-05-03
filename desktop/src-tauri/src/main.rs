@@ -2297,6 +2297,24 @@ async fn watch_for_edit(
                     notify_macos(&app, title, &body);
                 }
 
+                // Surface queued (k-event sighting recorded but not yet promoted)
+                // so the user knows the system noticed their correction. Without
+                // this the silent k-event behavior looks broken — the classifier
+                // ran, found a real STT error, and "did nothing" from the user's
+                // POV. Soft toast only; no OS banner.
+                if let Some(term) = resp.queued_terms.first() {
+                    if !term.trim().is_empty() {
+                        let _ = app.emit(
+                            "vocab-toast",
+                            serde_json::json!({
+                                "kind":   "queued",
+                                "term":   term,
+                                "source": "auto",
+                            }),
+                        );
+                    }
+                }
+
                 if resp.learned || resp.pending_id.is_some() {
                     let _ = app.emit("pending-edits-changed", ());
                 }

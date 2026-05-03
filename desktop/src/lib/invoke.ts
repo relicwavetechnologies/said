@@ -701,9 +701,10 @@ export function onVocabularyChanged(handler: () => void): () => void {
   return () => unsub();
 }
 
-/** In-app vocabulary toast event payload (emitted by backend on add/promote/star). */
+/** In-app vocabulary toast event payload (emitted by backend on add/promote/star/queue). */
 export interface VocabToastPayload {
-  kind:   "added" | "starred" | "removed";
+  /** "queued" — sighting recorded; k-event threshold not yet met (one more needed). */
+  kind:   "added" | "starred" | "removed" | "queued";
   term:   string;
   source?: "auto" | "manual" | "starred";
 }

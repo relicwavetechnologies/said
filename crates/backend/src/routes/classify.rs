@@ -111,6 +111,11 @@ pub struct ClassifyResponse {
     /// so it doesn't have to deserialize the full LabelledHunk schema.
     #[serde(default)]
     pub promoted_terms: Vec<String>,
+    /// Terms recorded into the pending-promotions queue but not yet promoted
+    /// (k-threshold not met).  Surface this to the user as a soft "noticed —
+    /// once more and I'll remember" toast so the system never feels silent.
+    #[serde(default)]
+    pub queued_terms:   Vec<String>,
 }
 
 pub async fn classify(
@@ -309,6 +314,8 @@ pub async fn classify(
         &state.pool, &state.default_user_id, 30 * 24 * 3600 * 1000,
     );
 
+    let mut queued_terms: Vec<String> = Vec::new();
+
     for cand in &result.candidates {
         let correct = cand.correct_form().trim();
         if correct.is_empty() { continue; }
@@ -320,22 +327,30 @@ pub async fn classify(
                     continue;
                 }
 
-                // K-event promotion gate.  First sighting → record as pending,
-                // do NOT touch live vocab.  Second sighting (with same phonetic
-                // key) → promote to live vocab and clear pending row.
+                // K-event promotion gate with adaptive threshold.  Strong
+                // signals (high-confidence capture + clear jargon + phonetic
+                // OR LLM-confidence) promote at k=1 so users don't have to
+                // confirm obvious corrections.  Weak signals (low jargon
+                // score, ambiguous LLM confidence) require k=2 to guard
+                // against single-event false promotions.
                 let from = cand.transcript_form().trim();
+                let k = pick_k_for_stt_error(
+                    cand, correct, &body.capture_method,
+                );
                 let decision = pending_promotions::record_sighting(
                     &state.pool, &state.default_user_id,
                     correct, from, &output_language,
-                    pending_promotions::DEFAULT_K,
+                    k,
                 );
                 let promote_now = matches!(
                     decision, Some(pending_promotions::PromotionDecision::Promote { .. }),
                 );
                 if !promote_now {
                     info!(
-                        "[classify] STT_ERROR queued — sighting recorded but k-threshold not met for {correct:?}",
+                        "[classify] STT_ERROR queued — k={k} not met for {correct:?} (jargon={:.2})",
+                        phonetics::jargon_score(correct),
                     );
+                    queued_terms.push(correct.to_string());
                     continue;
                 }
 
@@ -432,8 +447,49 @@ pub async fn classify(
             promoted_count,
             is_repeat,
             promoted_terms,
+            queued_terms,
         }),
     )
+}
+
+/// Adaptive k-event threshold for STT_ERROR promotions.
+///
+/// Returns 1 when the signal is strong enough that asking the user to
+/// confirm the correction would feel slow + dumb (clear jargon + reliable
+/// capture path + either phonetic agreement or high LLM confidence).
+/// Returns 2 otherwise — single-event promotion of weak signals is the
+/// documented cause of WisperFlow's dictionary-bloat problem.
+///
+/// The thresholds:
+///   • capture_method must be AX or keystroke_verified (atomic-element-bound
+///     reads that we can fully trust)
+///   • jargon_score(correct) ≥ 0.6 — clearly an acronym, code identifier,
+///     mixed-case, or digit-bearing term (n8n, k8s, MACOBS, iPhone)
+///   • EITHER phonetic similarity ≥ 0.65 (the user's correction sounds like
+///     what STT heard, so it's a plausible mishearing)
+///     OR LLM confidence ≥ 0.85 (the labeler is very sure)
+fn pick_k_for_stt_error(
+    cand:           &LabelledHunk,
+    correct:        &str,
+    capture_method: &str,
+) -> i64 {
+    let high_conf_capture = matches!(capture_method, "ax" | "keystroke_verified");
+    if !high_conf_capture {
+        return pending_promotions::DEFAULT_K;
+    }
+    let jargon = phonetics::jargon_score(correct);
+    if jargon < 0.6 {
+        return pending_promotions::DEFAULT_K;
+    }
+    let phon_sim = phonetics::similarity(cand.transcript_form(), correct)
+        .max(phonetics::similarity(cand.polish_form(), correct));
+    let strong_phonetic   = phon_sim >= 0.65;
+    let strong_llm_conf   = cand.confidence >= 0.85;
+    if strong_phonetic || strong_llm_conf {
+        1
+    } else {
+        pending_promotions::DEFAULT_K
+    }
 }
 
 /// Defense-in-depth gate for STT_ERROR auto-promotion.
@@ -604,6 +660,7 @@ fn empty_response(class: &str, reason: &str) -> ClassifyResponse {
         promoted_count: 0,
         is_repeat:      false,
         promoted_terms: vec![],
+        queued_terms:   vec![],
     }
 }
 

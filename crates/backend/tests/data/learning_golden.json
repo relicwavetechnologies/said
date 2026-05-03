@@ -336,6 +336,21 @@
       }
     },
     {
+      "name": "REGRESSION: MACOBS k=1 single-shot promote (clear jargon + AX)",
+      "polish": "Main corps ka IPO ka 12 hazaar batana.",
+      "user_kept": "MACOBS ka IPO ka 12 hazaar batana.",
+      "transcript": "Main corps ka IPO ka 12 hazaar batana.",
+      "output_language": "hinglish",
+      "capture_method": "ax",
+      "expected": {
+        "pre_filter": "pass",
+        "expected_class": "STT_ERROR",
+        "should_promote_term": "MACOBS",
+        "promotion_should_pass": true,
+        "notes": "Clear jargon (all-caps acronym) + AX capture should promote at k=1. Earlier behaviour silently queued — invisible to user. Adaptive k policy fixes this."
+      }
+    },
+    {
       "name": "REGRESSION: AX-captured edit must survive app-switch",
       "polish": "Main Corps ka IPO ko baarah hazaar batana tha",
       "user_kept": "MACOBS ka IPO ko baarah hazaar batana tha",
