@@ -28,14 +28,43 @@ pub struct VocabTerm {
     pub source:    String,
 }
 
-/// Insert or strengthen a vocabulary term.  If the term already exists, we
-/// add `bump` to its weight and increment use_count.
+/// Insert or strengthen a vocabulary term (language-agnostic — kept for
+/// backward compatibility with manual-add and starred paths that don't
+/// carry a language).  New code from the classifier should call
+/// `upsert_for_language` instead so the term is bucketed correctly.
 pub fn upsert(
     pool:    &DbPool,
     user_id: &str,
     term:    &str,
     bump:    f64,
     source:  &str,
+) -> bool {
+    upsert_inner(pool, user_id, term, bump, source, None)
+}
+
+/// Insert or strengthen a vocabulary term, recording the user's
+/// `output_language` at the time of the sighting.  This is what the
+/// learning pipeline calls so the keyterms slate can be filtered by
+/// language at recording time (no Devanagari leaking into English-mode
+/// Deepgram requests).
+pub fn upsert_for_language(
+    pool:    &DbPool,
+    user_id: &str,
+    term:    &str,
+    bump:    f64,
+    source:  &str,
+    language: &str,
+) -> bool {
+    upsert_inner(pool, user_id, term, bump, source, Some(language))
+}
+
+fn upsert_inner(
+    pool:    &DbPool,
+    user_id: &str,
+    term:    &str,
+    bump:    f64,
+    source:  &str,
+    language: Option<&str>,
 ) -> bool {
     let conn = match pool.get() {
         Ok(c) => c,
@@ -46,22 +75,47 @@ pub fn upsert(
         return false;
     }
     let now = now_ms();
-    let n = conn.execute(
-        "INSERT INTO vocabulary (user_id, term, weight, use_count, last_used, source)
-         VALUES (?1, ?2, ?3, 1, ?4, ?5)
-         ON CONFLICT(user_id, term) DO UPDATE SET
-            weight    = MIN(5.0, weight + ?3),
-            use_count = use_count + 1,
-            last_used = excluded.last_used,
-            source    = CASE
-                          WHEN vocabulary.source = 'starred' THEN 'starred'
-                          ELSE excluded.source
-                        END",
-        params![user_id, trimmed, bump, now, source],
-    );
+    // SQLite doesn't allow conditional column lists in a single prepared
+    // statement, so we run two slightly different statements depending on
+    // whether language is supplied.  Either path uses the same upsert
+    // semantics for weight + use_count.
+    let n = match language {
+        Some(lang) => conn.execute(
+            "INSERT INTO vocabulary
+                 (user_id, term, weight, use_count, last_used, source, language)
+             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6)
+             ON CONFLICT(user_id, term) DO UPDATE SET
+                weight    = MIN(5.0, weight + ?3),
+                use_count = use_count + 1,
+                last_used = excluded.last_used,
+                language  = excluded.language,
+                source    = CASE
+                              WHEN vocabulary.source = 'starred' THEN 'starred'
+                              ELSE excluded.source
+                            END",
+            params![user_id, trimmed, bump, now, source, lang],
+        ),
+        None => conn.execute(
+            "INSERT INTO vocabulary
+                 (user_id, term, weight, use_count, last_used, source)
+             VALUES (?1, ?2, ?3, 1, ?4, ?5)
+             ON CONFLICT(user_id, term) DO UPDATE SET
+                weight    = MIN(5.0, weight + ?3),
+                use_count = use_count + 1,
+                last_used = excluded.last_used,
+                source    = CASE
+                              WHEN vocabulary.source = 'starred' THEN 'starred'
+                              ELSE excluded.source
+                            END",
+            params![user_id, trimmed, bump, now, source],
+        ),
+    };
     match n {
         Ok(rows) => {
-            info!("[vocab] upsert term={trimmed:?} bump={bump} rows={rows}");
+            info!(
+                "[vocab] upsert term={trimmed:?} bump={bump} lang={:?} rows={rows}",
+                language,
+            );
             rows > 0
         }
         Err(e) => {
@@ -140,6 +194,36 @@ pub fn top_term_strings(pool: &DbPool, user_id: &str, limit: usize) -> Vec<Strin
         .collect()
 }
 
+/// Top-N vocabulary terms scoped to a specific language.  Rows whose
+/// `language` is NULL (legacy / language-agnostic) are always included so
+/// the backfill from before migration 013 doesn't disappear from the
+/// keyterms slate overnight.
+pub fn top_term_strings_for_language(
+    pool:     &DbPool,
+    user_id:  &str,
+    language: &str,
+    limit:    usize,
+) -> Vec<String> {
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT term FROM vocabulary
+          WHERE user_id = ?1
+            AND (language = ?2 OR language IS NULL)
+          ORDER BY weight DESC, last_used DESC
+          LIMIT ?3",
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    stmt.query_map(params![user_id, language, limit as i64], |row| row.get::<_, String>(0))
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+}
+
 /// Total count of vocabulary entries for a user (UI badge).
 pub fn count(pool: &DbPool, user_id: &str) -> i64 {
     let conn = match pool.get() {
@@ -173,6 +257,7 @@ mod tests {
                  use_count INTEGER NOT NULL DEFAULT 1,
                  last_used INTEGER NOT NULL,
                  source    TEXT NOT NULL DEFAULT 'auto',
+                 language  TEXT,
                  UNIQUE(user_id, term)
              );"
         ).unwrap();
@@ -232,6 +317,27 @@ mod tests {
         let pool = mem_pool();
         assert!(!upsert(&pool, "u1", "  ", 1.0, "auto"));
         assert_eq!(count(&pool, "u1"), 0);
+    }
+
+    #[test]
+    fn per_language_filter_only_returns_matching_or_null() {
+        let pool = mem_pool();
+        // Pre-013 row (language = NULL) — should always show.
+        upsert(&pool, "u1", "legacy_term", 2.0, "auto");
+        // English-bucketed term.
+        upsert_for_language(&pool, "u1", "english_term", 1.0, "auto", "english");
+        // Hinglish-bucketed term.
+        upsert_for_language(&pool, "u1", "hinglish_term", 1.0, "auto", "hinglish");
+
+        let english = top_term_strings_for_language(&pool, "u1", "english", 10);
+        assert!(english.contains(&"legacy_term".into()),    "legacy term must be returned");
+        assert!(english.contains(&"english_term".into()),   "english bucket must be returned");
+        assert!(!english.contains(&"hinglish_term".into()), "hinglish term must NOT leak into english");
+
+        let hinglish = top_term_strings_for_language(&pool, "u1", "hinglish", 10);
+        assert!(hinglish.contains(&"legacy_term".into()));
+        assert!(hinglish.contains(&"hinglish_term".into()));
+        assert!(!hinglish.contains(&"english_term".into()));
     }
 
     #[test]

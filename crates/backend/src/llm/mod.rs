@@ -4,6 +4,7 @@ pub mod gateway;
 pub mod gemini_direct;
 pub mod groq;
 pub mod openai_codex;
+pub mod phonetic_triage;
 pub mod phonetics;
 pub mod pre_filter;
 pub mod promotion_gate;

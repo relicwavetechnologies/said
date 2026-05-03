@@ -8,6 +8,7 @@ pub mod corrections;
 pub mod history;
 pub mod openai_oauth;
 pub mod pending_edits;
+pub mod pending_promotions;
 pub mod prefs;
 pub mod stt_replacements;
 pub mod users;
@@ -28,6 +29,7 @@ const MIGRATION_009: &str = include_str!("migrations/009_word_corrections.sql");
 const MIGRATION_010: &str = include_str!("migrations/010_groq_api_key.sql");
 const MIGRATION_011: &str = include_str!("migrations/011_embed_dims_256.sql");
 const MIGRATION_012: &str = include_str!("migrations/012_vocabulary_and_stt_replacements.sql");
+const MIGRATION_013: &str = include_str!("migrations/013_pending_promotions_and_language.sql");
 
 /// Open (or create) the SQLite database at `path`, run pending migrations,
 /// and return a connection pool.
@@ -161,6 +163,14 @@ fn run_migrations(pool: &DbPool) {
             .expect("migration 012 failed");
         conn.execute_batch("PRAGMA user_version = 12")
             .expect("failed to set user_version to 12");
+    }
+
+    if version < 13 {
+        info!("running migration 013_pending_promotions_and_language");
+        conn.execute_batch(MIGRATION_013)
+            .expect("migration 013 failed");
+        conn.execute_batch("PRAGMA user_version = 13")
+            .expect("failed to set user_version to 13");
     }
 }
 

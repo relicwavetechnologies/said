@@ -7,7 +7,7 @@
 //! POST   /v1/vocabulary/:term/star — toggle starred status (immune to demotion)
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
@@ -15,7 +15,7 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::{store::{vocabulary, now_ms}, AppState};
+use crate::{store::{vocabulary, prefs::get_prefs, now_ms}, AppState};
 
 // ── GET /v1/vocabulary/terms (hot path) ──────────────────────────────────────
 
@@ -24,8 +24,36 @@ pub struct TermsResponse {
     pub terms: Vec<String>,
 }
 
-pub async fn list_terms(State(state): State<AppState>) -> Json<TermsResponse> {
-    let terms = vocabulary::top_term_strings(&state.pool, &state.default_user_id, 100);
+#[derive(Deserialize, Default)]
+pub struct TermsQuery {
+    /// Optional output_language filter.  When supplied, returns only terms
+    /// learned in this language (plus legacy language=NULL terms).  Without
+    /// this, returns the language-agnostic top-N (legacy behaviour).
+    pub language: Option<String>,
+}
+
+pub async fn list_terms(
+    State(state): State<AppState>,
+    Query(q):     Query<TermsQuery>,
+) -> Json<TermsResponse> {
+    // Resolve effective language: explicit query parameter wins, else fall
+    // back to the user's stored output_language preference.  This means the
+    // desktop hot path automatically gets language-bucketed keyterms with
+    // no client-side change required.
+    let lang = q.language
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            get_prefs(&state.pool, &state.default_user_id)
+                .map(|p| p.output_language)
+                .filter(|s| !s.trim().is_empty())
+        });
+
+    let terms = match lang.as_deref() {
+        Some(lang) => vocabulary::top_term_strings_for_language(
+            &state.pool, &state.default_user_id, lang, 100,
+        ),
+        None => vocabulary::top_term_strings(&state.pool, &state.default_user_id, 100),
+    };
     Json(TermsResponse { terms })
 }
 

@@ -1969,7 +1969,10 @@ async fn watch_for_edit(
     // a UI placeholder ("Type / for commands") that replaces the actual edit.
     let mut best_candidate = post_paste.clone();
     let mut idle_at = Instant::now();
-    let started = Instant::now();
+    let started     = Instant::now();
+    // Capture-error metadata, hoisted so we can ship it to the backend's
+    // CAPTURE_ERROR pre-filter alongside the edit text.
+    let mut app_switched_during_capture: bool = false;
 
     tracing::info!(
         "[edit-watch] watching {recording_id} — initial field readable: {} (len={})",
@@ -1993,6 +1996,7 @@ async fn watch_for_edit(
             (Some(a), Some(b)) if a != b
         );
         if pid_switched {
+            app_switched_during_capture = true;
             break;
         }
 
@@ -2228,7 +2232,16 @@ async fn watch_for_edit(
 
     let ep_opt = back_arc.lock().ok().and_then(|g| g.clone());
     if let Some(ref ep) = ep_opt {
-        match api::classify_edit(ep, &recording_id, &polished, &user_kept, capture_method).await {
+        let capture_meta = api::CaptureMeta {
+            time_since_paste_ms: watch_start.elapsed().as_millis() as u64,
+            app_switched:        app_switched_during_capture,
+            // matches_clipboard is left false for now — wiring it requires
+            // careful sequencing with the end-of-loop Cmd+A+C path; deferred
+            // to a follow-up so this PR stays focused on the four foundational
+            // accuracy fixes.
+            matches_clipboard:   false,
+        };
+        match api::classify_edit(ep, &recording_id, &polished, &user_kept, capture_method, capture_meta).await {
             Ok(resp) => {
                 tracing::info!(
                     "[edit-watch] classifier: class={} promoted={} repeat={} learned={} notify={} reason={:?} pending={:?}",

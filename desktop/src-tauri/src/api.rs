@@ -778,19 +778,33 @@ pub struct ClassifyEditResponse {
 /// the original transcript and calls Groq.  Promotion happens server-side:
 /// STT_ERROR auto-promotes on first sighting; POLISH_ERROR promotes only on
 /// repeat; REPHRASE/REWRITE do nothing.
+/// Capture-error metadata.  Sent alongside the edit so the backend's
+/// CAPTURE_ERROR pre-filter can cheaply reject obvious bad signals
+/// (app-switch, paste-on-top, stale capture) before any pipeline cost.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CaptureMeta {
+    pub time_since_paste_ms: u64,
+    pub app_switched:        bool,
+    pub matches_clipboard:   bool,
+}
+
 pub async fn classify_edit(
     ep: &BackendEndpoint,
     recording_id: &str,
     ai_output: &str,
     user_kept: &str,
     capture_method: &str,
+    capture_meta:   CaptureMeta,
 ) -> Result<ClassifyEditResponse, String> {
     let url = format!("{}/v1/classify-edit", ep.url);
     let body = serde_json::json!({
-        "recording_id":   recording_id,
-        "ai_output":      ai_output,
-        "user_kept":      user_kept,
-        "capture_method": capture_method,
+        "recording_id":        recording_id,
+        "ai_output":           ai_output,
+        "user_kept":           user_kept,
+        "capture_method":      capture_method,
+        "time_since_paste_ms": capture_meta.time_since_paste_ms,
+        "app_switched":        capture_meta.app_switched,
+        "matches_clipboard":   capture_meta.matches_clipboard,
     });
     Client::new()
         .post(&url)
@@ -813,7 +827,24 @@ pub struct VocabTermsResponse {
 }
 
 pub async fn get_vocabulary_terms(ep: &BackendEndpoint) -> Result<Vec<String>, String> {
-    let url = format!("{}/v1/vocabulary/terms", ep.url);
+    get_vocabulary_terms_for_language(ep, None).await
+}
+
+/// Same as `get_vocabulary_terms` but scoped to a language bucket.  Pass the
+/// user's current `output_language` so the keyterms slate doesn't leak
+/// Devanagari into English mode (or vice versa).  `None` returns the
+/// language-agnostic top-N (legacy behaviour).
+pub async fn get_vocabulary_terms_for_language(
+    ep:       &BackendEndpoint,
+    language: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let url = match language {
+        Some(lang) if !lang.trim().is_empty() => format!(
+            "{}/v1/vocabulary/terms?language={}",
+            ep.url, urlencoding_encode(lang),
+        ),
+        _ => format!("{}/v1/vocabulary/terms", ep.url),
+    };
     let resp = Client::new()
         .get(&url)
         .header("Authorization", ep.bearer())

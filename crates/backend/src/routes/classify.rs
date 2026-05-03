@@ -33,11 +33,12 @@ use tracing::{info, warn};
 use crate::{
     llm::{
         classifier, classifier::{EditClass, LabelledHunk},
-        edit_diff, phonetics, pre_filter, promotion_gate,
+        edit_diff, edit_diff::Hunk,
+        phonetic_triage, phonetics, pre_filter, promotion_gate,
     },
     store::{
-        corrections, history, pending_edits, prefs::get_prefs,
-        stt_replacements, vocabulary,
+        corrections, history, pending_edits, pending_promotions,
+        prefs::get_prefs, stt_replacements, vocabulary,
     },
     AppState,
 };
@@ -54,9 +55,30 @@ pub struct ClassifyBody {
     /// Missing/unknown values are treated as `"ax"` for backward compatibility.
     #[serde(default = "default_capture_method")]
     pub capture_method: String,
+    /// Milliseconds elapsed between paste-completed and the captured edit.
+    /// Used by the CAPTURE_ERROR pre-filter to reject edits that arrived too
+    /// long after the paste (likely an unrelated edit, not a correction).
+    /// Missing → 0 (treated as "no signal", does not trigger the gate).
+    #[serde(default)]
+    pub time_since_paste_ms: u64,
+    /// True if the active app/window changed between paste and capture.
+    /// Almost always means the user moved on; the captured text rarely
+    /// belongs to our paste.
+    #[serde(default)]
+    pub app_switched: bool,
+    /// True if the captured `user_kept` matches the contents of the user's
+    /// clipboard at capture time.  Strong signal that what we read was the
+    /// user pasting more text on top of our paste — not a typed edit.
+    #[serde(default)]
+    pub matches_clipboard: bool,
 }
 
 fn default_capture_method() -> String { "ax".to_string() }
+
+/// Maximum elapsed-since-paste before we treat the edit as unrelated to
+/// our paste.  30 seconds is generous (covers slow human typing, longer
+/// thinking pauses) without being unbounded.
+const CAPTURE_STALE_MS: u64 = 30_000;
 
 /// Capture-confidence policy.  Maps the wire-level `capture_method` string
 /// into a single bool: "is this capture trustworthy enough to auto-promote?"
@@ -103,7 +125,46 @@ pub async fn classify(
         .map(|p| p.output_language.clone())
         .unwrap_or_else(|| "hinglish".into());
 
-    // 2. Run negative-signal demotion (independent of class).  If a previously
+    // 2. CAPTURE_ERROR gate.  Reject obvious bad signals before we burn any
+    //    pipeline budget on them.  Each check below corresponds to a real
+    //    failure mode in the AX/keystroke capture path:
+    //
+    //      • app_switched      — the user moved focus away mid-edit; whatever
+    //                            we read is almost certainly from a different
+    //                            text element and shouldn't be attributed to
+    //                            our paste.
+    //      • matches_clipboard — the captured text equals the user's clipboard
+    //                            at capture time.  They pasted something on
+    //                            top of our paste; the diff is meaningless.
+    //      • too late          — > 30 s after paste.  Either the user walked
+    //                            away or this is an entirely unrelated edit
+    //                            in the same field.
+    if body.app_switched {
+        info!("[classify] capture_error: app_switched between paste and capture for {}", body.recording_id);
+        return (
+            StatusCode::OK,
+            Json(empty_response("USER_REPHRASE", "capture_error: app changed mid-edit")),
+        );
+    }
+    if body.matches_clipboard {
+        info!("[classify] capture_error: kept text matches clipboard for {}", body.recording_id);
+        return (
+            StatusCode::OK,
+            Json(empty_response("USER_REPHRASE", "capture_error: kept matches clipboard (user pasted)")),
+        );
+    }
+    if body.time_since_paste_ms > CAPTURE_STALE_MS {
+        info!(
+            "[classify] capture_error: stale capture ({}ms after paste) for {}",
+            body.time_since_paste_ms, body.recording_id,
+        );
+        return (
+            StatusCode::OK,
+            Json(empty_response("USER_REPHRASE", "capture_error: edit arrived > 30 s after paste")),
+        );
+    }
+
+    // 3. Run negative-signal demotion (independent of class).  If a previously
     //    promoted vocab term appears in polish but is removed in user_kept,
     //    decrement its weight.  Always runs — even on REWRITE/REPHRASE.
     let demoted = run_demotion_pass(&state, &body.ai_output, &body.user_kept);
@@ -111,7 +172,7 @@ pub async fn classify(
         info!("[classify] demoted {demoted} vocabulary term(s) on this edit");
     }
 
-    // 3. STAGE 1 — Pre-filter.
+    // 4. STAGE 1 — Pre-filter.
     match pre_filter::run(&body.ai_output, &body.user_kept, &output_language) {
         pre_filter::PreFilter::Drop => {
             info!("[classify] pre-filter: drop (no real edit) for {}", body.recording_id);
@@ -145,26 +206,62 @@ pub async fn classify(
     }
     info!("[classify] diff produced {} hunk(s) for {}", hunks.len(), body.recording_id);
 
-    // 5. STAGE 3 — LLM labeler.
-    let groq_key = prefs
-        .as_ref()
-        .and_then(|p| p.groq_api_key.clone())
-        .or_else(|| std::env::var("GROQ_API_KEY").ok())
-        .unwrap_or_default();
-    let http   = state.http_client.clone();
-    let result = match classifier::classify_edit(
-        &http, &groq_key, &transcript, &body.ai_output, &body.user_kept,
-        &hunks, &output_language,
-    ).await {
-        Some(r) => r,
-        None    => {
-            info!("[classify] classifier unavailable — skipping for {}", body.recording_id);
-            return (
-                StatusCode::OK,
-                Json(empty_response("USER_REPHRASE", "classifier unavailable")),
-            );
+    // 5. STAGE 2.5 — Phonetic triage.  For each hunk, decide cheaply whether
+    //    its class is obvious (clear typo/case-fix → STT_ERROR; clear synonym
+    //    swap → USER_REPHRASE).  Hunks that resolve here skip the LLM entirely.
+    //    Ambiguous hunks fall through.
+    let triage = phonetic_triage::triage(&hunks);
+    let resolved_count = triage
+        .iter()
+        .filter(|d| matches!(d, phonetic_triage::TriageDecision::Resolved(_)))
+        .count();
+    if resolved_count > 0 {
+        info!(
+            "[classify] triage resolved {}/{} hunk(s) without LLM",
+            resolved_count, triage.len(),
+        );
+    }
+    let ambiguous_hunks: Vec<Hunk> = triage
+        .iter()
+        .zip(hunks.iter())
+        .filter(|(d, _)| matches!(d, phonetic_triage::TriageDecision::Ambiguous))
+        .map(|(_, h)| h.clone())
+        .collect();
+
+    // 6. STAGE 3 — LLM labeler (only for hunks the triage couldn't resolve).
+    //    If everything was resolved, we skip the API call entirely.
+    let llm_result = if ambiguous_hunks.is_empty() {
+        info!("[classify] all hunks resolved by triage — no LLM call");
+        None
+    } else {
+        let groq_key = prefs
+            .as_ref()
+            .and_then(|p| p.groq_api_key.clone())
+            .or_else(|| std::env::var("GROQ_API_KEY").ok())
+            .unwrap_or_default();
+        let http = state.http_client.clone();
+        match classifier::classify_edit(
+            &http, &groq_key, &transcript, &body.ai_output, &body.user_kept,
+            &ambiguous_hunks, &output_language,
+        ).await {
+            Some(r) => Some(r),
+            None    => {
+                // LLM failed — but we may still have triage-resolved hunks to act on.
+                // If we have NOTHING actionable, return the unavailable signal.
+                if resolved_count == 0 {
+                    info!("[classify] classifier unavailable — skipping for {}", body.recording_id);
+                    return (
+                        StatusCode::OK,
+                        Json(empty_response("USER_REPHRASE", "classifier unavailable")),
+                    );
+                }
+                None
+            }
         }
     };
+
+    // 7. Merge triage-resolved + LLM-labelled hunks back into one ordered set.
+    let result = merge_triage_with_llm(triage, llm_result);
 
     // 6. STAGE 4 — Promotion gates + write artifacts.
     let mut promoted_count = 0_usize;
@@ -186,6 +283,13 @@ pub async fn classify(
         );
     }
 
+    // Best-effort housekeeping: drop pending-promotion rows older than 30 days
+    // so abandoned candidates don't sit forever waiting for a confirming sighting
+    // that will never come.
+    let _ = pending_promotions::prune_stale(
+        &state.pool, &state.default_user_id, 30 * 24 * 3600 * 1000,
+    );
+
     for cand in &result.candidates {
         let correct = cand.correct_form().trim();
         if correct.is_empty() { continue; }
@@ -196,18 +300,42 @@ pub async fn classify(
                 if !stt_promotion_allowed(cand, correct, &body.user_kept, &output_language) {
                     continue;
                 }
-                if vocabulary::upsert(&state.pool, &state.default_user_id, correct, 1.0, "auto") {
+
+                // K-event promotion gate.  First sighting → record as pending,
+                // do NOT touch live vocab.  Second sighting (with same phonetic
+                // key) → promote to live vocab and clear pending row.
+                let from = cand.transcript_form().trim();
+                let decision = pending_promotions::record_sighting(
+                    &state.pool, &state.default_user_id,
+                    correct, from, &output_language,
+                    pending_promotions::DEFAULT_K,
+                );
+                let promote_now = matches!(
+                    decision, Some(pending_promotions::PromotionDecision::Promote { .. }),
+                );
+                if !promote_now {
+                    info!(
+                        "[classify] STT_ERROR queued — sighting recorded but k-threshold not met for {correct:?}",
+                    );
+                    continue;
+                }
+
+                if vocabulary::upsert_for_language(
+                    &state.pool, &state.default_user_id, correct, 1.0, "auto", &output_language,
+                ) {
                     learned = true;
                     promoted_count += 1;
                     promoted_terms.push(correct.to_string());
                 }
-                let from = cand.transcript_form().trim();
                 if !from.is_empty()
                     && !from.eq_ignore_ascii_case(correct)
                     && stt_replacements::upsert(&state.pool, &state.default_user_id, from, correct, 1.0)
                 {
                     promoted_count += 1;
                 }
+                pending_promotions::delete(
+                    &state.pool, &state.default_user_id, correct, &output_language,
+                );
                 if vocabulary::top_terms(&state.pool, &state.default_user_id, 200)
                     .iter()
                     .any(|t| t.term.eq_ignore_ascii_case(correct) && t.use_count > 1)
@@ -387,6 +515,63 @@ fn correction_exists(state: &AppState, wrong: &str) -> bool {
         |row| row.get(0),
     ).unwrap_or(0);
     count > 0
+}
+
+/// Merge phonetic-triage decisions with the LLM's labels for the ambiguous
+/// hunks.  Triage-resolved hunks keep their synthetic labels; ambiguous hunks
+/// take their labels from the LLM result (in input order).  The returned
+/// `ClassifyResult` looks identical to one produced by the all-LLM path, so
+/// the rest of the route doesn't care which source labelled which hunk.
+fn merge_triage_with_llm(
+    triage:     Vec<phonetic_triage::TriageDecision>,
+    llm_result: Option<classifier::ClassifyResult>,
+) -> classifier::ClassifyResult {
+    let mut llm_iter = llm_result
+        .as_ref()
+        .map(|r| r.candidates.clone())
+        .unwrap_or_default()
+        .into_iter();
+
+    let mut candidates: Vec<LabelledHunk> = Vec::with_capacity(triage.len());
+    for d in triage {
+        match d {
+            phonetic_triage::TriageDecision::Resolved(lh) => candidates.push(lh),
+            phonetic_triage::TriageDecision::Ambiguous     => {
+                if let Some(lh) = llm_iter.next() {
+                    candidates.push(lh);
+                }
+                // If the LLM didn't return a label for an ambiguous hunk
+                // (failure / response-shape mismatch), we drop it — better
+                // to ignore one signal than to hallucinate a class.
+            }
+        }
+    }
+
+    // Compute overall class — priority order STT_ERROR > POLISH_ERROR
+    // > USER_REWRITE > USER_REPHRASE.
+    let overall = candidates
+        .iter()
+        .map(|c| c.class)
+        .max_by_key(|c| match c {
+            EditClass::SttError     => 4,
+            EditClass::PolishError  => 3,
+            EditClass::UserRewrite  => 2,
+            EditClass::UserRephrase => 1,
+        })
+        .unwrap_or(EditClass::UserRephrase);
+
+    let confidence = if candidates.is_empty() {
+        0.0
+    } else {
+        candidates.iter().map(|c| c.confidence).sum::<f64>() / candidates.len() as f64
+    };
+
+    let reason = match &llm_result {
+        Some(r) if !r.reason.is_empty() => r.reason.clone(),
+        _ => "phonetic triage labelled all hunks without LLM".to_string(),
+    };
+
+    classifier::ClassifyResult { class: overall, reason, candidates, confidence }
 }
 
 fn empty_response(class: &str, reason: &str) -> ClassifyResponse {
