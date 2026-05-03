@@ -169,8 +169,9 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
     let vocab_entries_pre: Vec<VocabEntry> = vocab_full
         .iter()
         .map(|v| VocabEntry {
-            term:    v.term.clone(),
-            context: v.example_context.clone(),
+            term:      v.term.clone(),
+            context:   v.example_context.clone(),
+            term_type: v.term_type.clone(),
         })
         .collect();
 
@@ -311,8 +312,9 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
                 info!("[voice] vocab selector picked {}/{} entries (relevance-aware)",
                       chosen.len(), vocab_full.len());
                 chosen.into_iter().map(|v| VocabEntry {
-                    term:    v.term,
-                    context: v.example_context,
+                    term:      v.term,
+                    context:   v.example_context,
+                    term_type: v.term_type,
                 }).collect()
             }
         };

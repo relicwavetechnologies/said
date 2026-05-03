@@ -32,6 +32,71 @@ pub struct VocabTerm {
     /// "MACOBS ka IPO ka 12 hazaar batana"). Nullable for legacy rows.
     #[serde(default)]
     pub example_context: Option<String>,
+    /// Term-type classification used by the polish prompt to reason from
+    /// structured signals (acronym vs proper noun vs common word) instead
+    /// of needing hardcoded exception lists. See `classify_term_type()`.
+    #[serde(default)]
+    pub term_type: Option<String>,
+}
+
+/// Classify a term's lexical shape into one of the polish-prompt categories.
+///
+/// The polish LLM uses this to reason about whether a transcript candidate
+/// is *type-compatible* with the canonical. An acronym vocab entry should
+/// not match a single common English word; a proper noun should match a
+/// name-shaped token; a code identifier should match a digit/underscore-
+/// bearing token; etc.
+///
+/// Cheap heuristic — same signals as `phonetics::jargon_score` but
+/// returning a category instead of a numeric score. No LLM call, no
+/// network. Conservative: when no signal fires we return "other" rather
+/// than guess.
+///
+/// Categories:
+///   "phrase"          — multi-word
+///   "acronym"         — all-caps alphabetic, 2-8 chars (NASA, MACOBS, IPO)
+///   "code_identifier" — contains digits, underscores, or hyphens (n8n, k8s, snake_case)
+///   "brand"           — mixed case (iPhone, OpenAI, ClaudeCode)
+///   "proper_noun"     — initial-cap + rest-lowercase, ≥4 chars (Anish, Vipassana)
+///   "other"           — none of the above (likely generic / common word)
+pub fn classify_term_type(term: &str) -> &'static str {
+    let t = term.trim();
+    if t.is_empty() { return "other"; }
+
+    // Multi-word → phrase (highest priority — overrides single-word checks)
+    if t.contains(char::is_whitespace) {
+        return "phrase";
+    }
+
+    let alpha_only = t.chars().all(|c| c.is_ascii_alphabetic());
+    let has_lower  = t.chars().any(|c| c.is_ascii_lowercase());
+    let has_upper  = t.chars().any(|c| c.is_ascii_uppercase());
+    let has_digit  = t.chars().any(|c| c.is_ascii_digit());
+    let len        = t.chars().count();
+    let upper_after_first = t.chars().enumerate()
+        .any(|(i, c)| i > 0 && c.is_ascii_uppercase());
+
+    // All-caps acronym: alphabetic, 2-8 chars, no lowercase
+    if alpha_only && has_upper && !has_lower && (2..=8).contains(&len) {
+        return "acronym";
+    }
+    // Code identifier: digits OR underscore OR hyphen
+    if has_digit || t.contains('_') || t.contains('-') {
+        return "code_identifier";
+    }
+    // Brand / mixed-case: uppercase AFTER position 0
+    if has_lower && upper_after_first {
+        return "brand";
+    }
+    // Proper noun: initial-cap, rest lowercase, ≥4 chars
+    if alpha_only && len >= 4 {
+        let first = t.chars().next().unwrap();
+        let rest_lower = t.chars().skip(1).all(|c| c.is_ascii_lowercase());
+        if first.is_ascii_uppercase() && rest_lower {
+            return "proper_noun";
+        }
+    }
+    "other"
 }
 
 /// Insert or strengthen a vocabulary term (language-agnostic — kept for
@@ -120,41 +185,49 @@ fn upsert_inner(
             s.to_string()
         }
     });
+    // Classify the term's lexical shape (acronym / brand / proper noun /
+    // code identifier / phrase / other) so the polish prompt can render
+    // structured, type-aware entries instead of bare tokens. Cheap
+    // heuristic, no LLM call. Always recomputed (idempotent).
+    let term_type = classify_term_type(trimmed);
     // ON CONFLICT for example_context: COALESCE keeps the first-observed
     // context (most representative; later sightings of the same term may
-    // be in a generic sentence that strips meaning). New rows always set
-    // it; updates only fill in if previously NULL.
+    // be in a generic sentence that strips meaning). term_type is always
+    // refreshed because the classifier is deterministic — re-running it
+    // never changes the answer for the same term.
     let n = match language {
         Some(lang) => conn.execute(
             "INSERT INTO vocabulary
-                 (user_id, term, weight, use_count, last_used, source, language, example_context)
-             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7)
+                 (user_id, term, weight, use_count, last_used, source, language, example_context, term_type)
+             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(user_id, term) DO UPDATE SET
                 weight    = MIN(5.0, weight + ?3),
                 use_count = use_count + 1,
                 last_used = excluded.last_used,
                 language  = excluded.language,
                 example_context = COALESCE(vocabulary.example_context, excluded.example_context),
+                term_type = excluded.term_type,
                 source    = CASE
                               WHEN vocabulary.source = 'starred' THEN 'starred'
                               ELSE excluded.source
                             END",
-            params![user_id, trimmed, bump, now, source, lang, trimmed_ctx],
+            params![user_id, trimmed, bump, now, source, lang, trimmed_ctx, term_type],
         ),
         None => conn.execute(
             "INSERT INTO vocabulary
-                 (user_id, term, weight, use_count, last_used, source, example_context)
-             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6)
+                 (user_id, term, weight, use_count, last_used, source, example_context, term_type)
+             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7)
              ON CONFLICT(user_id, term) DO UPDATE SET
                 weight    = MIN(5.0, weight + ?3),
                 use_count = use_count + 1,
                 last_used = excluded.last_used,
                 example_context = COALESCE(vocabulary.example_context, excluded.example_context),
+                term_type = excluded.term_type,
                 source    = CASE
                               WHEN vocabulary.source = 'starred' THEN 'starred'
                               ELSE excluded.source
                             END",
-            params![user_id, trimmed, bump, now, source, trimmed_ctx],
+            params![user_id, trimmed, bump, now, source, trimmed_ctx, term_type],
         ),
     };
     match n {
@@ -210,7 +283,7 @@ pub fn top_terms(pool: &DbPool, user_id: &str, limit: usize) -> Vec<VocabTerm> {
         Err(_) => return vec![],
     };
     let mut stmt = match conn.prepare(
-        "SELECT term, weight, use_count, last_used, source, example_context
+        "SELECT term, weight, use_count, last_used, source, example_context, term_type
            FROM vocabulary
           WHERE user_id = ?1
           ORDER BY weight DESC, last_used DESC
@@ -227,6 +300,7 @@ pub fn top_terms(pool: &DbPool, user_id: &str, limit: usize) -> Vec<VocabTerm> {
             last_used:       row.get(3)?,
             source:          row.get(4)?,
             example_context: row.get(5).ok(),
+            term_type:       row.get(6).ok(),
         })
     })
     .ok()
@@ -307,6 +381,7 @@ mod tests {
                  source           TEXT NOT NULL DEFAULT 'auto',
                  language         TEXT,
                  example_context  TEXT,
+                 term_type        TEXT,
                  UNIQUE(user_id, term)
              );"
         ).unwrap();
@@ -387,6 +462,79 @@ mod tests {
         assert!(hinglish.contains(&"legacy_term".into()));
         assert!(hinglish.contains(&"hinglish_term".into()));
         assert!(!hinglish.contains(&"english_term".into()));
+    }
+
+    // ── Term type classifier ──────────────────────────────────────────────────
+
+    #[test]
+    fn classify_term_type_acronyms() {
+        assert_eq!(classify_term_type("MACOBS"), "acronym");
+        assert_eq!(classify_term_type("NASA"),   "acronym");
+        assert_eq!(classify_term_type("IPO"),    "acronym");
+        assert_eq!(classify_term_type("FBI"),    "acronym");
+        assert_eq!(classify_term_type("EMIAC"),  "acronym");
+    }
+
+    #[test]
+    fn classify_term_type_proper_nouns() {
+        assert_eq!(classify_term_type("Anish"),     "proper_noun");
+        assert_eq!(classify_term_type("Vipassana"), "proper_noun");
+        assert_eq!(classify_term_type("Cursor"),    "proper_noun");
+        assert_eq!(classify_term_type("Linear"),    "proper_noun");
+    }
+
+    #[test]
+    fn classify_term_type_brands_mixed_case() {
+        assert_eq!(classify_term_type("iPhone"),     "brand");
+        assert_eq!(classify_term_type("OpenAI"),     "brand");
+        assert_eq!(classify_term_type("ClaudeCode"), "brand");
+    }
+
+    #[test]
+    fn classify_term_type_code_identifiers() {
+        assert_eq!(classify_term_type("n8n"),       "code_identifier");
+        assert_eq!(classify_term_type("k8s"),       "code_identifier");
+        assert_eq!(classify_term_type("snake_case"),"code_identifier");
+        assert_eq!(classify_term_type("kebab-case"),"code_identifier");
+    }
+
+    #[test]
+    fn classify_term_type_phrases() {
+        assert_eq!(classify_term_type("Cloud Code"),       "phrase");
+        assert_eq!(classify_term_type("Hello World Inc."), "phrase");
+    }
+
+    #[test]
+    fn classify_term_type_falls_back_to_other() {
+        // The bug-class words: common single-case words don't have a strong
+        // type signal, so they fall into "other". The polish prompt then
+        // renders them without a type tag and the LLM treats them with extra
+        // care. (In practice users shouldn't add these as vocab — but if they
+        // do, we don't pretend they're jargon.)
+        assert_eq!(classify_term_type("hello"),  "other");
+        assert_eq!(classify_term_type("world"),  "other");
+        assert_eq!(classify_term_type("a"),      "other");  // too short for proper_noun
+        assert_eq!(classify_term_type("the"),    "other");  // sentence-case but only 3 chars
+    }
+
+    #[test]
+    fn classify_term_type_empty_safe() {
+        assert_eq!(classify_term_type(""),    "other");
+        assert_eq!(classify_term_type("   "), "other");
+    }
+
+    #[test]
+    fn upsert_writes_term_type_to_db() {
+        let pool = mem_pool();
+        upsert_for_language(&pool, "u1", "MACOBS", 1.0, "auto", "english");
+        upsert_for_language(&pool, "u1", "Anish",  1.0, "auto", "english");
+        upsert_for_language(&pool, "u1", "n8n",    1.0, "auto", "english");
+        let terms = top_terms(&pool, "u1", 10);
+        let by_term: std::collections::HashMap<_, _> =
+            terms.iter().map(|t| (t.term.as_str(), t.term_type.as_deref())).collect();
+        assert_eq!(by_term.get("MACOBS").and_then(|x| *x), Some("acronym"));
+        assert_eq!(by_term.get("Anish").and_then(|x| *x),  Some("proper_noun"));
+        assert_eq!(by_term.get("n8n").and_then(|x| *x),    Some("code_identifier"));
     }
 
     #[test]

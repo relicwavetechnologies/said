@@ -118,7 +118,11 @@ pub async fn polish(
         let vocab_entries: Vec<VocabEntry> = if tone_override.is_none() {
             vocabulary::top_terms(&pool, &user_id, 100)
                 .into_iter()
-                .map(|v| VocabEntry { term: v.term, context: v.example_context })
+                .map(|v| VocabEntry {
+                    term:      v.term,
+                    context:   v.example_context,
+                    term_type: v.term_type,
+                })
                 .collect()
         } else {
             vec![]

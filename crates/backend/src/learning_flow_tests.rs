@@ -37,6 +37,7 @@ fn pool() -> DbPool {
              source           TEXT NOT NULL DEFAULT 'auto',
              language         TEXT,
              example_context  TEXT,
+             term_type        TEXT,
              UNIQUE(user_id, term)
          );
 

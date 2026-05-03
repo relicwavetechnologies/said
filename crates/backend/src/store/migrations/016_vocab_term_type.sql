@@ -1,0 +1,22 @@
+-- Migration 016 — typed vocabulary entries.
+--
+-- Each vocab term gets a `term_type` classification so the polish LLM can
+-- reason from structured signals instead of needing hardcoded exception
+-- lists in the prompt. Without type info, the LLM sees a flat list of
+-- terms and has no way to tell "MACOBS is an all-caps acronym" from
+-- "main is a common English word" — it falls back on weak phonetic
+-- intuitions and over-replaces.
+--
+-- Categories (string for forward-compat; no enum table):
+--   "acronym"          — all-caps short tokens (NASA, IPO, MACOBS)
+--   "proper_noun"      — initial-cap names (Anish, Cursor, Vipassana)
+--   "brand"            — mixed-case (iPhone, OpenAI, ClaudeCode)
+--   "code_identifier"  — digits, underscores, hyphens (n8n, k8s, snake_case)
+--   "phrase"           — multi-word phrase (Cloud Code → ClaudeCode)
+--   "other"            — fallback when no signal fires (rare)
+--
+-- Nullable so existing pre-016 rows keep working; the polish prompt
+-- treats NULL term_type as "other" (no shape signal) and falls back to
+-- the bare-term presentation.
+
+ALTER TABLE vocabulary ADD COLUMN term_type TEXT;

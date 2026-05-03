@@ -33,6 +33,7 @@ const MIGRATION_012: &str = include_str!("migrations/012_vocabulary_and_stt_repl
 const MIGRATION_013: &str = include_str!("migrations/013_pending_promotions_and_language.sql");
 const MIGRATION_014: &str = include_str!("migrations/014_vocabulary_example_context.sql");
 const MIGRATION_015: &str = include_str!("migrations/015_vocab_embeddings.sql");
+const MIGRATION_016: &str = include_str!("migrations/016_vocab_term_type.sql");
 
 /// Open (or create) the SQLite database at `path`, run pending migrations,
 /// and return a connection pool.
@@ -190,6 +191,14 @@ fn run_migrations(pool: &DbPool) {
             .expect("migration 015 failed");
         conn.execute_batch("PRAGMA user_version = 15")
             .expect("failed to set user_version to 15");
+    }
+
+    if version < 16 {
+        info!("running migration 016_vocab_term_type");
+        conn.execute_batch(MIGRATION_016)
+            .expect("migration 016 failed");
+        conn.execute_batch("PRAGMA user_version = 16")
+            .expect("failed to set user_version to 16");
     }
 }
 

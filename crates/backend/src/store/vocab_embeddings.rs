@@ -30,6 +30,7 @@ struct VocabRow {
     last_used:       i64,
     source:          String,
     example_context: Option<String>,
+    term_type:       Option<String>,
 }
 
 impl VocabRow {
@@ -41,6 +42,7 @@ impl VocabRow {
             last_used:       self.last_used,
             source:          self.source,
             example_context: self.example_context,
+            term_type:       self.term_type,
         }
     }
 }
@@ -101,7 +103,7 @@ pub fn top_k_relevant(
 
     let mut stmt = match conn.prepare(
         "SELECT v.term, ve.embedding, v.weight, v.use_count, v.last_used,
-                v.source, v.example_context
+                v.source, v.example_context, v.term_type
            FROM vocab_embeddings ve
            JOIN vocabulary v
              ON v.user_id = ve.user_id AND v.term = ve.term
@@ -122,12 +124,13 @@ pub fn top_k_relevant(
             row.get::<_, i64>(4)?,
             row.get::<_, String>(5)?,
             row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
         ))
     })
     .ok()
     .map(|iter| {
         iter.filter_map(|r| r.ok())
-            .filter_map(|(term, blob, weight, uc, lu, src, ctx)| {
+            .filter_map(|(term, blob, weight, uc, lu, src, ctx, ty)| {
                 blob_to_floats(&blob).map(|embedding| VocabRow {
                     term,
                     embedding,
@@ -136,6 +139,7 @@ pub fn top_k_relevant(
                     last_used: lu,
                     source: src,
                     example_context: ctx,
+                    term_type: ty,
                 })
             })
             .collect()
@@ -281,6 +285,7 @@ mod tests {
                  source           TEXT NOT NULL DEFAULT 'auto',
                  language         TEXT,
                  example_context  TEXT,
+                 term_type        TEXT,
                  UNIQUE(user_id, term)
              );
              CREATE TABLE vocab_embeddings (

@@ -15,6 +15,32 @@
 
 use crate::store::{corrections::Correction, prefs::Preferences};
 
+/// Render a single vocab entry for the polish prompt. Output shape:
+///   `  MACOBS [acronym] — example: "MACOBS ka IPO ka 12 hazaar batana"`
+///   `  Anish [proper noun] — example: "Anish ne mail bhejna hai"`
+///   `  n8n [code identifier] — example: "I run n8n for automation"`
+///   `  Cloud Code [phrase] — example: "Cloud Code is faster"`
+///   `  TermWithoutContext [other]`
+///
+/// The bracketed type tag is what enables type-aware reasoning in the LLM —
+/// e.g. an acronym entry must not match a single common English word.
+fn format_vocab_entry(e: &VocabEntry) -> String {
+    let type_label = match e.term_type.as_deref() {
+        Some("acronym")          => " [acronym]",
+        Some("proper_noun")      => " [proper noun]",
+        Some("brand")            => " [brand]",
+        Some("code_identifier")  => " [code identifier]",
+        Some("phrase")           => " [phrase]",
+        Some("other") | None     => "",            // no signal — render bare
+        Some(other)              => return format!("  {} [{other}]", e.term),
+    };
+    match &e.context {
+        Some(ctx) if !ctx.trim().is_empty() =>
+            format!("  {}{type_label} — example: \"{}\"", e.term, ctx.trim()),
+        _ => format!("  {}{type_label}", e.term),
+    }
+}
+
 pub struct RagExample {
     pub ai_output: String,
     pub user_kept: String,
@@ -29,13 +55,19 @@ pub struct RagExample {
 /// the literal "main course" isn't a stored alias.
 #[derive(Clone)]
 pub struct VocabEntry {
-    pub term:    String,
-    pub context: Option<String>,
+    pub term:      String,
+    pub context:   Option<String>,
+    /// Lexical-shape classification ("acronym" / "proper_noun" / "brand" /
+    /// "code_identifier" / "phrase" / "other"). Used by the polish prompt
+    /// to render structured, type-aware entries so the LLM can reason from
+    /// signals (an acronym entry should not match a common single word)
+    /// instead of needing hardcoded exception lists.
+    pub term_type: Option<String>,
 }
 
 impl VocabEntry {
     pub fn from_term(term: impl Into<String>) -> Self {
-        Self { term: term.into(), context: None }
+        Self { term: term.into(), context: None, term_type: None }
     }
 }
 
@@ -92,58 +124,65 @@ pub fn build_system_prompt_with_vocab_entries(
     let tone         = tone_description(&prefs.tone_preset);
     let script_check = script_final_check(&prefs.output_language);
 
-    // Vocabulary preservation block — instructs the LLM to (a) keep known
-    // terms verbatim, (b) RECOGNISE phonetically-similar mishearings of
-    // them. Each entry may carry an example sentence the term was observed
-    // in — that's the foundational signal for context-aware recognition of
-    // unseen mishearings ("main course ka IPO" → MACOBS, when MACOBS's
-    // example is "MACOBS ka IPO ka 12 hazaar").
+    // Vocabulary preservation block — each entry is rendered as a STRUCTURED
+    // hypothesis the LLM evaluates per transcript: canonical + lexical type +
+    // example context. The type signal ("Acronym", "Proper noun", etc) is
+    // what lets the LLM reason about whether a transcript candidate is
+    // type-compatible with the canonical, instead of requiring a hardcoded
+    // exception list of common words.
+    //
+    // Design principle: we give the LLM the data it needs (term + type +
+    // context) and a small set of TYPE-AWARE matching rules. The LLM is the
+    // brain. We don't enumerate words to skip.
     let vocab_block = if vocabulary_entries.is_empty() {
         String::new()
     } else {
         let table = vocabulary_entries
             .iter()
-            .map(|e| match &e.context {
-                Some(ctx) if !ctx.trim().is_empty() => format!("  {} — example: \"{}\"", e.term, ctx.trim()),
-                _ => format!("  {}", e.term),
-            })
+            .map(format_vocab_entry)
             .collect::<Vec<_>>()
             .join("\n");
         format!(
             "<personal_vocabulary>\n\
-             The following are the user's personal vocabulary terms — names, \
-             brands, code identifiers, acronyms, technical terms — together \
-             with the example sentence each was first observed in. The example \
-             tells you the CONTEXT in which the user uses the term.\n\n\
-             RULES:\n\
-             1. If a term appears verbatim in the transcript, KEEP IT — same \
-             spelling, same case.\n\
-             2. Do NOT translate, expand, or substitute these terms.\n\
-             3. **COMMON-WORD SAFEGUARD (CRITICAL):** A standalone common word \
-             — \"main\", \"the\", \"a\", \"is\", \"of\", \"to\", \"in\", \"on\", \
-             \"and\", \"or\", \"course\", \"corps\", \"hai\", \"ka\", \"ki\", \
-             \"ko\", \"se\", \"par\" etc — is NEVER a candidate for replacement, \
-             regardless of how phonetically similar it might be to a vocabulary \
-             term. Only ENTIRE multi-word phrases (e.g. \"main corps\") or \
-             distinctly-shaped single tokens (acronyms, mixed-case identifiers, \
-             digit-bearing tokens like \"n8n\") can trigger replacement.\n\
-             4. RECOGNISE MISHEARINGS (with safeguard): if the transcript contains \
-             a multi-word phrase OR a distinctly-shaped token that is phonetically \
-             similar to a vocabulary term AND appears in a context that resembles \
-             the term's example, REPLACE the matched span with the canonical term.\n\
-                ✓ Vocab: `MACOBS — example: \"MACOBS ka IPO ka 12 hazaar batana\"`. \
-             Transcript: \"main course ka IPO ka 12 hazaar batana\" → multi-word \
-             phrase \"main course\" + matching IPO/finance context → output MACOBS.\n\
-                ✗ Vocab: `MACOBS — example: \"MACOBS ka IPO\"`. Transcript: \
-             \"main is here\" → standalone common word \"main\" → DO NOT replace, \
-             output \"main is here\" verbatim.\n\
-                ✗ Vocab: `MACOBS — example: \"MACOBS ka IPO\"`. Transcript: \
-             \"the main course at dinner\" → multi-word phrase \"main course\" but \
-             context (dinner) does NOT match → DO NOT replace.\n\
-             5. When in doubt — when the phonetic match is weak, when the context \
-             doesn't clearly match, when the candidate is a common English/Hinglish \
-             word — KEEP THE TRANSCRIPT AS-IS. Over-replacement (false positives) \
-             is far worse than under-replacement (the user can correct it once).\n\n\
+             The user has a personal vocabulary. Each entry below is a CANDIDATE \
+             you may emit when the transcript contains a phrase that the entry \
+             would canonicalise. Each entry has THREE pieces of structured \
+             information:\n\n\
+             • **canonical**  — the exact spelling/case to emit if you decide \
+             the entry applies\n\
+             • **type**       — the lexical shape of the canonical (acronym / \
+             proper noun / brand / code identifier / phrase / other)\n\
+             • **example**    — the situation the canonical was observed in \
+             (gives you the SEMANTIC context that has to match)\n\n\
+             TYPE-AWARE MATCHING RULES (no exception list — reason from the type):\n\n\
+             1. **Verbatim match**: if the canonical appears verbatim in the \
+             transcript, emit it unchanged.\n\n\
+             2. **Mishearing recognition**: emit the canonical in place of a \
+             transcript span ONLY when ALL of the following hold:\n\
+                a) The transcript span is **type-compatible** with the canonical:\n\
+                   • acronym canonical → matched span must be a multi-word phrase \
+                     or a distinctly-shaped token (e.g. \"main corps\" matches \
+                     acronym MACOBS; bare \"main\" does NOT — single common words \
+                     are never type-compatible with acronyms).\n\
+                   • proper_noun canonical → matched span is a name-shaped token \
+                     phonetically close to the canonical (anees / aniss / etc \
+                     for Anish).\n\
+                   • brand / code_identifier canonical → matched span is the \
+                     same shape (mixed case, digit-bearing, hyphenated, etc).\n\
+                   • phrase canonical → matched span is the SAME-LENGTH phrase, \
+                     phonetically close.\n\
+                b) The transcript context **resembles** the entry's example. The \
+                example tells you the topic; without topic match, do not replace.\n\
+                c) Phonetic similarity is meaningfully high — sharing only the \
+                first letter is NOT enough.\n\n\
+             3. **Default to keeping the transcript as-is.** Over-replacement is \
+             far worse than under-replacement: the user can correct a missed \
+             term once and the system learns; a wrong replacement looks like \
+             a bug. When ANY of (a), (b), (c) is uncertain, leave the \
+             transcript word alone.\n\n\
+             4. **Do NOT translate, expand, or generate** vocabulary tokens out \
+             of thin air. They appear in the output only if you matched them \
+             against a transcript span using the rules above.\n\n\
              {table}\n\
              </personal_vocabulary>\n\n"
         )
@@ -395,8 +434,8 @@ mod tests {
         assert!(prompt.contains("<personal_vocabulary>"), "vocab block should be emitted");
         assert!(prompt.contains("n8n"));
         assert!(prompt.contains("Vipassana"));
-        assert!(prompt.contains("KEEP IT"), "verbatim-keep instruction should appear");
-        assert!(prompt.contains("RECOGNISE MISHEARINGS"),
+        assert!(prompt.contains("Verbatim match"), "verbatim-keep instruction should appear");
+        assert!(prompt.contains("Mishearing recognition"),
                 "context-aware mishearing instruction should appear");
     }
 
@@ -408,48 +447,86 @@ mod tests {
         // conditional reference in <task>) must not be present.
         assert!(!prompt.contains("<personal_vocabulary>\n"),
                 "expected no vocabulary block when terms are empty");
-        assert!(!prompt.contains("RECOGNISE MISHEARINGS"),
+        assert!(!prompt.contains("Mishearing recognition"),
                 "vocab instructions should be gated on having terms");
     }
 
     #[test]
-    fn vocab_block_includes_common_word_safeguard() {
-        // Regression for the "main → MACOBS" over-replacement case.
+    fn vocab_block_uses_type_aware_reasoning_not_stopword_list() {
+        // FOUNDATIONAL: the old prompt enumerated 18+ exception words
+        // ("main", "the", "a", "hai", "ka", ...) as a CRITICAL safeguard
+        // list. That was a patch — it didn't generalise to other languages
+        // or future common words. The new prompt drops the list entirely
+        // and instructs the LLM to reason from the term's TYPE.
         let p = prefs();
         let entries = vec![VocabEntry {
-            term:    "MACOBS".into(),
-            context: Some("MACOBS ka IPO".into()),
+            term:      "MACOBS".into(),
+            context:   Some("MACOBS ka IPO".into()),
+            term_type: Some("acronym".into()),
         }];
         let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
-        assert!(prompt.contains("COMMON-WORD SAFEGUARD"),
-                "common-word safeguard must appear in vocab block");
-        assert!(prompt.contains("\"main\""),
-                "common-word list must include 'main' explicitly");
-        assert!(prompt.contains("\"main is here\""),
-                "counter-example must explicitly show 'main is here' → leave alone");
+
+        // The "COMMON-WORD SAFEGUARD" heading must be gone.
+        assert!(!prompt.contains("COMMON-WORD SAFEGUARD"),
+                "stopword safeguard heading must be removed");
+        // The enumerated comma-separated stopword list shape must be gone.
+        // The old list contained "the", "a", "is", "of", "to", "in", "on",
+        // "and", "or" together. Check that this distinctive enumeration
+        // shape is absent.
+        assert!(!prompt.contains("\"the\", \"a\", \"is\""),
+                "enumerated stopword list must be removed");
+        // The new prompt must instead contain the type-aware language.
+        assert!(prompt.contains("type-compatible"),
+                "type-compatible reasoning instruction must be present");
+        assert!(prompt.contains("acronym canonical"),
+                "type-specific rule for acronyms must be present");
+    }
+
+    #[test]
+    fn vocab_block_renders_type_tag_per_entry() {
+        let p = prefs();
+        let entries = vec![
+            VocabEntry { term: "MACOBS".into(),     context: Some("MACOBS ka IPO".into()),     term_type: Some("acronym".into()) },
+            VocabEntry { term: "Anish".into(),      context: None,                              term_type: Some("proper_noun".into()) },
+            VocabEntry { term: "n8n".into(),        context: Some("I run n8n".into()),         term_type: Some("code_identifier".into()) },
+            VocabEntry { term: "ClaudeCode".into(), context: None,                              term_type: Some("brand".into()) },
+            VocabEntry { term: "Cloud Code".into(), context: None,                              term_type: Some("phrase".into()) },
+            VocabEntry { term: "weird".into(),      context: None,                              term_type: Some("other".into()) },
+        ];
+        let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
+        assert!(prompt.contains("MACOBS [acronym] — example: \"MACOBS ka IPO\""));
+        assert!(prompt.contains("Anish [proper noun]"));
+        assert!(prompt.contains("n8n [code identifier] — example: \"I run n8n\""));
+        assert!(prompt.contains("ClaudeCode [brand]"));
+        assert!(prompt.contains("Cloud Code [phrase]"));
+        // "other" type means no signal — render bare without a tag.
+        assert!(prompt.contains("  weird\n"));
+        assert!(!prompt.contains("weird [other]"));
     }
 
     #[test]
     fn vocab_entries_with_context_render_inline() {
-        // The foundational addition: contexts are inlined as `term — example: "..."`
-        // so the LLM has the situational signal it needs to disambiguate
-        // unseen STT mishearings.
+        // Backward-compat for the earlier context-only test. Type tag is
+        // omitted when entry.term_type is None — the LLM still has the
+        // example signal to work with.
         let p = prefs();
         let entries = vec![
             VocabEntry {
-                term:    "MACOBS".into(),
-                context: Some("MACOBS ka IPO ka 12 hazaar batana".into()),
+                term:      "MACOBS".into(),
+                context:   Some("MACOBS ka IPO ka 12 hazaar batana".into()),
+                term_type: None,
             },
             VocabEntry {
-                term:    "n8n".into(),
-                context: None,
+                term:      "n8n".into(),
+                context:   None,
+                term_type: None,
             },
         ];
         let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
         assert!(prompt.contains("MACOBS — example: \"MACOBS ka IPO ka 12 hazaar batana\""),
-                "entry with context should render `term — example: \"...\"`");
+                "entry without type tag should still render context");
         assert!(prompt.contains("  n8n\n"),
-                "entry without context should render bare term");
+                "bare entry should render just the term");
     }
 
     #[test]
