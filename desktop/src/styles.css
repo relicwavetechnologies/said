@@ -510,26 +510,32 @@
    FLOATING STATUS BAR — pill overlay window
    ═══════════════════════════════════════════════════════════════════════════ */
 
+html.statusbar-mode,
+html.statusbar-mode body,
 body.statusbar-mode {
   margin: 0;
   padding: 0;
   background: transparent !important;
+  background-color: transparent !important;
   overflow: hidden;
   user-select: none;
   -webkit-user-select: none;
 }
 
+html.statusbar-mode::before,
 body.statusbar-mode::before {
   display: none;
 }
 
+html.statusbar-mode #app,
 body.statusbar-mode #app {
   display: flex;
   align-items: center;
   justify-content: center;
   width: 100vw;
   height: 100vh;
-  background: transparent;
+  background: transparent !important;
+  background-color: transparent !important;
 }
 
 .sb-pill {
@@ -571,11 +577,11 @@ body.statusbar-mode #app {
 
 .sb-pill--idle {
   min-width: 0;
-  width: 74px;
+  width: 70px;
   height: 18px;
   padding: 0;
   gap: 0;
-  background: rgba(10, 10, 12, 0.34);
+  background: rgba(10, 10, 12, 0.72);
   border-color: rgba(255, 255, 255, 0.66);
   box-shadow:
     0 5px 14px rgba(0, 0, 0, 0.32),
@@ -583,10 +589,10 @@ body.statusbar-mode #app {
     0 -1px 0 rgba(0, 0, 0, 0.42) inset;
 }
 
-.sb-pill--idle:hover {
-  width: 106px;
-  height: 32px;
-  background: rgba(10, 10, 12, 0.58);
+.sb-pill--idle.sb-pill--hovered {
+  width: 98px;
+  height: 28px;
+  background: rgba(10, 10, 12, 0.82);
   border-color: rgba(255, 255, 255, 0.72);
   box-shadow:
     0 10px 28px rgba(0, 0, 0, 0.42),
@@ -595,21 +601,21 @@ body.statusbar-mode #app {
 }
 
 .sb-idle-line {
-  width: 42px;
+  width: 36px;
   height: 2px;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.40);
   transition: width 0.18s ease, opacity 0.18s ease;
 }
 
-.sb-pill--idle:hover .sb-idle-line {
-  width: 56px;
+.sb-pill--idle.sb-pill--hovered .sb-idle-line {
+  width: 50px;
   opacity: 0.9;
 }
 
 .sb-rec-wave {
-  width: 4px;
-  height: 12px;
+  width: 3px;
+  height: 10px;
   border-radius: 999px;
   background: #ff453a;
   box-shadow: 0 0 10px rgba(255, 69, 58, 0.65);
@@ -617,7 +623,7 @@ body.statusbar-mode #app {
 }
 
 .sb-rec-wave--b {
-  height: 17px;
+  height: 15px;
   animation-delay: 0.12s;
 }
 
@@ -673,8 +679,8 @@ body.statusbar-mode #app {
 /* ── Spinner ──────────────────────────────────────────────────────────────── */
 
 .sb-spinner {
-  width: 14px;
-  height: 14px;
+  width: 13px;
+  height: 13px;
   border: 1.5px solid rgba(255, 255, 255, 0.16);
   border-top-color: rgba(255, 255, 255, 0.85);
   border-radius: 50%;
@@ -687,8 +693,8 @@ body.statusbar-mode #app {
 }
 
 .sb-burst {
-  width: 10px;
-  height: 10px;
+  width: 9px;
+  height: 9px;
   border-radius: 999px;
   background: #30d158;
   box-shadow:
@@ -704,7 +710,7 @@ body.statusbar-mode #app {
 }
 
 .sb-manual-paste {
-  width: 34px;
+  width: 30px;
   height: 2px;
   border-radius: 999px;
   background: linear-gradient(90deg, rgba(255, 214, 10, 0.25), #ffd60a, rgba(255, 214, 10, 0.25));
@@ -718,8 +724,8 @@ body.statusbar-mode #app {
 }
 
 .sb-error-pulse {
-  width: 10px;
-  height: 10px;
+  width: 9px;
+  height: 9px;
   border-radius: 999px;
   background: #ff9f0a;
   box-shadow: 0 0 12px rgba(255, 159, 10, 0.70);
@@ -734,14 +740,14 @@ body.statusbar-mode #app {
 /* ── Buttons ──────────────────────────────────────────────────────────────── */
 
 .sb-btn {
-  width: 20px;
-  height: 20px;
+  width: 18px;
+  height: 18px;
   padding: 0;
   border-radius: 11px;
   border: 1px solid rgba(255, 255, 255, 0.15);
   background: rgba(255, 255, 255, 0.10);
   color: rgba(255, 255, 255, 0.85);
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 500;
   font-family: inherit;
   cursor: pointer;

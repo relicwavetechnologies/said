@@ -20,6 +20,7 @@ console.info("[status-bar:entry]", {
 
 if (isStatusBar) {
   // Floating status-bar window — minimal pill overlay
+  document.documentElement.classList.add("statusbar-mode");
   document.body.classList.add("statusbar-mode");
   root.render(
     <React.StrictMode>

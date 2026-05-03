@@ -41,9 +41,16 @@ fn configure_status_bar_macos(win: &tauri::WebviewWindow) {
     // sets CanJoinAllSpaces, which is not enough for the three-finger Spaces
     // swipe behavior users expect from always-hovering status pills.
     const CAN_JOIN_ALL_SPACES: usize = 1 << 0;
+    const MANAGED: usize = 1 << 2;
+    const TRANSIENT: usize = 1 << 3;
     const STATIONARY: usize = 1 << 4;
     const IGNORES_CYCLE: usize = 1 << 6;
+    const FULL_SCREEN_PRIMARY: usize = 1 << 7;
     const FULL_SCREEN_AUXILIARY: usize = 1 << 8;
+    const FULL_SCREEN_NONE: usize = 1 << 9;
+    const PRIMARY: usize = 1 << 16;
+    const AUXILIARY: usize = 1 << 17;
+    const CAN_JOIN_ALL_APPLICATIONS: usize = 1 << 18;
     const NS_STATUS_WINDOW_LEVEL: isize = 25;
 
     unsafe {
@@ -51,8 +58,18 @@ fn configure_status_bar_macos(win: &tauri::WebviewWindow) {
         let current: usize = ns_window
             .send_message(Sel::register("collectionBehavior"), ())
             .unwrap_or(0);
-        let behavior =
-            current | CAN_JOIN_ALL_SPACES | STATIONARY | IGNORES_CYCLE | FULL_SCREEN_AUXILIARY;
+        let behavior = (current
+            & !(MANAGED
+                | TRANSIENT
+                | FULL_SCREEN_PRIMARY
+                | FULL_SCREEN_NONE
+                | PRIMARY
+                | AUXILIARY))
+            | CAN_JOIN_ALL_SPACES
+            | STATIONARY
+            | IGNORES_CYCLE
+            | FULL_SCREEN_AUXILIARY
+            | CAN_JOIN_ALL_APPLICATIONS;
         let _: Result<(), _> =
             ns_window.send_message(Sel::register("setCollectionBehavior:"), (behavior,));
         let _: Result<(), _> =
@@ -771,17 +788,18 @@ fn create_status_bar(app: &tauri::AppHandle) {
         return;
     }
 
-    // Position: bottom-center, 90 px above the dock. Idle reserves a transparent
-    // hover area; CSS keeps the visible pill tiny until the pointer is over it.
-    let idle_w = 112.0;
-    let idle_h = 36.0;
+    // Position: bottom-center, low above the dock. Keep the native idle window
+    // almost exactly pill-sized so no webview strip can show around it.
+    let idle_w = 72.0;
+    let idle_h = 20.0;
+    let bottom_offset = 64.0;
     let (x, y) = if let Ok(Some(m)) = app.primary_monitor() {
         let sf = m.scale_factor();
         let sw = m.size().width  as f64 / sf;
         let sh = m.size().height as f64 / sf;
         let mx = m.position().x as f64 / sf;
         let my = m.position().y as f64 / sf;
-        (mx + sw / 2.0 - idle_w / 2.0, my + sh - idle_h - 90.0)
+        (mx + sw / 2.0 - idle_w / 2.0, my + sh - idle_h - bottom_offset)
     } else {
         (560.0, 860.0)
     };
@@ -2791,6 +2809,16 @@ fn main() {
             let shared   = Arc::clone(&shared_app);
             let back_arc = Arc::clone(&backend_arc);
             move |app| {
+                #[cfg(target_os = "macos")]
+                {
+                    // Tauri/macOS currently keeps normal app windows tied to
+                    // fullscreen Spaces more strongly than menu-bar accessory
+                    // apps. Accessory policy is the reliable path for a global
+                    // HUD-style status pill that floats over other apps.
+                    app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                    tracing::info!("[status-bar] macOS activation policy set to Accessory");
+                }
+
                 // ── Spawn backend daemon ──────────────────────────────────────
                 // ── Permission status at launch (visible in ~/Library/Logs/Said/said.log) ──
                 let ax_ok = paster::is_accessibility_granted();

@@ -16,22 +16,24 @@ type BarState =
   | { kind: "error"; message: string; audioId?: string };
 
 type PillKind = BarState["kind"];
+const BOTTOM_OFFSET = 64;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function pillSize(kind: PillKind): { width: number; height: number } {
-  if (kind === "idle") return { width: 112, height: 36 };
-  if (kind === "recording") return { width: 82, height: 28 };
-  if (kind === "processing") return { width: 76, height: 28 };
-  if (kind === "manual_paste") return { width: 88, height: 28 };
-  if (kind === "error") return { width: 96, height: 28 };
-  return { width: 76, height: 28 };
+function pillSize(kind: PillKind, hovered = false): { width: number; height: number } {
+  if (kind === "idle") return hovered ? { width: 100, height: 30 } : { width: 72, height: 20 };
+  if (kind === "recording") return { width: 76, height: 26 };
+  if (kind === "processing") return { width: 70, height: 26 };
+  if (kind === "manual_paste") return { width: 82, height: 26 };
+  if (kind === "error") return { width: 90, height: 26 };
+  return { width: 70, height: 26 };
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function StatusBar() {
   const [bar, setBar] = useState<BarState>({ kind: "idle" });
+  const [idleHovered, setIdleHovered] = useState(false);
   const doneTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const win = getCurrentWindow();
 
@@ -48,7 +50,7 @@ export default function StatusBar() {
   // Rust owns the native always-on-top behavior; React only changes content.
   useEffect(() => {
     console.info("[status-bar] state", bar);
-    const { width, height } = pillSize(bar.kind);
+    const { width, height } = pillSize(bar.kind, bar.kind === "idle" && idleHovered);
     primaryMonitor()
       .then((monitor) => {
         const scale = monitor?.scaleFactor ?? 1;
@@ -57,14 +59,14 @@ export default function StatusBar() {
         const sx = monitor ? monitor.position.x / scale : 0;
         const sy = monitor ? monitor.position.y / scale : 0;
         const x = sx + sw / 2 - width / 2;
-        const y = sy + sh - height - 90;
+        const y = sy + sh - height - BOTTOM_OFFSET;
         return win
           .setSize(new LogicalSize(width, height))
           .then(() => win.setPosition(new LogicalPosition(x, y)));
       })
-      .then(() => console.info("[status-bar] chrome sized", { kind: bar.kind, width, height }))
+      .then(() => console.info("[status-bar] chrome sized", { kind: bar.kind, idleHovered, width, height }))
       .catch((err) => console.warn("[status-bar] chrome size failed", err));
-  }, [bar.kind]);
+  }, [bar.kind, idleHovered]);
 
   // Seed from current snapshot on mount so we reflect any in-progress state
   useEffect(() => {
@@ -171,10 +173,14 @@ export default function StatusBar() {
 
   return (
     <div
-      className={`sb-pill sb-pill--${bar.kind}`}
+      className={`sb-pill sb-pill--${bar.kind}${bar.kind === "idle" && idleHovered ? " sb-pill--hovered" : ""}`}
       data-tauri-drag-region
       aria-label={`Said ${bar.kind}`}
       title={`Said ${bar.kind}`}
+      onMouseEnter={() => {
+        if (bar.kind === "idle") setIdleHovered(true);
+      }}
+      onMouseLeave={() => setIdleHovered(false)}
     >
 
       {bar.kind === "idle" && (
