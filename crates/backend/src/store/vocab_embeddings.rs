@@ -414,10 +414,36 @@ pub fn select_for_polish(
     )
 }
 
-/// Hybrid version that also accepts the raw transcript for BM25 lookup.
-/// Existing callers can continue using `select_for_polish` (text=None).
-/// New callers (voice/text routes) should pass the transcript so the BM25
-/// half of hybrid retrieval fires.
+/// Lexical-gated retrieval: only include vocab entries with ACTUAL EVIDENCE
+/// in the transcript that they might apply.
+///
+/// The architectural shift: previously we used hybrid retrieval (cosine ⊕ BM25
+/// via RRF) which could surface vocab entries with no shared words at all
+/// with the transcript — pure semantic neighbours. That's the bug source for
+/// "tembeess for time": tembeess gets included in the polish prompt because
+/// its embedding is semantically near "time", even though the words have no
+/// lexical overlap. The LLM then over-applies.
+///
+/// New rule: a vocab entry enters the prompt ONLY when its term OR its
+/// example_context shares at least one word with the transcript (BM25 is
+/// the gate). Within the gated set, cosine + decay + use_count rank for
+/// the prompt order — but unevidenced entries never enter regardless of
+/// rank.
+///
+/// This works because the foundational design captures example_context for
+/// every learned term. So "MACOBS recovers from main corps" still works:
+/// MACOBS's example_context "MACOBS ka IPO ka 12 hazaar batana" shares
+/// words like "ka", "IPO", "hazaar" with the transcript "main corps ka IPO
+/// ka 12 hazaar batana" — BM25 catches the overlap, MACOBS enters, LLM
+/// recognises the pattern, output is MACOBS. But "what time is it" shares
+/// no words with any tembeess-related vocab data, so tembeess never enters
+/// the prompt at all, no over-replacement possible.
+///
+/// `query_text` (the raw transcript) is now REQUIRED for the gate to fire.
+/// Without it we fall back to starred + top-weight (legacy behaviour).
+/// `query_embedding` is used for intra-set cosine ranking only — never for
+/// inclusion. `min_sim` is no longer applied as a gate (BM25 is the gate);
+/// it's effectively dead and kept for ABI compatibility.
 pub fn select_for_polish_hybrid(
     pool:            &DbPool,
     user_id:         &str,
@@ -427,13 +453,14 @@ pub fn select_for_polish_hybrid(
     n_top_weight:    usize,
     k_relevant:      usize,
     max_total:       usize,
-    min_sim:         f32,
+    _min_sim:        f32,
 ) -> Vec<VocabTerm> {
     use crate::store::{vocab_fts, vocabulary};
     let mut chosen: Vec<VocabTerm> = Vec::with_capacity(max_total);
     let mut seen:   std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Bucket 1 — starred (user-pinned). Always in.
+    // Bucket 1 — Starred (always). User-pinned terms bypass the lexical
+    // gate because they represent explicit user intent.
     let all = vocabulary::top_terms(pool, user_id, 1000);
     for t in all.iter().filter(|t| t.source == "starred") {
         if seen.insert(t.term.to_ascii_lowercase()) {
@@ -442,51 +469,80 @@ pub fn select_for_polish_hybrid(
         }
     }
 
-    // Bucket 2 — HYBRID retrieval (dense ⊕ BM25 via RRF).
+    // Bucket 2 — Lexical gate via BM25.
     //
-    // Dense leg: cosine on centroids with time-decay + use-count reinforcement.
-    // Sparse leg: BM25 on (term, example_context) — catches exact-match
-    // tokens (acronyms, IDs) that cosine misses.
-    // Fuse with RRF (k=60 from Cormack et al. 2009).
-    let dense_hits: Vec<String> = match query_embedding {
-        Some(q) => top_k_relevant(pool, user_id, q, language, k_relevant, min_sim)
-            .into_iter().map(|t| t.term).collect(),
-        None    => vec![],
-    };
-    let sparse_hits: Vec<String> = match query_text {
-        Some(text) => vocab_fts::search(pool, user_id, text, k_relevant),
-        None       => vec![],
+    // Without a transcript we can't run the gate; fall back to starred +
+    // top-weight (legacy behaviour) so existing callers without text don't
+    // silently get empty prompts.
+    let lexical_hits: Vec<String> = match query_text {
+        Some(text) if !text.trim().is_empty() => {
+            // Pull a generous candidate set; we'll re-rank by
+            // cosine × decay × use_count after.
+            vocab_fts::search(pool, user_id, text, k_relevant.max(20))
+        }
+        _ => Vec::new(),
     };
 
-    let fused: Vec<String> = if !dense_hits.is_empty() || !sparse_hits.is_empty() {
-        vocab_fts::rrf_fuse(&[&dense_hits, &sparse_hits], 60.0)
-    } else {
-        Vec::new()
-    };
-
-    // Resolve fused term names back to full VocabTerm rows (preserving rank
-    // order). Lowercased lookup so case-insensitive duplicates dedupe.
+    // Resolve hits to full rows + rank within the lexically-gated set.
     let by_term_lower: std::collections::HashMap<String, &VocabTerm> = all
         .iter()
         .map(|t| (t.term.to_ascii_lowercase(), t))
         .collect();
-    let mut hybrid_added = 0;
-    for term in fused.into_iter().take(k_relevant) {
-        let key = term.to_ascii_lowercase();
-        if seen.contains(&key) { continue; }
-        if let Some(vt) = by_term_lower.get(&key) {
-            chosen.push((*vt).clone());
-            seen.insert(key);
-            hybrid_added += 1;
+
+    let mut gated: Vec<VocabTerm> = lexical_hits
+        .iter()
+        .filter_map(|term| {
+            let key = term.to_ascii_lowercase();
+            by_term_lower.get(&key).map(|vt| (*vt).clone())
+        })
+        .collect();
+
+    // Intra-set ranking: cosine × decay × use_count. When no embedding,
+    // fall back to weight × decay so we still produce a sensible order.
+    let now = now_ms();
+    if let Some(q) = query_embedding {
+        let q_norm = l2_norm(q);
+        if q_norm > 0.0 {
+            // Load each gated term's centroid once; if missing, score via
+            // weight only (centroid is async-populated, so a fresh term may
+            // not have one yet).
+            let conn = pool.get().ok();
+            gated.sort_by(|a, b| {
+                let sa = score_within_set(&conn, user_id, a, q, q_norm, now);
+                let sb = score_within_set(&conn, user_id, b, q, q_norm, now);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+    } else {
+        // No embedding: rank by weight × decay only.
+        gated.sort_by(|a, b| {
+            let sa = a.weight as f32 * decay_factor(a.last_used, now);
+            let sb = b.weight as f32 * decay_factor(b.last_used, now);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    let mut gate_added = 0;
+    for vt in gated.into_iter().take(k_relevant) {
+        if seen.insert(vt.term.to_ascii_lowercase()) {
+            chosen.push(vt);
+            gate_added += 1;
             if chosen.len() >= max_total { return chosen; }
         }
     }
 
-    // Bucket 3 — top-N by weight, ONLY when hybrid retrieval found nothing.
-    // Same fallback rationale as before: fresh install, embedder down, or
-    // a transcript matching no past context. Better to include trusted
-    // entries than to send an empty vocab block.
-    if hybrid_added == 0 {
+    // Bucket 3 — top-N by weight ONLY when no lexical gate ran (legacy
+    // callers passing no transcript). With a transcript present, an empty
+    // gate result is the CORRECT outcome — that's what stops the
+    // "tembeess for time" class of bug. Top-weight fallback running anyway
+    // would defeat the purpose.
+    //
+    // Starred terms are still included from Bucket 1; this only adds
+    // unstarred high-weight terms when we have no other way to populate
+    // the prompt.
+    let _ = gate_added;  // kept for future telemetry
+    let lexical_gate_ran = matches!(query_text, Some(t) if !t.trim().is_empty());
+    if !lexical_gate_ran {
         for t in all.iter().take(n_top_weight) {
             if seen.insert(t.term.to_ascii_lowercase()) {
                 chosen.push(t.clone());
@@ -496,6 +552,40 @@ pub fn select_for_polish_hybrid(
     }
 
     chosen
+}
+
+/// Internal: per-term score within the lexically-gated set. Combines
+/// cosine on the term's centroid, time-decay, and log(1+use_count).
+fn score_within_set(
+    conn:    &Option<r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>>,
+    user_id: &str,
+    vt:      &VocabTerm,
+    q:       &[f32],
+    q_norm:  f32,
+    now:     i64,
+) -> f32 {
+    // Default if we can't load embedding: fall back to weight × decay.
+    let weight_decay = vt.weight as f32 * decay_factor(vt.last_used, now);
+    let conn = match conn {
+        Some(c) => c,
+        None    => return weight_decay,
+    };
+    let blob: Vec<u8> = match conn.query_row(
+        "SELECT embedding FROM vocab_embeddings WHERE user_id=?1 AND term=?2",
+        params![user_id, vt.term],
+        |row| row.get(0),
+    ) {
+        Ok(b) => b,
+        Err(_) => return weight_decay,
+    };
+    let centroid = match blob_to_floats(&blob) {
+        Some(v) => v,
+        None    => return weight_decay,
+    };
+    let cn = l2_norm(&centroid);
+    if cn == 0.0 { return weight_decay; }
+    let cos = dot(&centroid, q) / (cn * q_norm);
+    cos * decay_factor(vt.last_used, now) * use_count_factor(vt.use_count)
 }
 
 // ── Math helpers (kept local — same impl as vectors.rs) ───────────────────────
@@ -553,7 +643,11 @@ mod tests {
                  recorded_at   INTEGER NOT NULL
              );
              CREATE INDEX idx_vocab_examples_user_term
-               ON vocab_embedding_examples (user_id, term, recorded_at DESC);"
+               ON vocab_embedding_examples (user_id, term, recorded_at DESC);
+             CREATE VIRTUAL TABLE vocab_fts USING fts5(
+                 user_id UNINDEXED, term, example_context,
+                 tokenize = 'unicode61 remove_diacritics 2'
+             );"
         ).unwrap();
         pool
     }
@@ -794,122 +888,205 @@ mod tests {
         );
     }
 
-    // ── Hybrid selector tests ──────────────────────────────────────────────────
+    // ── Lexical-gated selector tests ──────────────────────────────────────────
+    //
+    // The selector now only includes vocab entries with ACTUAL EVIDENCE in
+    // the transcript (BM25 lexical match against term OR example_context).
+    // Cosine + decay + use_count rank WITHIN that gated set but never
+    // include unevidenced entries.
+
+    /// Helper: also write a vocab_fts row (the in-memory FTS index) so
+    /// BM25 lookups in select_for_polish_hybrid can hit.
+    fn seed_with_context(
+        pool:    &DbPool,
+        term:    &str,
+        weight:  f64,
+        source:  &str,
+        embedding: &[f32],
+        language:  &str,
+        context:   &str,
+    ) {
+        // Update the legacy seed() to also insert example_context + FTS row.
+        {
+            let conn = pool.get().unwrap();
+            conn.execute(
+                "INSERT INTO vocabulary
+                   (user_id, term, weight, use_count, last_used, source, language, example_context)
+                 VALUES ('u1', ?1, ?2, 1, ?3, ?4, ?5, ?6)",
+                params![term, weight, now_ms(), source, language, context],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO vocab_fts (user_id, term, example_context)
+                 VALUES ('u1', ?1, ?2)",
+                params![term, context],
+            ).unwrap();
+        }
+        upsert_embedding(pool, "u1", term, embedding);
+    }
 
     #[test]
-    fn selector_includes_starred_and_relevance_when_query_matches() {
+    fn lexical_gate_includes_term_when_transcript_mentions_it_directly() {
         let pool = mem_pool();
-        seed(&pool, "STARRED",  0.5, "starred", &vec4(0.0, 1.0, 0.0, 0.0), "english");
-        seed(&pool, "TOPWEIGHT",4.0, "auto",    &vec4(0.0, 0.0, 1.0, 0.0), "english");
-        seed(&pool, "RELEVANT", 1.0, "auto",    &vec4(1.0, 0.0, 0.0, 0.0), "english");
-        seed(&pool, "OTHER",    1.0, "auto",    &vec4(0.0, 0.5, 0.5, 0.0), "english");
+        seed_with_context(&pool, "MACOBS", 1.0, "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0), "english",
+            "MACOBS ka IPO ka 12 hazaar batana");
 
-        let chosen = select_for_polish(
+        let chosen = select_for_polish_hybrid(
             &pool, "u1", "english",
             Some(&vec4(1.0, 0.0, 0.0, 0.0)),
-            /* n_top_weight */ 1,
-            /* k_relevant   */ 1,
-            /* max_total    */ 10,
-            /* min_sim      */ 0.3,
-        );
-
-        let names: Vec<&str> = chosen.iter().map(|v| v.term.as_str()).collect();
-        assert!(names.contains(&"STARRED"),  "starred always included");
-        assert!(names.contains(&"RELEVANT"), "vector-relevant included");
-        // TOPWEIGHT must NOT appear — relevance found a hit, no fallback fires.
-        // This is the "main → MACOBS" guard: high-weight terms don't pollute
-        // prompts for transcripts where they don't match.
-        assert!(!names.contains(&"TOPWEIGHT"),
-                "top-weight must NOT inject when relevance found hits");
-    }
-
-    #[test]
-    fn selector_falls_back_to_top_weight_when_no_relevance() {
-        // The exact scenario for the over-replacement bug: user dictates
-        // a short utterance like "main is here". Relevance retrieval finds
-        // nothing (no MACOBS context match). Top-weight kicks in as
-        // fallback so the polish prompt isn't empty.
-        let pool = mem_pool();
-        seed(&pool, "STARRED",  0.5, "starred", &vec4(0.0, 1.0, 0.0, 0.0), "english");
-        seed(&pool, "MACOBS",   4.0, "auto",    &vec4(1.0, 0.0, 0.0, 0.0), "english");
-
-        // Query is orthogonal to MACOBS embedding — no relevance hit.
-        let chosen = select_for_polish(
-            &pool, "u1", "english",
-            Some(&vec4(0.0, 0.0, 0.0, 1.0)),  // unrelated query
-            /* n_top_weight */ 5,
-            /* k_relevant   */ 5,
-            /* max_total    */ 10,
-            /* min_sim      */ 0.5,
-        );
-
-        let names: Vec<&str> = chosen.iter().map(|v| v.term.as_str()).collect();
-        assert!(names.contains(&"STARRED"));
-        assert!(names.contains(&"MACOBS"), "top-weight fallback when no relevance");
-    }
-
-    #[test]
-    fn selector_does_not_inject_irrelevant_top_weight_when_relevance_succeeded() {
-        // The "main → MACOBS" regression case at the selector level.
-        // User has high-weight MACOBS. They dictate a transcript that
-        // matches an entirely different vocab entry (ITALIAN). MACOBS must
-        // NOT appear in the chosen list.
-        let pool = mem_pool();
-        seed(&pool, "MACOBS",  5.0, "auto", &vec4(1.0, 0.0, 0.0, 0.0), "english");
-        seed(&pool, "ITALIAN", 1.0, "auto", &vec4(0.0, 1.0, 0.0, 0.0), "english");
-
-        let chosen = select_for_polish(
-            &pool, "u1", "english",
-            Some(&vec4(0.0, 1.0, 0.0, 0.0)),  // matches ITALIAN, not MACOBS
-            5, 5, 10, 0.5,
-        );
-        let names: Vec<&str> = chosen.iter().map(|v| v.term.as_str()).collect();
-        assert!(names.contains(&"ITALIAN"));
-        assert!(!names.contains(&"MACOBS"),
-                "high-weight MACOBS must NOT pollute an Italian-cooking prompt");
-    }
-
-    #[test]
-    fn selector_dedupes_when_buckets_overlap() {
-        let pool = mem_pool();
-        // One term that is BOTH high-weight AND high-relevance.
-        seed(&pool, "BOTH", 5.0, "auto", &vec4(1.0, 0.0, 0.0, 0.0), "english");
-        let chosen = select_for_polish(
-            &pool, "u1", "english",
-            Some(&vec4(1.0, 0.0, 0.0, 0.0)),
+            Some("the MACOBS announcement"),     // term itself appears in transcript
             5, 5, 10, 0.0,
         );
-        assert_eq!(chosen.len(), 1, "duplicate must be deduped");
+        assert!(chosen.iter().any(|v| v.term == "MACOBS"),
+                "term-itself match must include the entry");
     }
 
     #[test]
-    fn selector_caps_at_max_total() {
+    fn lexical_gate_includes_term_when_transcript_overlaps_example_context() {
         let pool = mem_pool();
-        for i in 0..50 {
-            seed(&pool, &format!("T{i}"), 1.0, "auto",
-                 &vec4(i as f32, 0.0, 0.0, 0.0), "english");
-        }
-        let chosen = select_for_polish(
+        seed_with_context(&pool, "MACOBS", 1.0, "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0), "english",
+            "MACOBS ka IPO ka 12 hazaar batana");
+
+        // Transcript shares "ka", "IPO", "hazaar" with the example_context.
+        // BM25 catches the overlap → MACOBS enters the prompt. This is the
+        // "main corps → MACOBS recovery" path that keeps working.
+        let chosen = select_for_polish_hybrid(
             &pool, "u1", "english",
             Some(&vec4(1.0, 0.0, 0.0, 0.0)),
+            Some("main corps ka IPO ka 12 hazaar batana"),
+            5, 5, 10, 0.0,
+        );
+        assert!(chosen.iter().any(|v| v.term == "MACOBS"),
+                "example_context overlap must include the entry");
+    }
+
+    #[test]
+    fn lexical_gate_excludes_term_when_no_transcript_overlap() {
+        // The "tembeess for time" regression. tembeess vocab exists with a
+        // distinct context. Transcript "what time is it" shares no words
+        // with tembeess or its context. Lexical gate must EXCLUDE tembeess
+        // → no over-replacement possible at the polish-prompt layer.
+        let pool = mem_pool();
+        seed_with_context(&pool, "tembeess", 4.0, "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0), "english",
+            "tembeess team meeting on Friday");
+
+        let chosen = select_for_polish_hybrid(
+            &pool, "u1", "english",
+            Some(&vec4(0.99, 0.0, 0.0, 0.0)),  // semantically near (cosine high)
+            Some("what time is it"),            // BUT no lexical overlap
+            5, 5, 10, 0.0,
+        );
+        assert!(!chosen.iter().any(|v| v.term == "tembeess"),
+                "lexical gate must exclude tembeess for unrelated transcripts even if cosine is high");
+    }
+
+    #[test]
+    fn lexical_gate_starred_always_included_regardless_of_overlap() {
+        let pool = mem_pool();
+        seed_with_context(&pool, "PINNED", 0.5, "starred",
+            &vec4(0.0, 1.0, 0.0, 0.0), "english",
+            "PINNED is my favourite term");
+
+        // Transcript shares NO words with PINNED or its context.
+        let chosen = select_for_polish_hybrid(
+            &pool, "u1", "english", None,
+            Some("the cat sat on the mat"),
+            5, 5, 10, 0.0,
+        );
+        assert!(chosen.iter().any(|v| v.term == "PINNED"),
+                "starred terms always included regardless of lexical match");
+    }
+
+    #[test]
+    fn lexical_gate_returns_empty_for_no_match_no_starred() {
+        // Foundational behaviour: when nothing matches and no starred exists,
+        // the vocab block is EMPTY. This is correct — no over-replacement
+        // possible because no vocab in scope. Top-weight fallback only runs
+        // when no transcript was passed at all (legacy callers).
+        let pool = mem_pool();
+        seed_with_context(&pool, "tembeess", 5.0, "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0), "english",
+            "tembeess Friday team meeting");
+
+        let chosen = select_for_polish_hybrid(
+            &pool, "u1", "english",
+            Some(&vec4(0.99, 0.0, 0.0, 0.0)),  // semantically near
+            Some("what time is it"),            // no lexical anchor
+            10,  // n_top_weight — must NOT fire because gate ran (text was passed)
+            5, 25, 0.0,
+        );
+        assert!(chosen.is_empty(),
+                "lexical gate ran with no matches → vocab block must be empty (got: {chosen:?})");
+    }
+
+    #[test]
+    fn legacy_no_text_call_falls_back_to_top_weight() {
+        // Legacy callers (no transcript passed) get the old behaviour:
+        // starred + top-weight. Used by select_for_polish wrapper for
+        // backward compatibility.
+        let pool = mem_pool();
+        seed_with_context(&pool, "STARRED", 0.5, "starred", &vec4(0.0, 1.0, 0.0, 0.0), "english", "");
+        seed_with_context(&pool, "HEAVY",   4.0, "auto",    &vec4(0.0, 0.0, 1.0, 0.0), "english", "");
+
+        let chosen = select_for_polish_hybrid(
+            &pool, "u1", "english",
+            None,     // no embedding
+            None,     // no transcript → lexical gate doesn't run
+            5, 5, 10, 0.0,
+        );
+        let names: Vec<&str> = chosen.iter().map(|v| v.term.as_str()).collect();
+        assert!(names.contains(&"STARRED"));
+        assert!(names.contains(&"HEAVY"),
+                "legacy no-text callers fall back to top-weight (otherwise empty)");
+    }
+
+    #[test]
+    fn within_gated_set_cosine_ranks_higher_first() {
+        // When multiple lexical matches exist, cosine + decay + use_count
+        // determines the order within the gated set.
+        let pool = mem_pool();
+        // Both contexts mention "IPO" so both lexically gate-pass.
+        seed_with_context(&pool, "MACOBS",  1.0, "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0), "english", "MACOBS ka IPO ka 12 hazaar");
+        seed_with_context(&pool, "OTHERCO", 1.0, "auto",
+            &vec4(0.0, 1.0, 0.0, 0.0), "english", "OTHERCO ka IPO date hai");
+
+        // Query embedding aligns with MACOBS (1,0,0,0) > OTHERCO (0,1,0,0).
+        let chosen = select_for_polish_hybrid(
+            &pool, "u1", "english",
+            Some(&vec4(1.0, 0.0, 0.0, 0.0)),
+            Some("the IPO is tomorrow"),  // both gate-pass via "IPO"
+            5, 5, 10, 0.0,
+        );
+        // Both should be present; MACOBS first by cosine score.
+        assert!(chosen.iter().any(|v| v.term == "MACOBS"));
+        assert!(chosen.iter().any(|v| v.term == "OTHERCO"));
+        let macobs_idx  = chosen.iter().position(|v| v.term == "MACOBS").unwrap();
+        let otherco_idx = chosen.iter().position(|v| v.term == "OTHERCO").unwrap();
+        assert!(macobs_idx < otherco_idx,
+                "MACOBS (cosine-near to query) should rank above OTHERCO");
+    }
+
+    #[test]
+    fn lexical_gate_caps_at_max_total() {
+        let pool = mem_pool();
+        // Seed 50 terms whose example_contexts all contain "MEETING" so
+        // they all lexically gate-pass.
+        for i in 0..50 {
+            seed_with_context(
+                &pool, &format!("T{i}"), 1.0, "auto",
+                &vec4(i as f32, 0.0, 0.0, 0.0), "english",
+                "MEETING with T",
+            );
+        }
+        let chosen = select_for_polish_hybrid(
+            &pool, "u1", "english",
+            Some(&vec4(1.0, 0.0, 0.0, 0.0)),
+            Some("MEETING today"),
             100, 100, 5, 0.0,
         );
         assert_eq!(chosen.len(), 5);
-    }
-
-    #[test]
-    fn selector_works_without_query_embedding() {
-        // When embedder is unavailable, fall back to starred + weight.
-        let pool = mem_pool();
-        seed(&pool, "STARRED",  0.5, "starred", &vec4(1.0, 0.0, 0.0, 0.0), "english");
-        seed(&pool, "TOPWEIGHT",4.0, "auto",    &vec4(0.0, 1.0, 0.0, 0.0), "english");
-        let chosen = select_for_polish(
-            &pool, "u1", "english",
-            None,  // no embedding
-            5, 5, 10, 0.0,
-        );
-        let names: Vec<&str> = chosen.iter().map(|v| v.term.as_str()).collect();
-        assert!(names.contains(&"STARRED"));
-        assert!(names.contains(&"TOPWEIGHT"));
     }
 }
