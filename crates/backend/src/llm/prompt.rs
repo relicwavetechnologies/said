@@ -119,18 +119,31 @@ pub fn build_system_prompt_with_vocab_entries(
              1. If a term appears verbatim in the transcript, KEEP IT — same \
              spelling, same case.\n\
              2. Do NOT translate, expand, or substitute these terms.\n\
-             3. RECOGNISE MISHEARINGS: if the transcript contains a word or \
-             short phrase that is phonetically similar to a vocabulary term \
-             AND appears in a context that resembles the term's example, \
-             REPLACE it with the canonical term.\n\
-                Example: vocab has `MACOBS — example: \"MACOBS ka IPO ka 12 \
-             hazaar batana\"`. Transcript says \"main course ka IPO ka 12 \
-             hazaar batana\" — context matches → output MACOBS, not \"main course\".\n\
-                Counter-example: vocab has `MACOBS — example: \"MACOBS ka IPO\"`. \
-             Transcript says \"the main course at dinner was great\" — context \
-             does NOT match (no IPO/finance signal) → leave \"main course\" alone.\n\
-             4. When in doubt (similar sound but unrelated context), keep the \
-             transcript as-is. Don't over-replace.\n\n\
+             3. **COMMON-WORD SAFEGUARD (CRITICAL):** A standalone common word \
+             — \"main\", \"the\", \"a\", \"is\", \"of\", \"to\", \"in\", \"on\", \
+             \"and\", \"or\", \"course\", \"corps\", \"hai\", \"ka\", \"ki\", \
+             \"ko\", \"se\", \"par\" etc — is NEVER a candidate for replacement, \
+             regardless of how phonetically similar it might be to a vocabulary \
+             term. Only ENTIRE multi-word phrases (e.g. \"main corps\") or \
+             distinctly-shaped single tokens (acronyms, mixed-case identifiers, \
+             digit-bearing tokens like \"n8n\") can trigger replacement.\n\
+             4. RECOGNISE MISHEARINGS (with safeguard): if the transcript contains \
+             a multi-word phrase OR a distinctly-shaped token that is phonetically \
+             similar to a vocabulary term AND appears in a context that resembles \
+             the term's example, REPLACE the matched span with the canonical term.\n\
+                ✓ Vocab: `MACOBS — example: \"MACOBS ka IPO ka 12 hazaar batana\"`. \
+             Transcript: \"main course ka IPO ka 12 hazaar batana\" → multi-word \
+             phrase \"main course\" + matching IPO/finance context → output MACOBS.\n\
+                ✗ Vocab: `MACOBS — example: \"MACOBS ka IPO\"`. Transcript: \
+             \"main is here\" → standalone common word \"main\" → DO NOT replace, \
+             output \"main is here\" verbatim.\n\
+                ✗ Vocab: `MACOBS — example: \"MACOBS ka IPO\"`. Transcript: \
+             \"the main course at dinner\" → multi-word phrase \"main course\" but \
+             context (dinner) does NOT match → DO NOT replace.\n\
+             5. When in doubt — when the phonetic match is weak, when the context \
+             doesn't clearly match, when the candidate is a common English/Hinglish \
+             word — KEEP THE TRANSCRIPT AS-IS. Over-replacement (false positives) \
+             is far worse than under-replacement (the user can correct it once).\n\n\
              {table}\n\
              </personal_vocabulary>\n\n"
         )
@@ -397,6 +410,23 @@ mod tests {
                 "expected no vocabulary block when terms are empty");
         assert!(!prompt.contains("RECOGNISE MISHEARINGS"),
                 "vocab instructions should be gated on having terms");
+    }
+
+    #[test]
+    fn vocab_block_includes_common_word_safeguard() {
+        // Regression for the "main → MACOBS" over-replacement case.
+        let p = prefs();
+        let entries = vec![VocabEntry {
+            term:    "MACOBS".into(),
+            context: Some("MACOBS ka IPO".into()),
+        }];
+        let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
+        assert!(prompt.contains("COMMON-WORD SAFEGUARD"),
+                "common-word safeguard must appear in vocab block");
+        assert!(prompt.contains("\"main\""),
+                "common-word list must include 'main' explicitly");
+        assert!(prompt.contains("\"main is here\""),
+                "counter-example must explicitly show 'main is here' → leave alone");
     }
 
     #[test]

@@ -176,17 +176,23 @@ pub fn top_k_relevant(
 /// Build the polish prompt's vocabulary slice using a hybrid strategy:
 ///
 ///   • **Always** include starred terms (user-pinned, regardless of weight)
-///   • **Always** include the top-N highest-weight terms (most-used jargon)
-///   • **Add** the top-K vector-relevant terms (matched to current transcript)
-///   • Deduplicate by term, cap at `max_total`
+///   • **If query embedding present + relevance hits found**, include the
+///     top-K vector-relevant terms — these are the entries that actually
+///     match what the user just said.
+///   • **Top-N by weight** is added only when we have NO relevance hits
+///     (fallback for fresh installs / embedder unavailable / first-time
+///     short transcripts that can't match anything yet).
+///   • Deduplicate by term, cap at `max_total`.
 ///
-/// Order in the returned vec: starred > weight > relevance, so the LLM
-/// sees the most-trusted entries first when prompts are reordered for
-/// any reason.
+/// Why we don't ALWAYS include top-weight: it injects high-weight terms
+/// (e.g. MACOBS) into prompts for unrelated transcripts ("main is here"),
+/// where the LLM can over-apply them. Relevance retrieval already gives
+/// us the entries that matter for the current transcript; adding "trust
+/// fallback" entries when relevance succeeded only adds noise.
 ///
 /// `query_embedding` may be None — in that case we skip the relevance
-/// stage and fall back to starred + weight only. This is the right
-/// behaviour when the embedder is unavailable.
+/// stage and fall back to starred + weight (the only way to populate
+/// the prompt without an embedding).
 pub fn select_for_polish(
     pool:            &DbPool,
     user_id:         &str,
@@ -201,7 +207,7 @@ pub fn select_for_polish(
     let mut chosen: Vec<VocabTerm> = Vec::with_capacity(max_total);
     let mut seen:   std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Bucket 1 — starred (user-pinned). Always in.
+    // Bucket 1 — starred (user-pinned). Always in, regardless of relevance.
     let all = vocabulary::top_terms(pool, user_id, 1000);
     for t in all.iter().filter(|t| t.source == "starred") {
         if seen.insert(t.term.to_ascii_lowercase()) {
@@ -210,43 +216,33 @@ pub fn select_for_polish(
         }
     }
 
-    // Bucket 2 — top-N by weight (filtered by language).
-    let top_weight = all
-        .iter()
-        .filter(|t| {
-            // Same language-filter rule as top_term_strings_for_language: NULL
-            // language entries are treated as language-agnostic.
-            true_when_lang_compatible(language, &t.term, &all)
-        })
-        .take(n_top_weight);
-    for t in top_weight {
-        if seen.insert(t.term.to_ascii_lowercase()) {
-            chosen.push(t.clone());
-            if chosen.len() >= max_total { return chosen; }
+    // Bucket 2 — top-K by cosine similarity to query.
+    let mut relevance_hits: Vec<VocabTerm> = Vec::new();
+    if let Some(q) = query_embedding {
+        relevance_hits = top_k_relevant(pool, user_id, q, language, k_relevant, min_sim);
+        for t in &relevance_hits {
+            if seen.insert(t.term.to_ascii_lowercase()) {
+                chosen.push(t.clone());
+                if chosen.len() >= max_total { return chosen; }
+            }
         }
     }
 
-    // Bucket 3 — top-K by cosine similarity to query.
-    if let Some(q) = query_embedding {
-        let relevant = top_k_relevant(pool, user_id, q, language, k_relevant, min_sim);
-        for t in relevant {
+    // Bucket 3 — top-N by weight, ONLY when relevance retrieval found nothing.
+    // This is the fallback path: fresh install, embedder unavailable, or a
+    // transcript that doesn't match any past context. It's better to include
+    // the most-trusted entries than to send an empty vocab block — the LLM
+    // can still recognise verbatim matches.
+    if relevance_hits.is_empty() {
+        for t in all.iter().take(n_top_weight) {
             if seen.insert(t.term.to_ascii_lowercase()) {
-                chosen.push(t);
+                chosen.push(t.clone());
                 if chosen.len() >= max_total { return chosen; }
             }
         }
     }
 
     chosen
-}
-
-/// Tiny helper kept inline so we don't expand the public surface of the
-/// vocabulary module. We can't easily query language directly from a
-/// VocabTerm (the field isn't part of the struct), so we treat all rows
-/// as language-compatible for the weight bucket and rely on the embedded
-/// retrieval in bucket 3 for finer language scoping (it already filters).
-fn true_when_lang_compatible(_language: &str, _term: &str, _all: &[VocabTerm]) -> bool {
-    true
 }
 
 // ── Math helpers (kept local — same impl as vectors.rs) ───────────────────────
@@ -376,15 +372,11 @@ mod tests {
     // ── Hybrid selector tests ──────────────────────────────────────────────────
 
     #[test]
-    fn selector_includes_starred_then_weight_then_relevance_dedupe() {
+    fn selector_includes_starred_and_relevance_when_query_matches() {
         let pool = mem_pool();
-        // Starred — pinned regardless of weight.
         seed(&pool, "STARRED",  0.5, "starred", &vec4(0.0, 1.0, 0.0, 0.0), "english");
-        // High weight — always in.
         seed(&pool, "TOPWEIGHT",4.0, "auto",    &vec4(0.0, 0.0, 1.0, 0.0), "english");
-        // Relevance match.
         seed(&pool, "RELEVANT", 1.0, "auto",    &vec4(1.0, 0.0, 0.0, 0.0), "english");
-        // Irrelevant + low weight — should NOT appear.
         seed(&pool, "OTHER",    1.0, "auto",    &vec4(0.0, 0.5, 0.5, 0.0), "english");
 
         let chosen = select_for_polish(
@@ -397,9 +389,59 @@ mod tests {
         );
 
         let names: Vec<&str> = chosen.iter().map(|v| v.term.as_str()).collect();
-        assert!(names.contains(&"STARRED"),   "starred always included");
-        assert!(names.contains(&"TOPWEIGHT"), "top-weight always included");
-        assert!(names.contains(&"RELEVANT"),  "vector-relevant included");
+        assert!(names.contains(&"STARRED"),  "starred always included");
+        assert!(names.contains(&"RELEVANT"), "vector-relevant included");
+        // TOPWEIGHT must NOT appear — relevance found a hit, no fallback fires.
+        // This is the "main → MACOBS" guard: high-weight terms don't pollute
+        // prompts for transcripts where they don't match.
+        assert!(!names.contains(&"TOPWEIGHT"),
+                "top-weight must NOT inject when relevance found hits");
+    }
+
+    #[test]
+    fn selector_falls_back_to_top_weight_when_no_relevance() {
+        // The exact scenario for the over-replacement bug: user dictates
+        // a short utterance like "main is here". Relevance retrieval finds
+        // nothing (no MACOBS context match). Top-weight kicks in as
+        // fallback so the polish prompt isn't empty.
+        let pool = mem_pool();
+        seed(&pool, "STARRED",  0.5, "starred", &vec4(0.0, 1.0, 0.0, 0.0), "english");
+        seed(&pool, "MACOBS",   4.0, "auto",    &vec4(1.0, 0.0, 0.0, 0.0), "english");
+
+        // Query is orthogonal to MACOBS embedding — no relevance hit.
+        let chosen = select_for_polish(
+            &pool, "u1", "english",
+            Some(&vec4(0.0, 0.0, 0.0, 1.0)),  // unrelated query
+            /* n_top_weight */ 5,
+            /* k_relevant   */ 5,
+            /* max_total    */ 10,
+            /* min_sim      */ 0.5,
+        );
+
+        let names: Vec<&str> = chosen.iter().map(|v| v.term.as_str()).collect();
+        assert!(names.contains(&"STARRED"));
+        assert!(names.contains(&"MACOBS"), "top-weight fallback when no relevance");
+    }
+
+    #[test]
+    fn selector_does_not_inject_irrelevant_top_weight_when_relevance_succeeded() {
+        // The "main → MACOBS" regression case at the selector level.
+        // User has high-weight MACOBS. They dictate a transcript that
+        // matches an entirely different vocab entry (ITALIAN). MACOBS must
+        // NOT appear in the chosen list.
+        let pool = mem_pool();
+        seed(&pool, "MACOBS",  5.0, "auto", &vec4(1.0, 0.0, 0.0, 0.0), "english");
+        seed(&pool, "ITALIAN", 1.0, "auto", &vec4(0.0, 1.0, 0.0, 0.0), "english");
+
+        let chosen = select_for_polish(
+            &pool, "u1", "english",
+            Some(&vec4(0.0, 1.0, 0.0, 0.0)),  // matches ITALIAN, not MACOBS
+            5, 5, 10, 0.5,
+        );
+        let names: Vec<&str> = chosen.iter().map(|v| v.term.as_str()).collect();
+        assert!(names.contains(&"ITALIAN"));
+        assert!(!names.contains(&"MACOBS"),
+                "high-weight MACOBS must NOT pollute an Italian-cooking prompt");
     }
 
     #[test]
