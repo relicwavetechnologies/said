@@ -73,11 +73,35 @@ fn triage_one(hunk: &Hunk) -> TriageDecision {
         return TriageDecision::Ambiguous;
     }
 
-    // Multi-word transformations are too risky to triage — multi-word swaps
-    // are usually rephrases but occasionally STT mistakes ("you all" → "y'all").
-    // Send to the LLM, where we're already paying for nuance.
     let polish_words = polish.split_whitespace().count();
     let kept_words   = kept.split_whitespace().count();
+
+    // ── Multi-word polish → single jargon-y kept ────────────────────────
+    // Canonical STT-error shape for acronyms / brand names: STT spelled
+    // it out as multiple common words, the user collapsed it to the
+    // jargon form.
+    //   "Main corps"    → "MACOBS"
+    //   "next message"  → "nextMessage"
+    //   "n a tin"       → "n8n"
+    //   "Cloud Code"    → "ClaudeCode"
+    // Without this rule the LLM has to handle every one of these, and the
+    // (correct) classification ends up bottlenecked on Groq latency.
+    if polish_words > 1 && kept_words == 1 {
+        let kept_jargon = phonetics::jargon_score(kept);
+        // Any jargon signal at all is enough when collapsing multi-word
+        // into a single token — the *shape* of the transformation is
+        // already strong evidence of an STT error. Common-English single
+        // words score 0.0 here so they fall through to Ambiguous.
+        if kept_jargon >= 0.4 {
+            return TriageDecision::Resolved(synthesize(
+                hunk, EditClass::SttError, polish, kept, 0.92,
+            ));
+        }
+    }
+
+    // Other multi-word transformations are too risky to triage — multi-word
+    // swaps are usually rephrases but occasionally STT mistakes ("you all"
+    // → "y'all"). Send to the LLM where we're already paying for nuance.
     if polish_words > 1 || kept_words > 1 {
         return TriageDecision::Ambiguous;
     }
@@ -245,6 +269,32 @@ mod tests {
             TriageDecision::Resolved(lh) => assert_eq!(lh.class, EditClass::SttError),
             _ => panic!("expected Resolved STT_ERROR for ask→asked"),
         }
+    }
+
+    #[test]
+    fn multi_word_polish_to_acronym_kept_resolves_as_stt_error() {
+        // The MACOBS regression: Main corps -> MACOBS (multi-word -> all-caps)
+        let d = triage_one(&h("Main corps", "MACOBS"));
+        match d {
+            TriageDecision::Resolved(lh) => assert_eq!(lh.class, EditClass::SttError),
+            _ => panic!("expected Resolved STT_ERROR for Main corps -> MACOBS, got {:?}", d),
+        }
+    }
+
+    #[test]
+    fn multi_word_to_camel_case_resolves_as_stt_error() {
+        // Cloud Code -> ClaudeCode (or similar brand-name compaction)
+        let d = triage_one(&h("Cloud Code", "ClaudeCode"));
+        match d {
+            TriageDecision::Resolved(lh) => assert_eq!(lh.class, EditClass::SttError),
+            _ => panic!("expected Resolved STT_ERROR for Cloud Code -> ClaudeCode, got {:?}", d),
+        }
+    }
+
+    #[test]
+    fn multi_word_to_common_single_word_stays_ambiguous() {
+        // "the one" -> "this" — common single-word, should NOT auto-resolve
+        assert!(triage_one(&h("the one", "this")).is_ambiguous());
     }
 
     #[test]

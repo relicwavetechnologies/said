@@ -150,12 +150,17 @@ pub fn similarity(a: &str, b: &str) -> f64 {
 /// Score how "jargon-like" a token is.  Higher = more likely to be a name,
 /// brand, code identifier, or technical term that STT may have mis-transcribed.
 ///
-/// Signals:
-///   • mixed case (camelCase, PascalCase) → +0.4
-///   • contains digits                    → +0.4
-///   • contains underscore / hyphen       → +0.2
-///   • length 2–3 with consonant-heavy    → +0.2 (n8n, k8s)
-///   • all-lowercase short word           → ≤ 0.2 (likely common English)
+/// Signals (all stack, capped at 1.0):
+///   • all-caps acronym 2–8 letters (NASA, IPO, MACOBS, FBI)   → +0.6
+///   • mixed case (camelCase, PascalCase, iPhone)              → +0.4
+///   • contains digits (n8n, k8s, gpt4)                        → +0.4
+///   • contains underscore / hyphen (snake_case, kebab-case)   → +0.2
+///   • short consonant-heavy with digit (n8n, k8s)             → +0.2
+///   • initial-cap proper-noun-ish (Anish, Vipassana, Cursor)  → +0.2
+///
+/// The all-caps path is critical — it's the canonical shape for the
+/// jargon class STT mishears most aggressively (acronyms / brand names
+/// / company codes), and earlier scoring missed it entirely.
 ///
 /// Result is clamped to [0, 1].
 pub fn jargon_score(token: &str) -> f64 {
@@ -167,25 +172,60 @@ pub fn jargon_score(token: &str) -> f64 {
 
     let has_lower = t.chars().any(|c| c.is_ascii_lowercase());
     let has_upper = t.chars().any(|c| c.is_ascii_uppercase());
-    if has_lower && has_upper {
+    let has_digit = t.chars().any(|c| c.is_ascii_digit());
+    let len       = t.chars().count();
+    let alpha_only = t.chars().all(|c| c.is_ascii_alphabetic());
+
+    // ── All-caps acronym ─────────────────────────────────────────────────
+    // The single biggest miss in the previous version.  An all-uppercase
+    // alphabetic token of 2–8 letters is almost always an acronym, brand
+    // ticker, or company code — exactly the shapes STT mishears worst.
+    // We require alpha_only so we don't double-count "K8S" (handled by the
+    // digit path below).
+    if alpha_only && has_upper && !has_lower && (2..=8).contains(&len) {
+        score += 0.6;
+    }
+
+    // ── Mixed case (camelCase, PascalCase, iPhone) ──────────────────────
+    // Strict: requires an uppercase letter AFTER the first character.
+    // Sentence-case ("The", "And") has uppercase only at position 0 and
+    // shouldn't count as jargon — those are common English.
+    let upper_after_first = t.chars().enumerate()
+        .any(|(i, c)| i > 0 && c.is_ascii_uppercase());
+    if has_lower && upper_after_first {
         score += 0.4;
     }
 
-    let has_digit = t.chars().any(|c| c.is_ascii_digit());
+    // ── Digits ──────────────────────────────────────────────────────────
     if has_digit {
         score += 0.4;
     }
 
+    // ── Underscore / hyphen ─────────────────────────────────────────────
     if t.contains('_') || t.contains('-') {
         score += 0.2;
     }
 
-    let len = t.chars().count();
+    // ── Consonant-heavy short word with digit (n8n, k8s, c0d3) ──────────
     let consonants = t.chars().filter(|c| {
         c.is_ascii_alphabetic() && !"aeiouAEIOU".contains(*c)
     }).count();
     if (2..=4).contains(&len) && consonants as f64 / len as f64 > 0.5 && has_digit {
         score += 0.2;
+    }
+
+    // ── Initial-capital proper-noun shape ──────────────────────────────
+    // Catches Anish, Vipassana, Cursor, Linear, Slack — names of people,
+    // brands, and tools, which STT mishears constantly.  We *only* award
+    // this when the rest is all lowercase (so we don't double-count
+    // mixed-case which already got 0.4) and the word is at least 4 chars
+    // (avoids generic "I", "A", "The" boosts).
+    if alpha_only && len >= 4 {
+        let first  = t.chars().next().unwrap();
+        let rest_lower = t.chars().skip(1).all(|c| c.is_ascii_lowercase());
+        if first.is_ascii_uppercase() && rest_lower {
+            score += 0.2;
+        }
     }
 
     score.min(1.0)
@@ -237,5 +277,50 @@ mod tests {
         assert!(jargon_score("camelCase") >= 0.4);
         assert!(jargon_score("hello") <  0.4);
         assert!(jargon_score("the")   <  0.4);
+    }
+
+    #[test]
+    fn jargon_detects_all_caps_acronyms() {
+        // The MACOBS regression — acronyms scored 0.0 before the fix.
+        assert!(jargon_score("MACOBS") >= 0.6, "got {}", jargon_score("MACOBS"));
+        assert!(jargon_score("NASA")   >= 0.6);
+        assert!(jargon_score("IPO")    >= 0.6);
+        assert!(jargon_score("FBI")    >= 0.6);
+        assert!(jargon_score("EMIAC")  >= 0.6);
+        assert!(jargon_score("COVID")  >= 0.6);
+        // Too long — likely a sentence shouty-cap, not an acronym
+        assert!(jargon_score("THISISNOTAACRONYM") < 0.6);
+    }
+
+    #[test]
+    fn jargon_detects_proper_noun_initial_cap() {
+        // Names + brand names — STT mishears these constantly
+        assert!(jargon_score("Anish")     >= 0.2);
+        assert!(jargon_score("Vipassana") >= 0.2);
+        assert!(jargon_score("Cursor")    >= 0.2);
+        assert!(jargon_score("Linear")    >= 0.2);
+        // But NOT capitalised normal English at sentence-start
+        // (we accept some false positives here — the cost is "STT got The
+        //  vs the right" being treated as slightly jargon-like, low risk)
+        assert!(jargon_score("The")  < 0.4);  // length 3, doesn't trigger initial-cap path
+    }
+
+    #[test]
+    fn jargon_score_stacks_correctly() {
+        // iPhone: mixed case (+0.4), no digits, no _-, length 6
+        // Should score ~0.4
+        let p = jargon_score("iPhone");
+        assert!(p >= 0.4 && p <= 0.6, "iPhone scored {p}");
+
+        // K8S: all-caps + digit → 0.6 + 0.4 = 1.0
+        let k = jargon_score("K8S");
+        assert!(k >= 0.6, "K8S scored {k}");
+    }
+
+    #[test]
+    fn jargon_ignores_common_english_words() {
+        for word in &["the", "and", "for", "is", "was", "going", "really", "thought"] {
+            assert!(jargon_score(word) < 0.4, "{word:?} scored too high: {}", jargon_score(word));
+        }
     }
 }

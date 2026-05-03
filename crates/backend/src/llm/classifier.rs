@@ -164,9 +164,14 @@ A hunk is a contiguous region where polish and user_kept differ. Hunks are compu
 
 For each hunk, pick exactly ONE class:
 
-1. STT_ERROR — The STT engine misheard a word the user actually said. Both transcript and polish contain the wrong word; user_kept restores what was actually spoken. Most common for names, brands, code identifiers (n8n, k8s), technical terms, non-English words.
-   Signature: kept_window is absent from transcript AND polish AND looks jargon-like (digits, mixed case, rare term).
-   Example: transcript_window="written", polish_window="written", kept_window="n8n" → STT_ERROR.
+1. STT_ERROR — The STT engine misheard a word the user actually said. Both transcript and polish contain the wrong word; user_kept restores what was actually spoken. Most common for:
+     • All-caps acronyms (NASA, IPO, MACOBS, FBI, EMIAC)
+     • Brand / product names (Cursor, Claude, Linear, Anish)
+     • Code identifiers (n8n, k8s, snake_case, camelCase)
+     • Non-English / technical terms (Vipassana, satsang)
+   Signature: kept_window is absent from transcript AND polish AND looks jargon-like (digits, mixed case, all-caps acronym, capitalised proper noun, rare term).  When polish has multiple common words and kept compresses them into a single jargon-y token (e.g. "Main corps" → "MACOBS", "Cloud Code" → "ClaudeCode"), this is virtually always STT_ERROR — set confidence high (≥ 0.85).
+   Example: transcript_window="written", polish_window="written", kept_window="n8n" → STT_ERROR (confidence 0.95).
+   Example: transcript_window="Main corps", polish_window="Main corps", kept_window="MACOBS" → STT_ERROR (confidence 0.9), extracted_term: {"transcript_form":"Main corps","correct_form":"MACOBS"}.
 
 2. POLISH_ERROR — STT captured correctly, polish rewrote wrongly, user reverted to transcript form.
    Signature: kept_window equals transcript_window AND differs from polish_window.
