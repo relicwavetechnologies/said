@@ -30,6 +30,7 @@ const MIGRATION_010: &str = include_str!("migrations/010_groq_api_key.sql");
 const MIGRATION_011: &str = include_str!("migrations/011_embed_dims_256.sql");
 const MIGRATION_012: &str = include_str!("migrations/012_vocabulary_and_stt_replacements.sql");
 const MIGRATION_013: &str = include_str!("migrations/013_pending_promotions_and_language.sql");
+const MIGRATION_014: &str = include_str!("migrations/014_vocabulary_example_context.sql");
 
 /// Open (or create) the SQLite database at `path`, run pending migrations,
 /// and return a connection pool.
@@ -171,6 +172,14 @@ fn run_migrations(pool: &DbPool) {
             .expect("migration 013 failed");
         conn.execute_batch("PRAGMA user_version = 13")
             .expect("failed to set user_version to 13");
+    }
+
+    if version < 14 {
+        info!("running migration 014_vocabulary_example_context");
+        conn.execute_batch(MIGRATION_014)
+            .expect("migration 014 failed");
+        conn.execute_batch("PRAGMA user_version = 14")
+            .expect("failed to set user_version to 14");
     }
 }
 

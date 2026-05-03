@@ -77,7 +77,7 @@ use crate::{
     embedder::gemini,
     llm::{
         gateway, gemini_direct, groq, openai_codex,
-        prompt::{build_system_prompt_with_vocab, build_user_message},
+        prompt::{build_system_prompt_with_vocab_entries, build_user_message, VocabEntry},
     },
     store::{
         history::{InsertRecording, insert_recording},
@@ -148,13 +148,26 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
     let vocab_task = {
         let pool_c = pool.clone();
         let uid_c = user_id.clone();
-        tokio::task::spawn_blocking(move || vocabulary::top_term_strings(&pool_c, &uid_c, 100))
+        // Load full VocabTerm rows so we can carry example_context into the
+        // polish prompt — the foundational signal that lets the LLM do
+        // context-aware recognition of unseen STT mishearings.
+        tokio::task::spawn_blocking(move || vocabulary::top_terms(&pool_c, &uid_c, 100))
     };
-    let (prefs_opt, (word_corrections, stt_replacement_rules), vocab_terms) = tokio::join!(
+    let (prefs_opt, (word_corrections, stt_replacement_rules), vocab_full) = tokio::join!(
         crate::get_prefs_cached(&state.prefs_cache, &pool, &user_id),
         crate::get_lexicon_cached(&state.lexicon_cache, &pool, &user_id),
         async { vocab_task.await.unwrap_or_default() },
     );
+    // Bare term strings for Deepgram keyterm bias.
+    let vocab_terms: Vec<String> = vocab_full.iter().map(|v| v.term.clone()).collect();
+    // (term, context) entries for the polish prompt.
+    let vocab_entries: Vec<VocabEntry> = vocab_full
+        .iter()
+        .map(|v| VocabEntry {
+            term:    v.term.clone(),
+            context: v.example_context.clone(),
+        })
+        .collect();
 
     // ── Build SSE stream ───────────────────────────────────────────────────────
     let audio_id_ref = saved_audio_id.clone();
@@ -312,8 +325,8 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
 
         // 5. Build full system prompt — RAG examples + soft polish-layer corrections
         //    + personal vocabulary (preserve-verbatim instruction).
-        let system_prompt = build_system_prompt_with_vocab(
-            &prefs, &rag_examples, &word_corrections, &vocab_terms,
+        let system_prompt = build_system_prompt_with_vocab_entries(
+            &prefs, &rag_examples, &word_corrections, &vocab_entries,
         );
 
         // 6. Stream LLM tokens — dispatch to openai_codex / gemini_direct / gateway

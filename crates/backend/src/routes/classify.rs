@@ -354,8 +354,14 @@ pub async fn classify(
                     continue;
                 }
 
-                if vocabulary::upsert_for_language(
+                // Capture the surrounding sentence as example_context.
+                // Find the sentence containing `correct` in user_kept; if no
+                // sentence boundary, use the whole user_kept (it's already a
+                // short message in nearly all cases).
+                let example_ctx = surrounding_sentence(&body.user_kept, correct);
+                if vocabulary::upsert_for_language_with_context(
                     &state.pool, &state.default_user_id, correct, 1.0, "auto", &output_language,
+                    example_ctx.as_deref(),
                 ) {
                     learned = true;
                     promoted_count += 1;
@@ -659,6 +665,33 @@ fn merge_triage_with_llm(
     classifier::ClassifyResult { class: overall, reason, candidates, confidence }
 }
 
+/// Find the sentence inside `text` that contains `term`, returning it
+/// trimmed. When the term appears inside a longer message, this gives the
+/// polish LLM exactly the surrounding context the user used the term in
+/// (the foundational signal for context-aware mishearing recognition).
+///
+/// Sentence boundaries: '.', '!', '?', '\n'. Falls back to the whole text
+/// when no boundary brackets the term.
+fn surrounding_sentence(text: &str, term: &str) -> Option<String> {
+    let term_l = term.to_ascii_lowercase();
+    if term_l.is_empty() { return None; }
+    let text_l = text.to_ascii_lowercase();
+    let pos = text_l.find(&term_l)?;
+    // Walk backward to nearest sentence terminator (or start of text).
+    let start = text[..pos]
+        .rfind(|c: char| matches!(c, '.' | '!' | '?' | '\n'))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    // Walk forward to nearest terminator after the term.
+    let after_term = pos + term.len();
+    let end = text[after_term..]
+        .find(|c: char| matches!(c, '.' | '!' | '?' | '\n'))
+        .map(|i| after_term + i + 1)
+        .unwrap_or(text.len());
+    let snippet = text[start..end].trim();
+    if snippet.is_empty() { None } else { Some(snippet.to_string()) }
+}
+
 fn empty_response(class: &str, reason: &str) -> ClassifyResponse {
     ClassifyResponse {
         class:          class.to_string(),
@@ -677,6 +710,40 @@ fn empty_response(class: &str, reason: &str) -> ClassifyResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn surrounding_sentence_returns_the_containing_clause() {
+        let text = "Hello there. MACOBS ka IPO ka 12 hazaar batana. Then bye.";
+        let got  = surrounding_sentence(text, "MACOBS");
+        assert_eq!(got.as_deref(), Some("MACOBS ka IPO ka 12 hazaar batana."));
+    }
+
+    #[test]
+    fn surrounding_sentence_handles_no_terminator() {
+        let text = "MACOBS ka IPO ka 12 hazaar batana";  // no '.', '!', '?'
+        let got  = surrounding_sentence(text, "MACOBS");
+        assert_eq!(got.as_deref(), Some("MACOBS ka IPO ka 12 hazaar batana"));
+    }
+
+    #[test]
+    fn surrounding_sentence_handles_term_at_start() {
+        let text = "MACOBS! Then more text.";
+        let got  = surrounding_sentence(text, "MACOBS");
+        assert_eq!(got.as_deref(), Some("MACOBS!"));
+    }
+
+    #[test]
+    fn surrounding_sentence_returns_none_for_missing_term() {
+        assert!(surrounding_sentence("nothing here", "MACOBS").is_none());
+    }
+
+    #[test]
+    fn surrounding_sentence_is_case_insensitive() {
+        // user_kept may have the term in any case; we still want to find it
+        let text = "Hello. macobs ka IPO. Bye.";
+        let got  = surrounding_sentence(text, "MACOBS");
+        assert_eq!(got.as_deref(), Some("macobs ka IPO."));
+    }
 
     #[test]
     fn capture_method_policy_table() {

@@ -20,6 +20,24 @@ pub struct RagExample {
     pub user_kept: String,
 }
 
+/// One vocabulary entry as fed to the polish prompt. Carries the canonical
+/// term and (optionally) an example sentence the term was first observed
+/// in. The example is what enables context-aware recognition of unseen STT
+/// mishearings: when polish sees "main course ka IPO" but the vocab has
+/// `term="MACOBS"` with `context="MACOBS ka IPO ka 12 hazaar batana"`,
+/// the LLM can match the *context shape* and output MACOBS even though
+/// the literal "main course" isn't a stored alias.
+pub struct VocabEntry {
+    pub term:    String,
+    pub context: Option<String>,
+}
+
+impl VocabEntry {
+    pub fn from_term(term: impl Into<String>) -> Self {
+        Self { term: term.into(), context: None }
+    }
+}
+
 /// Build the full system-prompt string.
 ///
 /// `corrections` are LLM-polish substitutions learned from past POLISH_ERRORs.
@@ -43,41 +61,75 @@ pub fn build_system_prompt(
     build_system_prompt_with_vocab(prefs, rag_examples, corrections, &[])
 }
 
-/// Variant that also injects the personal vocabulary list as a preserve-verbatim
-/// instruction.  Existing call sites can keep using `build_system_prompt`; new
-/// callers should switch to this and pass the vocabulary terms.
+/// Backwards-compatible wrapper — wraps bare term strings into VocabEntry
+/// values with no context. Prefer `build_system_prompt_with_vocab_entries`
+/// for new code so contexts can flow through.
 pub fn build_system_prompt_with_vocab(
     prefs: &Preferences,
     rag_examples: &[RagExample],
     corrections: &[Correction],
     vocabulary_terms: &[String],
 ) -> String {
+    let entries: Vec<VocabEntry> = vocabulary_terms
+        .iter()
+        .map(|t| VocabEntry::from_term(t.clone()))
+        .collect();
+    build_system_prompt_with_vocab_entries(prefs, rag_examples, corrections, &entries)
+}
+
+/// Full builder with context-aware vocabulary. Each `VocabEntry` may carry
+/// an example sentence the term was observed in; the polish prompt surfaces
+/// these so the LLM can do context-aware recognition of mishearings.
+pub fn build_system_prompt_with_vocab_entries(
+    prefs: &Preferences,
+    rag_examples: &[RagExample],
+    corrections: &[Correction],
+    vocabulary_entries: &[VocabEntry],
+) -> String {
     let lang_rule    = language_rule(&prefs.output_language);
     let persona      = persona_block(prefs);
     let tone         = tone_description(&prefs.tone_preset);
     let script_check = script_final_check(&prefs.output_language);
 
-    // Vocabulary preservation block — instructs the LLM to leave learned
-    // jargon untouched.  Empty when the user has no vocab yet.
-    let vocab_block = if vocabulary_terms.is_empty() {
+    // Vocabulary preservation block — instructs the LLM to (a) keep known
+    // terms verbatim, (b) RECOGNISE phonetically-similar mishearings of
+    // them. Each entry may carry an example sentence the term was observed
+    // in — that's the foundational signal for context-aware recognition of
+    // unseen mishearings ("main course ka IPO" → MACOBS, when MACOBS's
+    // example is "MACOBS ka IPO ka 12 hazaar").
+    let vocab_block = if vocabulary_entries.is_empty() {
         String::new()
     } else {
-        let table = vocabulary_terms
+        let table = vocabulary_entries
             .iter()
-            .map(|t| format!("  {t}"))
+            .map(|e| match &e.context {
+                Some(ctx) if !ctx.trim().is_empty() => format!("  {} — example: \"{}\"", e.term, ctx.trim()),
+                _ => format!("  {}", e.term),
+            })
             .collect::<Vec<_>>()
             .join("\n");
         format!(
             "<personal_vocabulary>\n\
-             The following terms are part of the user's personal vocabulary \
-             (names, brands, code identifiers, technical terms).\n\
+             The following are the user's personal vocabulary terms — names, \
+             brands, code identifiers, acronyms, technical terms — together \
+             with the example sentence each was first observed in. The example \
+             tells you the CONTEXT in which the user uses the term.\n\n\
              RULES:\n\
-             1. If any of these terms appears in the transcript, KEEP IT VERBATIM \
-             in the output — same spelling, same case.\n\
+             1. If a term appears verbatim in the transcript, KEEP IT — same \
+             spelling, same case.\n\
              2. Do NOT translate, expand, or substitute these terms.\n\
-             3. If the transcript contains a phonetically-similar wrong word \
-             (e.g. transcript says \"written\" where the user meant a vocabulary \
-             term like \"n8n\"), prefer the vocabulary term.\n\n\
+             3. RECOGNISE MISHEARINGS: if the transcript contains a word or \
+             short phrase that is phonetically similar to a vocabulary term \
+             AND appears in a context that resembles the term's example, \
+             REPLACE it with the canonical term.\n\
+                Example: vocab has `MACOBS — example: \"MACOBS ka IPO ka 12 \
+             hazaar batana\"`. Transcript says \"main course ka IPO ka 12 \
+             hazaar batana\" — context matches → output MACOBS, not \"main course\".\n\
+                Counter-example: vocab has `MACOBS — example: \"MACOBS ka IPO\"`. \
+             Transcript says \"the main course at dinner was great\" — context \
+             does NOT match (no IPO/finance signal) → leave \"main course\" alone.\n\
+             4. When in doubt (similar sound but unrelated context), keep the \
+             transcript as-is. Don't over-replace.\n\n\
              {table}\n\
              </personal_vocabulary>\n\n"
         )
@@ -329,7 +381,9 @@ mod tests {
         assert!(prompt.contains("<personal_vocabulary>"), "vocab block should be emitted");
         assert!(prompt.contains("n8n"));
         assert!(prompt.contains("Vipassana"));
-        assert!(prompt.contains("KEEP IT VERBATIM"));
+        assert!(prompt.contains("KEEP IT"), "verbatim-keep instruction should appear");
+        assert!(prompt.contains("RECOGNISE MISHEARINGS"),
+                "context-aware mishearing instruction should appear");
     }
 
     #[test]
@@ -340,8 +394,31 @@ mod tests {
         // conditional reference in <task>) must not be present.
         assert!(!prompt.contains("<personal_vocabulary>\n"),
                 "expected no vocabulary block when terms are empty");
-        assert!(!prompt.contains("KEEP IT VERBATIM"),
+        assert!(!prompt.contains("RECOGNISE MISHEARINGS"),
                 "vocab instructions should be gated on having terms");
+    }
+
+    #[test]
+    fn vocab_entries_with_context_render_inline() {
+        // The foundational addition: contexts are inlined as `term — example: "..."`
+        // so the LLM has the situational signal it needs to disambiguate
+        // unseen STT mishearings.
+        let p = prefs();
+        let entries = vec![
+            VocabEntry {
+                term:    "MACOBS".into(),
+                context: Some("MACOBS ka IPO ka 12 hazaar batana".into()),
+            },
+            VocabEntry {
+                term:    "n8n".into(),
+                context: None,
+            },
+        ];
+        let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
+        assert!(prompt.contains("MACOBS — example: \"MACOBS ka IPO ka 12 hazaar batana\""),
+                "entry with context should render `term — example: \"...\"`");
+        assert!(prompt.contains("  n8n\n"),
+                "entry without context should render bare term");
     }
 
     #[test]
