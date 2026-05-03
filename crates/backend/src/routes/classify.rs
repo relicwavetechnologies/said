@@ -86,6 +86,16 @@ fn capture_allows_auto_promote(capture_method: &str) -> bool {
     matches!(capture_method, "ax" | "keystroke_verified" | "clipboard")
 }
 
+/// Stricter subset of `capture_allows_auto_promote`: captures whose source
+/// is an *atomic* read of a specific text element.  An AX read returning a
+/// value means it came from the targeted element at that moment; a focus
+/// change after the read doesn't invalidate it.  Keystroke / clipboard
+/// captures, by contrast, can include events from a window the user already
+/// switched to, so they're treated as low-confidence under app-switch.
+fn is_high_confidence_capture(capture_method: &str) -> bool {
+    matches!(capture_method, "ax" | "keystroke_verified")
+}
+
 #[derive(Serialize)]
 pub struct ClassifyResponse {
     pub class:          String,
@@ -125,32 +135,41 @@ pub async fn classify(
         .map(|p| p.output_language.clone())
         .unwrap_or_else(|| "hinglish".into());
 
-    // 2. CAPTURE_ERROR gate.  Reject obvious bad signals before we burn any
-    //    pipeline budget on them.  Each check below corresponds to a real
-    //    failure mode in the AX/keystroke capture path:
+    // 2. CAPTURE_ERROR gate.  Each check rejects an *obviously* bad signal
+    //    so the LLM doesn't burn budget on it.  Critical: we never reject a
+    //    high-confidence AX or keystroke_verified capture just because of an
+    //    out-of-band condition like app_switch — those reads are atomic
+    //    snapshots of a specific element at a specific moment, so a later
+    //    focus change doesn't invalidate them.
     //
-    //      • app_switched      — the user moved focus away mid-edit; whatever
-    //                            we read is almost certainly from a different
-    //                            text element and shouldn't be attributed to
-    //                            our paste.
-    //      • matches_clipboard — the captured text equals the user's clipboard
-    //                            at capture time.  They pasted something on
-    //                            top of our paste; the diff is meaningless.
-    //      • too late          — > 30 s after paste.  Either the user walked
-    //                            away or this is an entirely unrelated edit
-    //                            in the same field.
-    if body.app_switched {
-        info!("[classify] capture_error: app_switched between paste and capture for {}", body.recording_id);
-        return (
-            StatusCode::OK,
-            Json(empty_response("USER_REPHRASE", "capture_error: app changed mid-edit")),
-        );
-    }
+    //      • matches_clipboard — kept text equals the user's clipboard at
+    //                            capture time.  They pasted on top of our
+    //                            paste; the diff is meaningless regardless of
+    //                            capture method.
+    //      • app_switched      — focus left the original window mid-watch.
+    //                            ONLY rejected for keystroke-only / clipboard
+    //                            captures (those signals can be polluted by
+    //                            the new window).  AX captures are kept —
+    //                            an AX read returning text means it came from
+    //                            the targeted element atomically, before we
+    //                            noticed the switch.
+    //      • too late          — > 30 s after paste.  Universal reject; a
+    //                            very late edit is rarely tied to our paste.
     if body.matches_clipboard {
         info!("[classify] capture_error: kept text matches clipboard for {}", body.recording_id);
         return (
             StatusCode::OK,
             Json(empty_response("USER_REPHRASE", "capture_error: kept matches clipboard (user pasted)")),
+        );
+    }
+    if body.app_switched && !is_high_confidence_capture(&body.capture_method) {
+        info!(
+            "[classify] capture_error: app_switched + low-confidence capture ({:?}) for {}",
+            body.capture_method, body.recording_id,
+        );
+        return (
+            StatusCode::OK,
+            Json(empty_response("USER_REPHRASE", "capture_error: app changed during low-confidence capture")),
         );
     }
     if body.time_since_paste_ms > CAPTURE_STALE_MS {

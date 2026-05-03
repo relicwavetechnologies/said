@@ -336,6 +336,21 @@
       }
     },
     {
+      "name": "REGRESSION: AX-captured edit must survive app-switch",
+      "polish": "Main Corps ka IPO ko baarah hazaar batana tha",
+      "user_kept": "MACOBS ka IPO ko baarah hazaar batana tha",
+      "transcript": "Main Corps ka IPO ko baarah hazaar batana tha",
+      "output_language": "hinglish",
+      "capture_method": "ax",
+      "expected": {
+        "pre_filter": "pass",
+        "expected_class": "STT_ERROR",
+        "should_promote_term": "MACOBS",
+        "promotion_should_pass": true,
+        "notes": "Real production case: user fixed Main Corps -> MACOBS (acronym), then briefly switched apps. AX read had already captured the edit atomically. Earlier version of CAPTURE_ERROR gate dropped it; new version trusts AX-confirmed captures regardless of app_switched."
+      }
+    },
+    {
       "name": "Hindi mode allows Devanagari learning",
       "polish": "main kal jaunga",
       "user_kept": "मैं कल जाऊंगा",
