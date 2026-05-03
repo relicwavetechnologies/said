@@ -670,6 +670,46 @@ fn sync_tray(handle: &tauri::AppHandle, snap: &AppSnapshot) {
     }
 }
 
+// ── Floating status bar ───────────────────────────────────────────────────────
+
+/// Create the always-on-top floating status pill.
+///
+/// The window loads the same SPA with `#statusbar` in the hash so `main.tsx`
+/// renders `<StatusBar />` instead of the full app.  It starts hidden; the
+/// React component calls `appWindow.show()` / `hide()` as the pipeline runs.
+fn create_status_bar(app: &tauri::AppHandle) {
+    // Position: bottom-center, 90 px above the dock
+    let (x, y) = if let Ok(Some(m)) = app.primary_monitor() {
+        let sf = m.scale_factor();
+        let sw = m.size().width  as f64 / sf;
+        let sh = m.size().height as f64 / sf;
+        let mx = m.position().x as f64 / sf;
+        let my = m.position().y as f64 / sf;
+        (mx + sw / 2.0 - 160.0, my + sh - 56.0 - 90.0)
+    } else {
+        (560.0, 860.0)
+    };
+
+    match tauri::WebviewWindowBuilder::new(
+        app,
+        "status-bar",
+        tauri::WebviewUrl::App("index.html#statusbar".into()),
+    )
+    .title("Said")
+    .inner_size(320.0, 56.0)
+    .position(x, y)
+    .decorations(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .resizable(false)
+    .visible(false)
+    .build()
+    {
+        Ok(_)  => tracing::info!("[status-bar] window created at ({x:.0},{y:.0})"),
+        Err(e) => tracing::warn!("[status-bar] could not create window: {e}"),
+    }
+}
+
 // ── Tray action helpers ───────────────────────────────────────────────────────
 
 /// Trigger recording from a tray menu click.
@@ -2728,6 +2768,9 @@ fn main() {
                         }
                     });
                 }
+
+                // ── Floating status bar ────────────────────────────────────────
+                create_status_bar(app.handle());
 
                 // ── Caps Lock hold-to-record (macOS only) ─────────────────────
                 #[cfg(target_os = "macos")]
