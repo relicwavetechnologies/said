@@ -27,10 +27,10 @@ pub use super::PolishResult;
 
 const GROQ_ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions";
 
-/// Default model — best balance of quality and speed for Hinglish.
-pub const GROQ_MODEL_DEFAULT: &str = "llama-3.3-70b-versatile";
-/// Fast model — lower latency, slightly less quality.
-pub const GROQ_MODEL_FAST:    &str = "llama-3.1-8b-instant";
+/// Default model — Llama 4 Scout, best quality + speed for Hinglish on Groq.
+pub const GROQ_MODEL_DEFAULT: &str = "meta-llama/llama-4-scout-17b-16e-instruct";
+/// Fast model — lower latency fallback.
+pub const GROQ_MODEL_FAST:    &str = "meta-llama/llama-4-scout-17b-16e-instruct";
 
 // ── SSE types (identical to OpenAI format) ────────────────────────────────────
 

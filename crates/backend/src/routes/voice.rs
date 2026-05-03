@@ -82,7 +82,6 @@ use crate::{
     store::{
         history::{InsertRecording, insert_recording},
         openai_oauth, stt_replacements,
-        vectors::retrieve_similar,
         vocabulary,
     },
     stt::deepgram,
@@ -173,9 +172,8 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
     let audio_id_ref = saved_audio_id.clone();
     let stream = async_stream::stream! {
         let total_start = Instant::now();
-        let aid = audio_id_ref.as_deref(); // available for error payloads
+        let aid = audio_id_ref.as_deref();
 
-        // 1. Load prefs (already fetched above — just unwrap here)
         let prefs = match prefs_opt {
             Some(p) => p,
             None => {
@@ -187,12 +185,7 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
                 return;
             }
         };
-        debug!(
-            "[voice] prefs: lang={:?} tone={:?} model={:?}",
-            prefs.output_language, prefs.tone_preset, prefs.selected_model
-        );
 
-        // Keys: prefer DB-stored value, fall back to env var (useful in dev)
         let deepgram_key = prefs.deepgram_api_key.clone()
             .or_else(|| std::env::var("DEEPGRAM_API_KEY").ok())
             .unwrap_or_default();
@@ -207,37 +200,21 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
             .or_else(|| std::env::var("GROQ_API_KEY").ok())
             .unwrap_or_default();
 
-        if !vocab_terms.is_empty() {
-            info!("[voice] biasing STT with {} personal term(s)", vocab_terms.len());
-        }
-
-        // 2. Transcribe (skip if pre_transcript supplied by Tauri WS pipeline)
-        //
-        // Two transcripts are maintained:
-        //   stt_transcript_raw — plain text from Deepgram (or pre_transcript stripped)
-        //   enriched_raw       — same text but with [word?XX%] markers on
-        //                        low-confidence words (sent to the LLM)
+        // ── STEP 1: STT ───────────────────────────────────────────────────────────
         let (stt_transcript_raw, enriched_raw, stt_confidence, transcribe_ms) = if let Some(t) = pre_transcript {
-            // P5: Tauri already had a transcript from Deepgram WS — skip HTTP STT.
-            // The WS path sends an enriched transcript (with [word?XX%] markers)
-            // as-is.  It contains both the plain words and the confidence markers.
-            info!("[voice] using pre-transcript ({} chars) — STT step skipped", t.len());
-            // Strip markers for the plain version (used in DB/embedding)
             let plain = strip_confidence_markers(&t);
+            let ms = total_start.elapsed().as_millis();
+            info!("[timing] STT=0ms (WS pre-transcript, {} words) @{ms}ms", plain.split_whitespace().count());
             (plain, t, 0.95_f64, 0_i64)
         } else {
-            // Normal path: send WAV to Deepgram HTTP batch API
             yield Ok(Event::default().event("status")
                 .data(json!({"phase": "transcribing"}).to_string()));
-
             let t_start = Instant::now();
             match deepgram::transcribe(&http_client, &deepgram_key, wav_data, &prefs.language, &vocab_terms).await {
                 Ok(r) => {
                     let ms = t_start.elapsed().as_millis() as i64;
-                    info!("[voice] transcript in {ms}ms ({} uncertain words): {}", r.uncertain_count, r.transcript);
-                    if r.uncertain_count > 0 {
-                        info!("[voice] enriched for LLM: {}", r.enriched_transcript);
-                    }
+                    info!("[timing] STT={}ms (batch, {} words, conf={:.2})",
+                        ms, r.transcript.split_whitespace().count(), r.confidence);
                     (r.transcript, r.enriched_transcript, r.confidence, ms)
                 }
                 Err(e) => {
@@ -250,23 +227,13 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
             }
         };
 
-        // ── Apply post-STT phonetic/literal replacements ───────────────────────
-        // Applied to BOTH the plain transcript (used for storage/embedding) and
-        // the enriched transcript (sent to the LLM).  apply() preserves the
-        // surrounding [...?XX%] punctuation around tokens it rewrites, so a
-        // marker like "[written?47%]" becomes "[n8n?47%]" — the LLM still sees
-        // the uncertainty signal but on the corrected token.
-        // stt_replacement_rules loaded from LexiconCache before stream started
         let (stt_transcript, enriched_transcript) = if stt_replacement_rules.is_empty() {
             (stt_transcript_raw, enriched_raw)
         } else {
             let plain_rewritten = stt_replacements::apply(&stt_transcript_raw, &stt_replacement_rules);
             let enriched_rewritten = stt_replacements::apply(&enriched_raw, &stt_replacement_rules);
             if plain_rewritten != stt_transcript_raw {
-                info!(
-                    "[voice] post-STT replacement applied: {:?} → {:?}",
-                    stt_transcript_raw, plain_rewritten
-                );
+                info!("[voice] lexicon replacement: {:?} → {:?}", stt_transcript_raw, plain_rewritten);
             }
             (plain_rewritten, enriched_rewritten)
         };
@@ -274,77 +241,50 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
         let status_payload = json!({"phase": "polishing", "transcript": &stt_transcript}).to_string();
         yield Ok(Event::default().event("status").data(status_payload));
 
-        // ── P2: Spawn embedding immediately — runs in parallel with prompt building ──
+        // ── STEP 2: Embed (fire-and-forget — updates DB for future recordings) ──────
+        // We don't await embed: word corrections from LexiconCache already cover
+        // personalization for this recording. Embed result populates the vector DB
+        // so RAG benefits the NEXT recording instead of blocking this one.
         let transcript_for_embed = stt_transcript.clone();
         let http_for_embed       = http_client.clone();
         let pool_for_embed       = pool.clone();
         let gemini_key_embed     = gemini_key.clone();
-        let embed_start          = Instant::now();
 
-        let embed_task = tokio::spawn(async move {
-            gemini::embed(&http_for_embed, &pool_for_embed, &transcript_for_embed, &gemini_key_embed).await
+        tokio::spawn(async move {
+            let t = tokio::time::Instant::now();
+            let hit = gemini::embed(&http_for_embed, &pool_for_embed, &transcript_for_embed, &gemini_key_embed).await.is_some();
+            info!("[timing] embed={}ms (bg, {})", t.elapsed().as_millis(), if hit { "ok" } else { "skip/no-key" });
         });
 
-        // Build prompt skeleton concurrently while embedding runs
-        // (RAG examples will be injected once the embedding is available)
-        let model = voice_polish_core::resolve_model(&prefs.selected_model).to_string();
-        // Send the ENRICHED transcript to the LLM (with [word?XX%] markers)
-        // so it knows which words to scrutinize for context-based correction.
+        let embed_ms: i64 = 0; // non-blocking, not on critical path
+
+        let model        = voice_polish_core::resolve_model(&prefs.selected_model).to_string();
         let user_message = build_user_message(&enriched_transcript, &prefs.output_language);
 
-        // 3. Wait for embedding result (P2: overlapped with prompt prep above)
-        let embedding  = embed_task.await.unwrap_or(None);
-        let embed_ms   = embed_start.elapsed().as_millis() as i64;
+        // ── STEP 3: RAG — skipped (embed is async, use LexiconCache corrections) ──
+        let rag_examples: Vec<crate::llm::prompt::RagExample> = vec![];
+        let rag_ms: u128 = 0;
+        let examples_used = 0usize;
+        info!("[timing] RAG=0ms (skipped — embed async)");
 
-        // 4. RAG retrieval — off-loaded to blocking pool (sync SQLite KNN, ~5-10 ms).
-        let rag_examples = match &embedding {
-            Some(emb) => {
-                let emb_clone = emb.clone();
-                let pool_rag  = pool.clone();
-                let uid_rag   = user_id.clone();
-                let hits = tokio::task::spawn_blocking(move || {
-                    retrieve_similar(&pool_rag, &uid_rag, &emb_clone, 5, 0.65)
-                }).await.unwrap_or_default();
-                info!("[rag] {} example(s) retrieved for transcript", hits.len());
-                for (i, ex) in hits.iter().enumerate() {
-                    info!("[rag] example {}: ai={:?}  kept={:?}", i + 1, ex.ai_output, ex.user_kept);
-                }
-                hits
-            }
-            None => {
-                info!("[rag] skipped — embedding unavailable");
-                vec![]
-            }
-        };
-        let examples_used = rag_examples.len();
-
-        // 4b. Word corrections loaded from LexiconCache before stream started
-        if !word_corrections.is_empty() {
-            info!("[voice] {} word correction(s) loaded", word_corrections.len());
-        }
-
-        // 5. Build full system prompt — RAG examples + soft polish-layer corrections
-        //    + personal vocabulary (preserve-verbatim instruction).
+        // ── STEP 4: Build prompt ──────────────────────────────────────────────────
         let system_prompt = build_system_prompt_with_vocab_entries(
             &prefs, &rag_examples, &word_corrections, &vocab_entries,
         );
 
-        // 6. Stream LLM tokens — dispatch to openai_codex / gemini_direct / gateway
+        // ── STEP 5: LLM stream ────────────────────────────────────────────────────
         let llm_provider  = prefs.llm_provider.clone();
         let (token_tx, mut token_rx) = mpsc::channel::<String>(64);
         let sys_p       = system_prompt.clone();
         let usr_m       = user_message.clone();
         let client_c    = http_client.clone();
 
-        // Resolve model string and gather any provider-specific credentials.
-        // openai_oauth::get_token is a sync SQLite read — off-load to blocking pool.
         let (model_for_llm, openai_token_opt) = if llm_provider == "openai_codex" {
             let pool_tok = pool.clone();
             let uid_tok  = user_id.clone();
             let tok = tokio::task::spawn_blocking(move || openai_oauth::get_token(&pool_tok, &uid_tok))
                 .await
                 .unwrap_or(None);
-            // Always use mini — smart model removed
             let m = openai_codex::MODEL_MINI.to_string();
             (m, tok.map(|t| t.access_token))
         } else if llm_provider == "gemini_direct" {
@@ -359,7 +299,8 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
         let gk_gemini   = gemini_key.clone();
         let gk_groq     = groq_key.clone();
 
-        info!("[voice] LLM provider={llm_provider:?} model={model_for_llm:?}");
+        let llm_start = Instant::now();
+        info!("[timing] LLM start — provider={llm_provider:?} model={model_for_llm:?}");
 
         let llm_task = tokio::spawn(async move {
             if llm_provider == "openai_codex" {
@@ -407,9 +348,13 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
             }
         };
 
-        let total_ms     = total_start.elapsed().as_millis() as i64;
+        let llm_ms   = llm_start.elapsed().as_millis() as i64;
+        let total_ms = total_start.elapsed().as_millis() as i64;
+        let word_count = llm_result.polished.split_whitespace().count() as i64;
+        info!("[timing] LLM={}ms (TTFT inside) | total={}ms ← STT={}ms embed={}ms rag={}ms llm={}ms",
+            llm_ms, total_ms, transcribe_ms, embed_ms, rag_ms, llm_ms);
+
         let recording_id = Uuid::new_v4().to_string();
-        let word_count   = llm_result.polished.split_whitespace().count() as i64;
 
         // 7. Persist recording before emitting `done`, so the UI refresh that
         // follows the done event can see both the row and its audio_id.
@@ -446,9 +391,6 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
             }
         }
 
-        debug!("[voice] done — {total_ms}ms total, {word_count} words, {examples_used} RAG examples");
-
-        // 8. Final SSE event
         yield Ok(Event::default().event("done").data(
             json!({
                 "recording_id": recording_id,
@@ -456,11 +398,11 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
                 "model_used":   model,
                 "confidence":   stt_confidence,
                 "latency_ms": {
-                    "transcribe": transcribe_ms,
-                    "embed":      embed_ms,
-                    "retrieve":   0,
-                    "polish":     llm_result.polish_ms,
-                    "total":      total_ms,
+                    "stt":      transcribe_ms,
+                    "embed":    embed_ms,
+                    "rag":      rag_ms,
+                    "llm":      llm_ms,
+                    "total":    total_ms,
                 },
                 "examples_used": examples_used,
             })

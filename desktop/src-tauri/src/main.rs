@@ -486,6 +486,11 @@ struct HotPathCacheInner {
     keyterms: Vec<String>,
 }
 
+/// Holds a pre-warmed Deepgram WS connection ready for the next recording.
+/// Populated immediately after each recording session ends so the TLS handshake
+/// is never on the hot path (~150ms saved normally, up to 3s saved on rapid use).
+struct PrewarmedWsState(Arc<tokio::sync::Mutex<Option<dg_stream::PrewarmedWs>>>);
+
 /// Lightweight cache of tray-relevant prefs so `sync_tray` never needs async.
 struct TrayCache(Mutex<TrayCacheInner>);
 struct TrayCacheInner {
@@ -652,6 +657,31 @@ fn build_tray_menu(
     )
 }
 
+fn sync_status_bar(handle: &tauri::AppHandle, state: &str) {
+    let Some(win) = handle.get_webview_window("status-bar") else {
+        tracing::warn!("[status-bar] sync requested for state={state}, but window was not found");
+        return;
+    };
+
+    tracing::info!("[status-bar] sync state={state}");
+    match win.set_always_on_top(true) {
+        Ok(_) => tracing::info!("[status-bar] set_always_on_top ok"),
+        Err(e) => tracing::warn!("[status-bar] set_always_on_top failed: {e}"),
+    }
+    match win.set_visible_on_all_workspaces(true) {
+        Ok(_) => tracing::info!("[status-bar] set_visible_on_all_workspaces ok"),
+        Err(e) => tracing::warn!("[status-bar] set_visible_on_all_workspaces failed: {e}"),
+    }
+    match win.set_focusable(false) {
+        Ok(_) => tracing::info!("[status-bar] set_focusable(false) ok"),
+        Err(e) => tracing::warn!("[status-bar] set_focusable(false) failed: {e}"),
+    }
+    match win.show() {
+        Ok(_) => tracing::info!("[status-bar] show ok for state={state}"),
+        Err(e) => tracing::warn!("[status-bar] show failed for state={state}: {e}"),
+    }
+}
+
 /// Re-render the tray icon title + menu from the cached prefs (no async needed).
 fn sync_tray(handle: &tauri::AppHandle, snap: &AppSnapshot) {
     if let Some(tray) = handle.tray_by_id("said") {
@@ -668,44 +698,71 @@ fn sync_tray(handle: &tauri::AppHandle, snap: &AppSnapshot) {
             let _ = tray.set_menu(Some(menu));
         }
     }
+
+    sync_status_bar(handle, &snap.state);
 }
 
 // ── Floating status bar ───────────────────────────────────────────────────────
 
 /// Create the always-on-top floating status pill.
 ///
-/// The window loads the same SPA with `#statusbar` in the hash so `main.tsx`
-/// renders `<StatusBar />` instead of the full app.  It starts hidden; the
-/// React component calls `appWindow.show()` / `hide()` as the pipeline runs.
+/// The window loads the same SPA with an explicit statusbar marker so
+/// `main.tsx` renders `<StatusBar />` instead of the full app. It starts visible
+/// as a tiny idle hover pill and expands as React receives pipeline events.
 fn create_status_bar(app: &tauri::AppHandle) {
-    // Position: bottom-center, 90 px above the dock
+    if app.get_webview_window("status-bar").is_some() {
+        tracing::info!("[status-bar] create skipped; window already exists");
+        return;
+    }
+
+    // Position: bottom-center, 90 px above the dock. Idle reserves a transparent
+    // hover area; CSS keeps the visible pill tiny until the pointer is over it.
+    let idle_w = 112.0;
+    let idle_h = 36.0;
     let (x, y) = if let Ok(Some(m)) = app.primary_monitor() {
         let sf = m.scale_factor();
         let sw = m.size().width  as f64 / sf;
         let sh = m.size().height as f64 / sf;
         let mx = m.position().x as f64 / sf;
         let my = m.position().y as f64 / sf;
-        (mx + sw / 2.0 - 160.0, my + sh - 56.0 - 90.0)
+        (mx + sw / 2.0 - idle_w / 2.0, my + sh - idle_h - 90.0)
     } else {
         (560.0, 860.0)
     };
 
+    let url = "index.html?view=statusbar#statusbar";
+    tracing::info!(
+        "[status-bar] creating window url={url} x={x:.0} y={y:.0} size={idle_w:.0}x{idle_h:.0} visible=true"
+    );
+
     match tauri::WebviewWindowBuilder::new(
         app,
         "status-bar",
-        tauri::WebviewUrl::App("index.html#statusbar".into()),
+        tauri::WebviewUrl::App(url.into()),
     )
     .title("Said")
-    .inner_size(320.0, 56.0)
+    .inner_size(idle_w, idle_h)
     .position(x, y)
     .decorations(false)
     .always_on_top(true)
+    .visible_on_all_workspaces(true)
     .skip_taskbar(true)
+    .focused(false)
+    .focusable(false)
     .resizable(false)
-    .visible(false)
+    .shadow(false)
+    .transparent(true)
+    .visible(true)
     .build()
     {
-        Ok(_)  => tracing::info!("[status-bar] window created at ({x:.0},{y:.0})"),
+        Ok(win)  => {
+            tracing::info!("[status-bar] window created label={}", win.label());
+            match win.url() {
+                Ok(url) => tracing::info!("[status-bar] resolved url={url}"),
+                Err(e) => tracing::warn!("[status-bar] could not read window url: {e}"),
+            }
+            sync_status_bar(app, "idle");
+        }
         Err(e) => tracing::warn!("[status-bar] could not create window: {e}"),
     }
 }
@@ -1134,37 +1191,38 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
         tracing::debug!("[record] pre-unlocked AX for focused app pid={pid:?}");
     }
 
-    let snap = shared
-        .lock()
-        .ok()
-        .and_then(|mut d| d.start_recording().ok());
-    if let Some(snap) = snap {
-        sync_tray(app, &snap);
-        let _ = app.emit("app-state", &snap);
+    let started = match shared.lock() {
+        Ok(mut d) => d.start_recording(),
+        Err(_) => return,
+    };
+    match started {
+        Ok(snap) => {
+            sync_tray(app, &snap);
+            let _ = app.emit("app-state", &snap);
+        }
+        Err(e) => {
+            let _ = app.emit("voice-error", serde_json::json!({
+                "message": e,
+                "audio_id": null,
+            }));
+            return;
+        }
     }
 
     // ── P5: Start Deepgram WS streaming immediately ────────────────────────────
-    // Take the chunk receiver from the recorder and open a WebSocket to Deepgram.
-    // The transcript will be ready (or close to it) by the time Caps Lock is released.
     let chunk_recv = shared.lock().ok().and_then(|mut d| d.take_chunk_receiver());
     if let Some(chunk_recv) = chunk_recv {
         let streaming_state = app.state::<StreamingState>();
         let (transcript_tx, transcript_rx) = tokio::sync::oneshot::channel::<String>();
-        // Use ok() — a poisoned mutex (from a previous panic) must not cascade
         if let Some(mut g) = streaming_state.0.lock().ok() {
             *g = Some(transcript_rx);
         }
 
-        let hot_cache_arc = Arc::clone(&app.state::<HotPathCache>().0);
-        let backend_for_pe = Arc::clone(&app.state::<BackendState>().0);
+        let hot_cache_arc    = Arc::clone(&app.state::<HotPathCache>().0);
+        let backend_for_pe   = Arc::clone(&app.state::<BackendState>().0);
+        let prewarm_arc      = Arc::clone(&app.state::<PrewarmedWsState>().0);
 
         tauri::async_runtime::spawn(async move {
-            // ── P5 hot path: zero HTTP calls before WS connect ─────────────────
-            //
-            // API key: read from env (instant).
-            // Language + keyterms: read from HotPathCache (in-memory RwLock,
-            // populated at startup and kept fresh by patch_preferences /
-            // submit_edit_feedback).  No network round-trips on this path.
             let deepgram_key = std::env::var("DEEPGRAM_API_KEY").unwrap_or_default();
             if deepgram_key.is_empty() {
                 tracing::warn!("[dg_stream] DEEPGRAM_API_KEY not set — WS streaming disabled");
@@ -1176,20 +1234,15 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
                 let c = hot_cache_arc.read().await;
                 (c.language.clone(), c.keyterms.clone())
             };
-            if !keyterms.is_empty() {
-                tracing::info!(
-                    "[dg_stream] biasing WS with {} cached term(s)",
-                    keyterms.len()
-                );
-            }
 
-            // Build pre-embed URL from backend endpoint (fire-and-forget on CloseStream)
+            // Take the pre-warmed WS (if one is ready) so this recording skips TLS handshake.
+            let prewarmed = prewarm_arc.lock().await.take();
+
             let pre_embed_info: Option<(String, String)> =
                 backend_for_pe.lock().ok().and_then(|g| {
                     g.as_ref()
                         .map(|ep| (format!("{}/v1/pre-embed", ep.url), ep.secret.clone()))
                 });
-
             let pre_embed_ref = pre_embed_info
                 .as_ref()
                 .map(|(url, secret)| (url.as_str(), secret.as_str()));
@@ -1200,13 +1253,26 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
                 &language,
                 &keyterms,
                 pre_embed_ref,
-            )
-            .await;
-            tracing::info!(
-                "[dg_stream] pre-transcript result: {}",
-                transcript.as_deref().unwrap_or("<none>")
-            );
+                prewarmed,
+            ).await;
+
+            tracing::info!("[dg_stream] pre-transcript: {}",
+                transcript.as_deref().unwrap_or("<none — WS produced no output>"));
             let _ = transcript_tx.send(transcript.unwrap_or_default());
+
+            // ── Pre-warm the NEXT recording's WS connection immediately ──────────
+            // Fires right after CloseStream+drain complete. By the time the user
+            // presses the hotkey again, the TLS handshake is already done.
+            let key2      = deepgram_key.clone();
+            let lang2     = language.clone();
+            let terms2    = keyterms.clone();
+            let pw_arc2   = Arc::clone(&prewarm_arc);
+            tauri::async_runtime::spawn(async move {
+                if let Some(pw) = dg_stream::connect_ws(&key2, &lang2, &terms2).await {
+                    *pw_arc2.lock().await = Some(pw);
+                    tracing::info!("[dg_stream] next WS pre-warmed and ready");
+                }
+            });
         });
     } else {
         tracing::debug!("[dg_stream] no chunk receiver — WS streaming not started");
@@ -1230,9 +1296,18 @@ fn do_finish_recording(
             let _ = t.set_title(Some("[  …  ]  Said"));
         }
         match d.stop_and_extract() {
-            Ok(w) => w,
+            Ok(w) => {
+                let snap = d.snapshot();
+                sync_tray(&app, &snap);
+                let _ = app.emit("app-state", &snap);
+                w
+            }
             Err(e) => {
                 let snap = d.finish_err(e);
+                let _ = app.emit("voice-error", serde_json::json!({
+                    "message": snap.last_error.clone().unwrap_or_else(|| "Recording failed".to_string()),
+                    "audio_id": null,
+                }));
                 let _ = app.emit("app-state", &snap);
                 return;
             }
@@ -1453,6 +1528,7 @@ async fn run_voice_polish_sse(
 
     let n_typed = token_count.load(std::sync::atomic::Ordering::Relaxed);
     let n_failed = fail_count.load(std::sync::atomic::Ordering::Relaxed);
+    let mut output_pasted = false;
     if typed_any.load(std::sync::atomic::Ordering::Relaxed) {
         if n_failed > 0 {
             // Some tokens typed, some failed — AX partially worked (user switched app?).
@@ -1462,12 +1538,18 @@ async fn run_voice_polish_sse(
             );
             if !done.polished.is_empty() {
                 // Select-all and replace to avoid duplicating the partial text
-                if let Err(e) = paster::paste(&done.polished) {
-                    tracing::warn!("[main] safety paste failed: {e}");
+                match paster::paste(&done.polished) {
+                    Ok(_) => {
+                        output_pasted = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!("[main] safety paste failed: {e}");
+                    }
                 }
             }
         } else {
             tracing::info!("[main] word-by-word complete — {n_typed} token(s) typed directly");
+            output_pasted = true;
         }
     } else {
         // AX not available at all — fall back to clipboard paste
@@ -1476,8 +1558,13 @@ async fn run_voice_polish_sse(
             done.polished.len()
         );
         if !done.polished.is_empty() {
-            if let Err(e) = paster::paste(&done.polished) {
-                tracing::warn!("[main] paste fallback failed: {e}");
+            match paster::paste(&done.polished) {
+                Ok(_) => {
+                    output_pasted = true;
+                }
+                Err(e) => {
+                    tracing::warn!("[main] paste fallback failed: {e}");
+                }
             }
         }
     }
@@ -1492,6 +1579,21 @@ async fn run_voice_polish_sse(
             done.polished.len()
         );
     }
+
+    let output_status = if output_pasted { "pasted" } else { "manual_paste" };
+    let output_message = if output_pasted {
+        "Pasted"
+    } else {
+        "Press Ctrl+Cmd+V to paste anywhere"
+    };
+    tracing::info!("[main] voice-output status={output_status}");
+    let _ = app.emit(
+        "voice-output",
+        serde_json::json!({
+            "status": output_status,
+            "message": output_message,
+        }),
+    );
 
     Ok(done)
 }
@@ -2772,28 +2874,14 @@ fn main() {
                 // ── Floating status bar ────────────────────────────────────────
                 create_status_bar(app.handle());
 
-                // ── Caps Lock hold-to-record (macOS only) ─────────────────────
+                // ── Caps Lock click-to-toggle recording (macOS only) ──────────
                 #[cfg(target_os = "macos")]
                 {
-                    let h_press   = app.handle().clone();
-                    let a_press   = Arc::clone(&shared);
-                    let h_release = app.handle().clone();
-                    let a_release = Arc::clone(&shared);
-                    let b_release = Arc::clone(&back_arc);
-
-                    hotkey::start_hold_listener(
-                        Arc::new(move || {
-                            let a = Arc::clone(&a_press);
-                            let h = h_press.clone();
-                            std::thread::spawn(move || do_start_recording(&a, &h));
-                        }),
-                        Arc::new(move || {
-                            let a = Arc::clone(&a_release);
-                            let h = h_release.clone();
-                            let b = Arc::clone(&b_release);
-                            std::thread::spawn(move || do_finish_recording(a, h, b));
-                        }),
-                    );
+                    let h_toggle = app.handle().clone();
+                    hotkey::start_listener(Arc::new(move || {
+                        let h = h_toggle.clone();
+                        std::thread::spawn(move || tray_toggle_recording(&h));
+                    }));
 
                     // ── Option+1..5 tone shortcuts ─────────────────────────────
                     // Select text in any app, press Option+N to polish with a preset tone.
@@ -2856,6 +2944,7 @@ fn main() {
         .manage(TrayCache(Mutex::new(TrayCacheInner::default())))
         .manage(LatestResult(std::sync::Arc::new(Mutex::new(None))))
         .manage(HotPathCache(Arc::new(tokio::sync::RwLock::new(HotPathCacheInner::default()))))
+        .manage(PrewarmedWsState(Arc::new(tokio::sync::Mutex::new(None))))
         .invoke_handler(tauri::generate_handler![
             bootstrap,
             get_snapshot,

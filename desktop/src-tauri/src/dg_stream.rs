@@ -21,42 +21,18 @@ use voice_polish_recorder::{resample_to_16k, ChunkReceiver, SAMPLE_RATE};
 /// Confidence threshold — words below this get [word?XX%] markers for the LLM.
 const LOW_CONFIDENCE_THRESHOLD: f64 = 0.85;
 
-/// Resample raw audio chunks from the microphone, send them to Deepgram via WS,
-/// and return the final transcript once the stream is closed.
-///
-/// - `chunk_recv.rx` is closed (channel disconnected) by `AudioRecorder::stop()`.
-/// - `language`: pass an empty string for auto-detect / Hindi default.
-/// - `keyterms`: words/phrases to boost recognition for (the "right" spellings from
-///   user's correction history). Appended as `&keyterm=` params (Nova-3 only).
-/// - `pre_embed`: optional `(url, bearer_secret)` for the backend's `/v1/pre-embed`
-///   endpoint.  When set, the current partial transcript is POSTed fire-and-forget
-///   the moment CloseStream is sent — overlapping the 500ms drain window with the
-///   Gemini embed so it's cached by the time `/v1/voice/polish` is called.
-///
-/// Returns `None` if WS connection fails or Deepgram returns no transcript.
-pub async fn stream_to_deepgram(
-    chunk_recv:   ChunkReceiver,
-    deepgram_key: &str,
-    language:     &str,
-    keyterms:     &[String],
-    pre_embed:    Option<(&str, &str)>,  // (url, bearer_secret)
-) -> Option<String> {
-    if deepgram_key.is_empty() {
-        warn!("[dg_stream] no Deepgram API key — WS streaming disabled");
-        return None;
-    }
+/// A pre-warmed Deepgram WebSocket connection ready to start receiving audio.
+/// Stored in `PrewarmedWsState` between recordings to eliminate the TLS handshake
+/// from the hot path (~150ms saved, up to 3s saved under rapid use).
+pub struct PrewarmedWs {
+    pub ws:       tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    pub language: String,
+    pub keyterms: Vec<String>,
+}
 
-    let lang = if language.is_empty() || language == "auto" { "hi" } else { language };
-
-    // Endpointing: how long Deepgram waits after silence before marking speech_final.
-    // - multi: 100ms — Deepgram's recommended value for code-switching.
-    // - hi/en: 500ms — Hindi speech has natural inter-word pauses; shorter values
-    //   cause premature segment splits which reduce transcription accuracy.
+/// Build the Deepgram WS URL for the given language and keyterms.
+fn build_ws_url(lang: &str, keyterms: &[String]) -> (String, usize) {
     let endpointing = if lang == "multi" { 100 } else { 500 };
-
-    // Build WS URL — keyterms appended once via urlencode (RFC-3986 safe).
-    // Previously keyterms were appended twice (once via replace('+') and once via
-    // urlencode loop), doubling the URL size with incorrectly-encoded duplicates.
     let mut url_str = format!(
         "wss://api.deepgram.com/v1/listen\
          ?model=nova-3\
@@ -77,11 +53,15 @@ pub async fn stream_to_deepgram(
         url_str.push_str(&urlencode(cleaned));
         bias_count += 1;
     }
-    if bias_count > 0 {
-        info!("[dg_stream] {} keyterm(s) for STT boost", bias_count);
-    }
+    (url_str, bias_count)
+}
 
-    info!("[dg_stream] connecting to Deepgram WS (lang={lang}, endpointing={endpointing}ms, bias={bias_count}), key_len={}", deepgram_key.len());
+/// Open a fresh Deepgram WebSocket connection and return it ready for audio.
+/// Called both for cold-start and for pre-warming the next recording's connection.
+pub async fn connect_ws(deepgram_key: &str, language: &str, keyterms: &[String]) -> Option<PrewarmedWs> {
+    if deepgram_key.is_empty() { return None; }
+    let lang = if language.is_empty() || language == "auto" { "hi" } else { language };
+    let (url_str, bias_count) = build_ws_url(lang, keyterms);
 
     let mut req = match url_str.into_client_request() {
         Ok(r)  => r,
@@ -93,25 +73,53 @@ pub async fn stream_to_deepgram(
     };
     req.headers_mut().insert("Authorization", auth_value);
 
-    // Hard 5-second timeout on the WebSocket upgrade.
-    let connect_result = tokio::time::timeout(
-        Duration::from_secs(5),
-        connect_async(req),
-    ).await;
+    let start = tokio::time::Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(5), connect_async(req)).await;
+    let ms = start.elapsed().as_millis();
 
-    let (ws, _resp) = match connect_result {
-        Err(_elapsed) => {
-            warn!("[dg_stream] WS connect timed out after 5 s");
-            return None;
+    match result {
+        Err(_) => { warn!("[dg_stream] WS connect timed out"); None }
+        Ok(Err(e)) => { warn!("[dg_stream] WS connect failed: {e}"); None }
+        Ok(Ok((ws, _))) => {
+            info!("[dg_stream] ✓ WS connected in {ms}ms (lang={lang} keyterms={bias_count})");
+            Some(PrewarmedWs { ws, language: lang.to_string(), keyterms: keyterms.to_vec() })
         }
-        Ok(Err(e)) => {
-            warn!("[dg_stream] WS connect failed: {e}");
-            return None;
+    }
+}
+
+/// Stream audio to Deepgram and return the final transcript.
+///
+/// `prewarmed`: if Some and params match, uses the pre-established connection
+/// (eliminates TLS handshake from hot path). Falls back to fresh connect if None
+/// or if language/keyterms changed.
+pub async fn stream_to_deepgram(
+    chunk_recv:   ChunkReceiver,
+    deepgram_key: &str,
+    language:     &str,
+    keyterms:     &[String],
+    pre_embed:    Option<(&str, &str)>,
+    prewarmed:    Option<PrewarmedWs>,
+) -> Option<String> {
+    if deepgram_key.is_empty() {
+        warn!("[dg_stream] no Deepgram API key — WS streaming disabled");
+        return None;
+    }
+
+    let lang = if language.is_empty() || language == "auto" { "hi" } else { language };
+
+    // Use pre-warmed WS if params match; otherwise connect fresh.
+    let ws = if let Some(pw) = prewarmed {
+        if pw.language == lang && pw.keyterms == keyterms {
+            info!("[dg_stream] ✓ using pre-warmed WS (0ms connect)");
+            pw.ws
+        } else {
+            info!("[dg_stream] pre-warm params mismatch — connecting fresh");
+            connect_ws(deepgram_key, lang, keyterms).await?.ws
         }
-        Ok(Ok(pair)) => pair,
+    } else {
+        info!("[dg_stream] no pre-warm — connecting fresh");
+        connect_ws(deepgram_key, lang, keyterms).await?.ws
     };
-
-    info!("[dg_stream] ✓ connected to Deepgram WS");
 
     let (mut ws_tx, mut ws_rx) = ws.split();
 
@@ -140,6 +148,9 @@ pub async fn stream_to_deepgram(
     // ── Main loop: send PCM chunks + receive Deepgram messages ───────────────
     let mut transcript_parts: Vec<String> = Vec::new();
     let mut chunks_sent = 0usize;
+    // Track whether speech_final arrived during streaming so the drain loop
+    // can start its 500ms timer immediately instead of waiting the full 2500ms.
+    let mut got_speech_final_during_stream = false;
 
     // KeepAlive ticker: send KeepAlive if no audio for 8 s
     let mut keepalive_interval = tokio::time::interval(Duration::from_secs(8));
@@ -152,11 +163,6 @@ pub async fn stream_to_deepgram(
                 match chunk {
                     Some(pcm) => {
                         chunks_sent += 1;
-                        if chunks_sent == 1 {
-                            info!("[dg_stream] → first audio chunk sent to Deepgram ({} bytes)", pcm.len());
-                        } else if chunks_sent % 50 == 0 {
-                            info!("[dg_stream] → {chunks_sent} chunks sent so far");
-                        }
                         if ws_tx.send(Message::Binary(pcm)).await.is_err() {
                             warn!("[dg_stream] WS send error after {chunks_sent} chunks");
                             exit_reason = "send-error";
@@ -166,7 +172,6 @@ pub async fn stream_to_deepgram(
                     }
                     None => {
                         // Audio channel closed → recording stopped
-                        info!("[dg_stream] audio ended ({chunks_sent} chunks sent) — sending CloseStream");
                         let close = r#"{"type":"CloseStream"}"#;
                         if let Err(e) = ws_tx.send(Message::Text(close.into())).await {
                             warn!("[dg_stream] CloseStream send failed: {e}");
@@ -179,7 +184,7 @@ pub async fn stream_to_deepgram(
                             if !plain.is_empty() {
                                 let url    = url.to_string();
                                 let secret = secret.to_string();
-                                info!("[dg_stream] firing pre-embed ({} chars)", plain.len());
+                                debug!("[dg_stream] firing pre-embed ({} chars)", plain.len());
                                 tokio::spawn(async move {
                                     let client = reqwest::Client::new();
                                     let body   = serde_json::json!({"text": plain});
@@ -218,20 +223,18 @@ pub async fn stream_to_deepgram(
                         if let Ok(v) = serde_json::from_str::<Value>(&text) {
                             let msg_type = v["type"].as_str().unwrap_or("?");
                             if msg_type == "Results" {
-                                let is_f   = v["is_final"].as_bool().unwrap_or(false);
-                                let sp_f   = v["speech_final"].as_bool().unwrap_or(false);
-                                let t      = v["channel"]["alternatives"][0]["transcript"]
-                                    .as_str().unwrap_or("");
-                                info!("[dg_stream] ← Results is_final={is_f} speech_final={sp_f} transcript={t:?}");
-
-                                // Capture ALL is_final=true segments with confidence markers.
-                                if is_f && !t.is_empty() {
+                                let is_f = v["is_final"].as_bool().unwrap_or(false);
+                                let sp_f = v["speech_final"].as_bool().unwrap_or(false);
+                                if is_f {
                                     let enriched = enrich_from_words(&v["channel"]["alternatives"][0]["words"]);
-                                    info!("[dg_stream] captured is_final segment: {enriched:?} (speech_final={sp_f})");
-                                    transcript_parts.push(enriched);
+                                    if !enriched.is_empty() {
+                                        info!("[dg_stream] segment: {enriched:?} (speech_final={sp_f})");
+                                        transcript_parts.push(enriched);
+                                    }
                                 }
-                            } else {
-                                info!("[dg_stream] ← server msg type={msg_type}");
+                                if sp_f {
+                                    got_speech_final_during_stream = true;
+                                }
                             }
                         }
                     }
@@ -253,9 +256,6 @@ pub async fn stream_to_deepgram(
     }
 
     let parts_from_streaming = transcript_parts.len();
-    info!(
-        "[dg_stream] select loop done (reason={exit_reason}), parts from streaming: {parts_from_streaming}, chunks_sent: {chunks_sent}",
-    );
 
     // ── Drain remaining messages after CloseStream ────────────────────────────
     // Keep ws_tx alive here: dropping SplitSink before the drain could trigger
@@ -265,37 +265,32 @@ pub async fn stream_to_deepgram(
 
     // Give Deepgram time to flush remaining utterances after CloseStream.
     //
-    // IMPORTANT: Don't break on speech_final or UtteranceEnd — there may be multiple
-    // utterances pending (the user paused briefly, creating separate segments).
-    // Instead, after seeing any speech_final or UtteranceEnd, reset a 500ms timer.
-    // If nothing arrives in 500ms, we're done.  This is enough for Deepgram to
-    // send a second utterance's results if one exists.
-    let drain_ms = (chunks_sent as u64 * 12).max(2500);
-    info!("[dg_stream] drain budget={drain_ms}ms — will wait 500ms after last speech_final for additional segments");
+    // Fast path: if speech_final already arrived during streaming (common for short
+    // clips), pre-seed last_speech_final so the drain exits after just 500ms instead
+    // of waiting the full 2500ms fallback budget.
+    //
+    // Fallback: 2500ms flat ceiling for the rare case where Deepgram sends nothing
+    // during drain (e.g. very short clip fully processed before CloseStream).
+    // Previously this was `chunks_sent * 12` which scaled to 10s+ for long recordings
+    // — a flat ceiling is sufficient since the speech_final+500ms logic handles timing.
+    let drain_ms       = 2500_u64;
     let drain_start    = tokio::time::Instant::now();
     let drain_deadline = drain_start + Duration::from_millis(drain_ms);
 
-    // Track when we last saw a speech_final/UtteranceEnd — after 500ms with no more results, we exit
-    let mut last_speech_final: Option<tokio::time::Instant> = None;
+    let mut last_speech_final: Option<tokio::time::Instant> = if got_speech_final_during_stream {
+        Some(tokio::time::Instant::now())
+    } else {
+        None
+    };
 
     loop {
         let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            info!("[dg_stream] drain budget exhausted after {}ms",
-                  drain_start.elapsed().as_millis());
-            break;
-        }
+        if remaining.is_zero() { break; }
 
-        // If we've seen a speech_final/UtteranceEnd, use a shorter timeout to catch stragglers.
-        // 500ms is enough for Deepgram to send a second utterance's results if one exists.
         let effective_timeout = if let Some(sf_at) = last_speech_final {
             let since_sf = tokio::time::Instant::now().saturating_duration_since(sf_at);
             let sf_remaining = Duration::from_millis(500).saturating_sub(since_sf);
-            if sf_remaining.is_zero() {
-                info!("[dg_stream] 500ms after last speech_final/UtteranceEnd — drain done ({}ms total)",
-                      drain_start.elapsed().as_millis());
-                break;
-            }
+            if sf_remaining.is_zero() { break; }
             remaining.min(sf_remaining)
         } else {
             remaining
@@ -308,56 +303,22 @@ pub async fn stream_to_deepgram(
                     if msg_type == "Results" {
                         let is_f = v["is_final"].as_bool().unwrap_or(false);
                         let sp_f = v["speech_final"].as_bool().unwrap_or(false);
-                        let t    = v["channel"]["alternatives"][0]["transcript"]
-                            .as_str().unwrap_or("");
-                        info!("[dg_stream] ← drain Results is_final={is_f} speech_final={sp_f} transcript={t:?}");
-
-                        // Capture any is_final fragment with confidence markers
-                        if is_f && !t.is_empty() {
+                        if is_f {
                             let enriched = enrich_from_words(&v["channel"]["alternatives"][0]["words"]);
-                            info!("[dg_stream] drain captured: {enriched:?} (speech_final={sp_f})");
-                            transcript_parts.push(enriched);
+                            if !enriched.is_empty() {
+                                transcript_parts.push(enriched);
+                            }
                         }
-
-                        // Reset the timer — wait 500ms more for additional segments
-                        if sp_f {
-                            last_speech_final = Some(tokio::time::Instant::now());
-                            info!("[dg_stream] speech_final at {}ms — waiting 500ms for more segments",
-                                  drain_start.elapsed().as_millis());
-                        }
+                        if sp_f { last_speech_final = Some(tokio::time::Instant::now()); }
                     } else if msg_type == "UtteranceEnd" {
-                        // DON'T break here — UtteranceEnd fires per-utterance.
-                        // If the user paused briefly, there may be a second utterance
-                        // whose is_final/speech_final haven't arrived yet.
-                        // Instead, treat it like a speech_final: reset the 500ms timer.
-                        info!("[dg_stream] UtteranceEnd at {}ms — waiting for more segments",
-                              drain_start.elapsed().as_millis());
                         last_speech_final = Some(tokio::time::Instant::now());
-                    } else {
-                        debug!("[dg_stream] drain msg type={msg_type}");
                     }
                 }
             }
-            Ok(Some(Ok(Message::Close(frame)))) => {
-                info!("[dg_stream] WS closed by server during drain: {:?}", frame);
-                break;
-            }
-            Ok(None) => {
-                info!("[dg_stream] WS stream ended during drain");
-                break;
-            }
-            Ok(Some(Err(e))) => { warn!("[dg_stream] drain WS error: {e}"); break; }
-            Ok(Some(Ok(_))) => {} // ping/pong/binary — ignore
-            Err(_) => {
-                if last_speech_final.is_some() {
-                    info!("[dg_stream] 500ms after last speech_final/UtteranceEnd — drain done ({}ms total)",
-                          drain_start.elapsed().as_millis());
-                } else {
-                    info!("[dg_stream] drain timed out after {}ms (no speech_final arrived)",
-                          drain_start.elapsed().as_millis());
-                }
-                break;
-            }
+            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
+            Ok(Some(Err(e))) => { warn!("[dg_stream] drain error: {e}"); break; }
+            Ok(Some(Ok(_))) => {}
+            Err(_) => break,
         }
     }
 
@@ -371,18 +332,13 @@ pub async fn stream_to_deepgram(
         .collect::<Vec<_>>()
         .join(" ");
 
-    let parts_from_drain = transcript_parts.len() - parts_from_streaming;
-    info!(
-        "[dg_stream] transcript assembled: {} parts ({} streaming + {} drain), {} chars",
-        transcript_parts.len(), parts_from_streaming, parts_from_drain, full.len()
-    );
-
+    let drain_ms = drain_start.elapsed().as_millis();
     if full.is_empty() {
-        warn!("[dg_stream] no transcript received from WS stream (parts={}, chunks_sent={chunks_sent})",
-              transcript_parts.len());
+        warn!("[dg_stream] no transcript — chunks={chunks_sent} drain={drain_ms}ms");
         None
     } else {
-        info!("[dg_stream] final transcript: {full:?}");
+        info!("[dg_stream] ✓ transcript ready — drain={}ms chunks={} parts={} : {full:?}",
+            drain_ms, chunks_sent, transcript_parts.len());
         Some(full)
     }
 }

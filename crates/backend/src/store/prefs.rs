@@ -67,7 +67,7 @@ pub fn get_prefs(pool: &DbPool, user_id: &str) -> Option<Preferences> {
                 gateway_api_key:    row.get(10)?,
                 deepgram_api_key:   row.get(11)?,
                 gemini_api_key:     row.get(12)?,
-                llm_provider:       row.get::<_, Option<String>>(13)?.unwrap_or_else(|| "gateway".into()),
+                llm_provider:       row.get::<_, Option<String>>(13)?.unwrap_or_else(|| "openai_codex".into()),
                 groq_api_key:       row.get(14)?,
             })
         },

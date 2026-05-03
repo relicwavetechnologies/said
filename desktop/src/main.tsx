@@ -5,8 +5,20 @@ import App from "./App";
 import StatusBar from "./StatusBar";
 
 const root = ReactDOM.createRoot(document.getElementById("app")!);
+const params = new URLSearchParams(window.location.search);
+const isStatusBar =
+  window.location.hash === "#statusbar" ||
+  params.get("view") === "statusbar" ||
+  params.has("statusbar");
 
-if (window.location.hash === "#statusbar") {
+console.info("[status-bar:entry]", {
+  href: window.location.href,
+  hash: window.location.hash,
+  search: window.location.search,
+  isStatusBar,
+});
+
+if (isStatusBar) {
   // Floating status-bar window — minimal pill overlay
   document.body.classList.add("statusbar-mode");
   root.render(
