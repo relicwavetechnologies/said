@@ -5,12 +5,12 @@
 //! Response: SSE stream identical to voice/polish.
 
 use axum::{
+    Json,
     extract::State,
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse,
+        sse::{Event, KeepAlive, Sse},
     },
-    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -21,27 +21,46 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
+    AppState,
     embedder::gemini,
     llm::{
         gateway, gemini_direct, groq, openai_codex,
-        prompt::{build_system_prompt_with_vocab_entries, build_tray_system_prompt, build_user_message, VocabEntry},
+        prompt::{
+            VocabEntry, build_system_prompt_with_vocab_entries, build_tray_system_prompt,
+            build_user_message, vocab_terms_to_entries,
+        },
     },
     store::{
-        history::{insert_recording, InsertRecording},
+        history::{InsertRecording, insert_recording},
         openai_oauth,
         vectors::retrieve_similar,
-        vocabulary,
+        vocab_embeddings,
     },
-    AppState,
 };
 
 #[derive(Deserialize)]
 pub struct TextPolishBody {
-    pub text:          String,
-    pub target_app:    Option<String>,
+    pub text: String,
+    pub target_app: Option<String>,
     /// When set (by tray "Polish my message"), overrides the user's stored tone_preset
     /// and forces English output — the preset label already encodes the output language.
     pub tone_override: Option<String>,
+}
+
+fn select_prompt_vocab_entries(
+    pool: &crate::store::DbPool,
+    user_id: &str,
+    output_language: &str,
+    transcript: &str,
+    query_embedding: Option<&[f32]>,
+) -> Vec<VocabEntry> {
+    vocab_terms_to_entries(vocab_embeddings::select_for_prompt(
+        pool,
+        user_id,
+        output_language,
+        query_embedding,
+        Some(transcript),
+    ))
 }
 
 pub async fn polish(
@@ -52,10 +71,10 @@ pub async fn polish(
         return axum::http::StatusCode::BAD_REQUEST.into_response();
     }
 
-    let user_id       = state.default_user_id.as_str().to_string();
-    let pool          = state.pool.clone();
-    let transcript    = body.text.clone();
-    let target_app    = body.target_app.clone();
+    let user_id = state.default_user_id.as_str().to_string();
+    let pool = state.pool.clone();
+    let transcript = body.text.clone();
+    let target_app = body.target_app.clone();
     let tone_override = body.tone_override.clone();
 
     // Load prefs + lexicon from cache and grab shared HTTP client before stream.
@@ -116,15 +135,13 @@ pub async fn polish(
         // tone_override → use tray-specific English-locked prompt (no RAG, no persona)
         // Otherwise → use full RACC prompt with user prefs + RAG examples + corrections
         let vocab_entries: Vec<VocabEntry> = if tone_override.is_none() {
-            vocabulary::top_terms(&pool, &user_id, 100)
-                .into_iter()
-                .map(|v| VocabEntry {
-                    term:      v.term,
-                    context:   v.example_context,
-                    term_type: v.term_type,
-                    meaning:   v.meaning,
-                })
-                .collect()
+            select_prompt_vocab_entries(
+                &pool,
+                &user_id,
+                &prefs.output_language,
+                &transcript,
+                embedding.as_deref(),
+            )
         } else {
             vec![]
         };
@@ -272,4 +289,110 @@ pub async fn polish(
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_prompt_vocab_entries;
+    use crate::store::vocab_embeddings::upsert_embedding;
+    use crate::store::{DbPool, now_ms};
+    use r2d2_sqlite::SqliteConnectionManager;
+    use rusqlite::params;
+
+    fn mem_pool() -> DbPool {
+        let mgr = SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(mgr).unwrap();
+        pool.get()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE local_user (id TEXT PRIMARY KEY);
+             INSERT INTO local_user(id) VALUES ('u1');
+             CREATE TABLE vocabulary (
+                 user_id                 TEXT NOT NULL REFERENCES local_user(id),
+                 term                    TEXT NOT NULL,
+                 weight                  REAL NOT NULL DEFAULT 1.0,
+                 use_count               INTEGER NOT NULL DEFAULT 1,
+                 last_used               INTEGER NOT NULL,
+                 source                  TEXT NOT NULL DEFAULT 'auto',
+                 language                TEXT,
+                 example_context         TEXT,
+                 term_type               TEXT,
+                 meaning                 TEXT,
+                 meaning_updated_at      INTEGER,
+                 examples_since_meaning  INTEGER NOT NULL DEFAULT 0,
+                 UNIQUE(user_id, term)
+             );
+             CREATE TABLE vocab_embeddings (
+                 user_id    TEXT NOT NULL REFERENCES local_user(id),
+                 term       TEXT NOT NULL,
+                 embedding  BLOB NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 UNIQUE(user_id, term)
+             );
+             CREATE TABLE vocab_embedding_examples (
+                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id       TEXT NOT NULL REFERENCES local_user(id),
+                 term          TEXT NOT NULL,
+                 embedding     BLOB NOT NULL,
+                 example_text  TEXT NOT NULL,
+                 recorded_at   INTEGER NOT NULL
+             );
+             CREATE VIRTUAL TABLE vocab_fts USING fts5(
+                 user_id UNINDEXED, term, example_context,
+                 tokenize = 'unicode61 remove_diacritics 2'
+             );",
+            )
+            .unwrap();
+        pool
+    }
+
+    fn seed_vocab(
+        pool: &DbPool,
+        term: &str,
+        weight: f64,
+        context: &str,
+        meaning: Option<&str>,
+        embedding: &[f32],
+    ) {
+        pool.get().unwrap().execute(
+            "INSERT INTO vocabulary
+               (user_id, term, weight, use_count, last_used, source, language, example_context, term_type, meaning)
+             VALUES ('u1', ?1, ?2, 1, ?3, 'auto', 'english', ?4, 'proper_noun', ?5)",
+            params![term, weight, now_ms(), context, meaning],
+        ).unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO vocab_fts (user_id, term, example_context)
+             VALUES ('u1', ?1, ?2)",
+                params![term, context],
+            )
+            .unwrap();
+        upsert_embedding(pool, "u1", term, embedding);
+    }
+
+    #[test]
+    fn text_prompt_vocab_stays_empty_for_unrelated_top_weight_term() {
+        let pool = mem_pool();
+        seed_vocab(
+            &pool,
+            "tembeess",
+            5.0,
+            "tembeess Friday team meeting",
+            Some("Internal project term for a team meeting context."),
+            &[1.0, 0.0, 0.0, 0.0],
+        );
+
+        let chosen = select_prompt_vocab_entries(
+            &pool,
+            "u1",
+            "english",
+            "what time is it",
+            Some(&[0.99, 0.0, 0.0, 0.0]),
+        );
+        assert!(
+            chosen.is_empty(),
+            "text polish should not inject unrelated top-weight vocab"
+        );
+    }
 }

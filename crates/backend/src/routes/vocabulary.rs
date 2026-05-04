@@ -7,19 +7,130 @@
 //! POST   /v1/vocabulary/:term/star — toggle starred status (immune to demotion)
 
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::{store::{
-    vocabulary, vocab_embeddings, vocab_fts,
-    stt_replacements,
-    prefs::get_prefs, now_ms,
-}, AppState};
+use crate::{
+    AppState,
+    embedder::gemini,
+    llm::meaning,
+    store::{now_ms, prefs::get_prefs, stt_replacements, vocab_embeddings, vocab_fts, vocabulary},
+};
+
+pub fn spawn_prompt_artifact_repair(state: AppState) {
+    tokio::spawn(async move {
+        let user_id = state.default_user_id.to_string();
+        let total = vocabulary::count(&state.pool, &user_id).max(0) as usize;
+        if total == 0 {
+            return;
+        }
+
+        let pool_terms = state.pool.clone();
+        let user_terms = user_id.clone();
+        let terms = tokio::task::spawn_blocking(move || {
+            vocabulary::top_terms(&pool_terms, &user_terms, total)
+        })
+        .await
+        .unwrap_or_default();
+        if terms.is_empty() {
+            return;
+        }
+
+        let prefs = get_prefs(&state.pool, &state.default_user_id);
+        let gemini_key = prefs
+            .as_ref()
+            .and_then(|p| p.gemini_api_key.clone())
+            .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+            .unwrap_or_default();
+        let groq_key = prefs
+            .as_ref()
+            .and_then(|p| p.groq_api_key.clone())
+            .or_else(|| std::env::var("GROQ_API_KEY").ok())
+            .unwrap_or_default();
+        let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+
+        let mut meaning_repaired = 0;
+        let mut example_rings_repaired = 0;
+        let mut centroids_repaired = 0;
+
+        for term in terms {
+            vocab_fts::upsert(
+                &state.pool,
+                &state.default_user_id,
+                &term.term,
+                term.example_context.as_deref(),
+            );
+
+            let Some(context) = term
+                .example_context
+                .clone()
+                .filter(|c| !c.trim().is_empty())
+            else {
+                continue;
+            };
+
+            if !vocab_embeddings::has_example_ring(&state.pool, &user_id, &term.term) {
+                if !gemini_key.is_empty() {
+                    let embed_text = format!("{}. {}", term.term, context);
+                    if let Some(embedding) =
+                        gemini::embed(&state.http_client, &state.pool, &embed_text, &gemini_key)
+                            .await
+                    {
+                        vocab_embeddings::record_example_and_recentre(
+                            &state.pool,
+                            &user_id,
+                            &term.term,
+                            &embedding,
+                            &embed_text,
+                        );
+                        example_rings_repaired += 1;
+                    }
+                }
+            } else if !vocab_embeddings::has_centroid(&state.pool, &user_id, &term.term)
+                && vocab_embeddings::rebuild_centroid_from_examples(
+                    &state.pool,
+                    &user_id,
+                    &term.term,
+                )
+            {
+                centroids_repaired += 1;
+            }
+
+            if term
+                .meaning
+                .as_deref()
+                .map(|m| m.trim().is_empty())
+                .unwrap_or(true)
+            {
+                if let Some(new_meaning) = meaning::generate_initial(
+                    &state.http_client,
+                    &groq_key,
+                    &openai_key,
+                    &term.term,
+                    &context,
+                )
+                .await
+                {
+                    if vocabulary::update_meaning(&state.pool, &user_id, &term.term, &new_meaning) {
+                        meaning_repaired += 1;
+                    }
+                }
+            }
+        }
+
+        if meaning_repaired > 0 || example_rings_repaired > 0 || centroids_repaired > 0 {
+            info!(
+                "[vocab-repair] prompt artifacts repaired meanings={} example_rings={} centroids={}",
+                meaning_repaired, example_rings_repaired, centroids_repaired,
+            );
+        }
+    });
+}
 
 // ── GET /v1/vocabulary/terms (hot path) ──────────────────────────────────────
 
@@ -38,23 +149,24 @@ pub struct TermsQuery {
 
 pub async fn list_terms(
     State(state): State<AppState>,
-    Query(q):     Query<TermsQuery>,
+    Query(q): Query<TermsQuery>,
 ) -> Json<TermsResponse> {
     // Resolve effective language: explicit query parameter wins, else fall
     // back to the user's stored output_language preference.  This means the
     // desktop hot path automatically gets language-bucketed keyterms with
     // no client-side change required.
-    let lang = q.language
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            get_prefs(&state.pool, &state.default_user_id)
-                .map(|p| p.output_language)
-                .filter(|s| !s.trim().is_empty())
-        });
+    let lang = q.language.filter(|s| !s.trim().is_empty()).or_else(|| {
+        get_prefs(&state.pool, &state.default_user_id)
+            .map(|p| p.output_language)
+            .filter(|s| !s.trim().is_empty())
+    });
 
     let terms = match lang.as_deref() {
         Some(lang) => vocabulary::top_term_strings_for_language(
-            &state.pool, &state.default_user_id, lang, 100,
+            &state.pool,
+            &state.default_user_id,
+            lang,
+            100,
         ),
         None => vocabulary::top_term_strings(&state.pool, &state.default_user_id, 100),
     };
@@ -84,7 +196,7 @@ pub struct CreateBody {
 
 pub async fn create(
     State(state): State<AppState>,
-    Json(body):   Json<CreateBody>,
+    Json(body): Json<CreateBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let trimmed = body.term.trim();
     if trimmed.is_empty() {
@@ -108,7 +220,10 @@ pub async fn create(
         // until a future sighting fills in context.
         vocab_fts::upsert(&state.pool, &state.default_user_id, trimmed, None);
         info!("[vocab] manual add: {trimmed:?}");
-        (StatusCode::CREATED, Json(serde_json::json!({ "term": trimmed })))
+        (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "term": trimmed })),
+        )
     } else {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -119,22 +234,24 @@ pub async fn create(
 
 // ── DELETE /v1/vocabulary/:term ──────────────────────────────────────────────
 
-pub async fn delete(
-    State(state): State<AppState>,
-    Path(term):   Path<String>,
-) -> StatusCode {
+pub async fn delete(State(state): State<AppState>, Path(term): Path<String>) -> StatusCode {
     let trimmed = term.trim();
     if trimmed.is_empty() {
         return StatusCode::BAD_REQUEST;
     }
     let conn = match state.pool.get() {
         Ok(c) => c,
-        Err(e) => { warn!("[vocab] delete pool error: {e}"); return StatusCode::INTERNAL_SERVER_ERROR; }
+        Err(e) => {
+            warn!("[vocab] delete pool error: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
     };
-    let n = conn.execute(
-        "DELETE FROM vocabulary WHERE user_id = ?1 AND term = ?2",
-        params![state.default_user_id.as_str(), trimmed],
-    ).unwrap_or(0);
+    let n = conn
+        .execute(
+            "DELETE FROM vocabulary WHERE user_id = ?1 AND term = ?2",
+            params![state.default_user_id.as_str(), trimmed],
+        )
+        .unwrap_or(0);
     drop(conn);
 
     // Cascade-clean every per-term side table. None of these have FK cascades
@@ -149,13 +266,14 @@ pub async fn delete(
     // entry is needed here.
     vocab_embeddings::delete(&state.pool, &state.default_user_id, trimmed);
     vocab_fts::delete(&state.pool, &state.default_user_id, trimmed);
-    let stt_n  = stt_replacements::delete_by_correct_form(
-        &state.pool, &state.default_user_id, trimmed,
-    );
-    info!(
-        "[vocab] delete term={trimmed:?} vocab_rows={n} stt_aliases={stt_n}",
-    );
-    if n > 0 { StatusCode::NO_CONTENT } else { StatusCode::NOT_FOUND }
+    let stt_n =
+        stt_replacements::delete_by_correct_form(&state.pool, &state.default_user_id, trimmed);
+    info!("[vocab] delete term={trimmed:?} vocab_rows={n} stt_aliases={stt_n}",);
+    if n > 0 {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
 }
 
 // ── POST /v1/vocabulary/:term/star ───────────────────────────────────────────
@@ -167,21 +285,31 @@ pub struct StarResponse {
 
 pub async fn toggle_star(
     State(state): State<AppState>,
-    Path(term):   Path<String>,
+    Path(term): Path<String>,
 ) -> (StatusCode, Json<StarResponse>) {
     let trimmed = term.trim();
     if trimmed.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(StarResponse { starred: false }));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(StarResponse { starred: false }),
+        );
     }
     let conn = match state.pool.get() {
         Ok(c) => c,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(StarResponse { starred: false })),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(StarResponse { starred: false }),
+            );
+        }
     };
-    let current_source: Option<String> = conn.query_row(
-        "SELECT source FROM vocabulary WHERE user_id = ?1 AND term = ?2",
-        params![state.default_user_id.as_str(), trimmed],
-        |r| r.get(0),
-    ).ok();
+    let current_source: Option<String> = conn
+        .query_row(
+            "SELECT source FROM vocabulary WHERE user_id = ?1 AND term = ?2",
+            params![state.default_user_id.as_str(), trimmed],
+            |r| r.get(0),
+        )
+        .ok();
 
     let Some(source) = current_source else {
         return (StatusCode::NOT_FOUND, Json(StarResponse { starred: false }));
@@ -195,11 +323,19 @@ pub async fn toggle_star(
         ("starred", 3.0_f64, true)
     };
 
-    let n = conn.execute(
-        "UPDATE vocabulary SET source = ?1, weight = ?2, last_used = ?3
+    let n = conn
+        .execute(
+            "UPDATE vocabulary SET source = ?1, weight = ?2, last_used = ?3
            WHERE user_id = ?4 AND term = ?5",
-        params![new_source, new_weight, now_ms(), state.default_user_id.as_str(), trimmed],
-    ).unwrap_or(0);
+            params![
+                new_source,
+                new_weight,
+                now_ms(),
+                state.default_user_id.as_str(),
+                trimmed
+            ],
+        )
+        .unwrap_or(0);
     info!("[vocab] toggle_star term={trimmed:?} → source={new_source} starred={starred} rows={n}");
     (StatusCode::OK, Json(StarResponse { starred }))
 }

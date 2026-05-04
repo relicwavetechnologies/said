@@ -31,8 +31,7 @@ async fn main() {
         .expect("cannot open backend.log");
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("polish_backend=debug".parse().unwrap()),
+            EnvFilter::from_default_env().add_directive("polish_backend=debug".parse().unwrap()),
         )
         .with_ansi(false)
         .with_writer(std::sync::Mutex::new(log_file))
@@ -53,13 +52,15 @@ async fn main() {
     };
 
     // ── Fingerprint — visible in logs so we can confirm binary version ───────
-    info!("polish-backend build={} features=openai_oauth+codex_api", env!("CARGO_PKG_VERSION"));
+    info!(
+        "polish-backend build={} features=openai_oauth+codex_api",
+        env!("CARGO_PKG_VERSION")
+    );
 
     // ── Open DB + ensure default user ─────────────────────────────────────────
-    let pool    = polish_backend::store::open(&db_path);
+    let pool = polish_backend::store::open(&db_path);
     let user_id = polish_backend::store::ensure_default_user(&pool);
-    let secret  = std::env::var("POLISH_SHARED_SECRET")
-        .unwrap_or_else(|_| "dev-secret".into());
+    let secret = std::env::var("POLISH_SHARED_SECRET").unwrap_or_else(|_| "dev-secret".into());
 
     let http_client = reqwest::Client::builder()
         .pool_max_idle_per_host(4)
@@ -68,19 +69,20 @@ async fn main() {
         .expect("failed to build shared HTTP client");
 
     let state = polish_backend::AppState {
-        pool:            pool.clone(),
-        shared_secret:   std::sync::Arc::new(secret),
+        pool: pool.clone(),
+        shared_secret: std::sync::Arc::new(secret),
         default_user_id: std::sync::Arc::new(user_id.clone()),
-        prefs_cache:     std::sync::Arc::new(tokio::sync::RwLock::new(None)),
-        lexicon_cache:   std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+        prefs_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+        lexicon_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
         http_client,
     };
+    polish_backend::routes::vocabulary::spawn_prompt_artifact_repair(state.clone());
 
     // ── Build router ──────────────────────────────────────────────────────────
     let router = polish_backend::router_with_state(state);
 
     // ── Bind listener ─────────────────────────────────────────────────────────
-    let addr     = format!("127.0.0.1:{}", cli.port);
+    let addr = format!("127.0.0.1:{}", cli.port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
@@ -104,7 +106,7 @@ async fn main() {
 
     // ── Hourly metering report task ───────────────────────────────────────────
     {
-        let pool3    = pool.clone();
+        let pool3 = pool.clone();
         let user_id2 = user_id.clone();
         tokio::spawn(async move {
             let cloud_url = std::env::var("CLOUD_API_URL")
@@ -123,9 +125,9 @@ async fn main() {
     let shutdown = async {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{signal, SignalKind};
+            use tokio::signal::unix::{SignalKind, signal};
             let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM listener");
-            let mut sigint  = signal(SignalKind::interrupt()).expect("SIGINT listener");
+            let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT listener");
             tokio::select! {
                 _ = sigterm.recv() => info!("received SIGTERM — shutting down"),
                 _ = sigint.recv()  => info!("received SIGINT — shutting down"),
@@ -160,23 +162,16 @@ fn start_parent_death_watch() {
         }
 
         let mut change = libc::kevent {
-            ident:  parent_pid as libc::uintptr_t,
+            ident: parent_pid as libc::uintptr_t,
             filter: libc::EVFILT_PROC,
-            flags:  libc::EV_ADD | libc::EV_ENABLE,
+            flags: libc::EV_ADD | libc::EV_ENABLE,
             fflags: libc::NOTE_EXIT,
-            data:   0,
-            udata:  std::ptr::null_mut(),
+            data: 0,
+            udata: std::ptr::null_mut(),
         };
         let mut event = std::mem::zeroed::<libc::kevent>();
 
-        let rc = libc::kevent(
-            kq,
-            &mut change,
-            1,
-            &mut event,
-            1,
-            std::ptr::null(),
-        );
+        let rc = libc::kevent(kq, &mut change, 1, &mut event, 1, std::ptr::null());
         let _ = libc::close(kq);
 
         if rc > 0 {
@@ -204,16 +199,18 @@ fn start_parent_death_watch() {}
 /// Aggregate recording counts from the last ~24h and POST to the cloud
 /// metering endpoint. Silently skips if the user has no cloud token.
 async fn send_metering_report(
-    pool:      &polish_backend::store::DbPool,
-    user_id:   &str,
-    http:      &reqwest::Client,
+    pool: &polish_backend::store::DbPool,
+    user_id: &str,
+    http: &reqwest::Client,
     cloud_url: &str,
 ) {
     use polish_backend::store::users;
     use tracing::{debug, warn};
 
     // Read cloud token
-    let Some(user) = users::get_user(pool, user_id) else { return; };
+    let Some(user) = users::get_user(pool, user_id) else {
+        return;
+    };
     let Some(token) = user.cloud_token else {
         debug!("[metering] no cloud token — skipping");
         return;
@@ -234,28 +231,24 @@ async fn send_metering_report(
                     SUM(word_count) as word_count
                FROM recordings
               WHERE user_id = ?1 AND timestamp_ms >= ?2
-              GROUP BY date, model_used"
+              GROUP BY date, model_used",
         ) {
-            Ok(mut stmt) => {
-                stmt.query_map(
-                    rusqlite::params![user_id, cutoff_ms],
-                    |row| {
-                        let date:         String = row.get(0)?;
-                        let model:        String = row.get(1)?;
-                        let polish_count: i64   = row.get(2)?;
-                        let word_count:   i64   = row.get(3)?;
-                        Ok(serde_json::json!({
-                            "date":         date,
-                            "model":        model,
-                            "polish_count": polish_count,
-                            "word_count":   word_count,
-                        }))
-                    },
-                )
+            Ok(mut stmt) => stmt
+                .query_map(rusqlite::params![user_id, cutoff_ms], |row| {
+                    let date: String = row.get(0)?;
+                    let model: String = row.get(1)?;
+                    let polish_count: i64 = row.get(2)?;
+                    let word_count: i64 = row.get(3)?;
+                    Ok(serde_json::json!({
+                        "date":         date,
+                        "model":        model,
+                        "polish_count": polish_count,
+                        "word_count":   word_count,
+                    }))
+                })
                 .ok()
                 .map(|rows| rows.flatten().collect())
-                .unwrap_or_default()
-            }
+                .unwrap_or_default(),
             Err(_) => vec![],
         }
     };
@@ -265,7 +258,7 @@ async fn send_metering_report(
         return;
     }
 
-    let url     = format!("{}/v1/metering/report", cloud_url.trim_end_matches('/'));
+    let url = format!("{}/v1/metering/report", cloud_url.trim_end_matches('/'));
     let payload = serde_json::json!({ "events": events });
 
     match http

@@ -17,34 +17,39 @@
 use rusqlite::params;
 use tracing::{info, warn};
 
-use super::{now_ms, DbPool};
+use super::{DbPool, now_ms};
 use crate::embedder::gemini::{blob_to_floats, floats_to_blob};
 use crate::store::vocabulary::VocabTerm;
 
+const PROMPT_VOCAB_TOP_WEIGHT: usize = 8;
+const PROMPT_VOCAB_K_RELEVANT: usize = 12;
+const PROMPT_VOCAB_MAX_TOTAL: usize = 25;
+const PROMPT_VOCAB_MIN_SIM: f32 = 0.55;
+
 /// One vocab entry plus its embedding, as loaded from the joined query.
 struct VocabRow {
-    term:            String,
-    embedding:       Vec<f32>,
-    weight:          f64,
-    use_count:       i64,
-    last_used:       i64,
-    source:          String,
+    term: String,
+    embedding: Vec<f32>,
+    weight: f64,
+    use_count: i64,
+    last_used: i64,
+    source: String,
     example_context: Option<String>,
-    term_type:       Option<String>,
-    meaning:         Option<String>,
+    term_type: Option<String>,
+    meaning: Option<String>,
 }
 
 impl VocabRow {
     fn into_term(self) -> VocabTerm {
         VocabTerm {
-            term:            self.term,
-            weight:          self.weight,
-            use_count:       self.use_count,
-            last_used:       self.last_used,
-            source:          self.source,
+            term: self.term,
+            weight: self.weight,
+            use_count: self.use_count,
+            last_used: self.last_used,
+            source: self.source,
             example_context: self.example_context,
-            term_type:       self.term_type,
-            meaning:         self.meaning,
+            term_type: self.term_type,
+            meaning: self.meaning,
         }
     }
 }
@@ -88,10 +93,10 @@ pub fn upsert_embedding(pool: &DbPool, user_id: &str, term: &str, embedding: &[f
 /// reader (`top_k_relevant`) tolerates a momentary stale centroid (worst
 /// case: one retrieval uses last-cycle's centroid).
 pub fn record_example_and_recentre(
-    pool:         &DbPool,
-    user_id:      &str,
-    term:         &str,
-    embedding:    &[f32],
+    pool: &DbPool,
+    user_id: &str,
+    term: &str,
+    embedding: &[f32],
     example_text: &str,
 ) {
     let conn = match pool.get() {
@@ -102,7 +107,7 @@ pub fn record_example_and_recentre(
         }
     };
     let term_trim = term.trim();
-    let now       = now_ms();
+    let now = now_ms();
 
     // 1. Append the new example.
     let blob = floats_to_blob(embedding);
@@ -149,41 +154,51 @@ pub fn record_example_and_recentre(
 /// Used as a soft signal — surfaced in logs today, will drive
 /// auto-split-into-two-prototypes in a future iteration.
 pub fn cluster_spread(pool: &DbPool, user_id: &str, term: &str) -> f32 {
-    let Ok(conn) = pool.get() else { return 0.0; };
+    let Ok(conn) = pool.get() else {
+        return 0.0;
+    };
     let examples = load_example_embeddings(&conn, user_id, term.trim());
     if examples.len() < 2 {
         return 0.0;
     }
     let centroid = mean_normalised(&examples);
     let cn = l2_norm(&centroid);
-    if cn == 0.0 { return 0.0; }
-    let mean_sim: f32 = examples.iter().map(|e| {
-        let en = l2_norm(e);
-        if en == 0.0 { 0.0 } else { dot(e, &centroid) / (en * cn) }
-    }).sum::<f32>() / examples.len() as f32;
+    if cn == 0.0 {
+        return 0.0;
+    }
+    let mean_sim: f32 = examples
+        .iter()
+        .map(|e| {
+            let en = l2_norm(e);
+            if en == 0.0 {
+                0.0
+            } else {
+                dot(e, &centroid) / (en * cn)
+            }
+        })
+        .sum::<f32>()
+        / examples.len() as f32;
     (1.0 - mean_sim).max(0.0)
 }
 
 /// Load the most-recent example texts for a (user, term), newest first,
 /// capped at `limit`. Used by the meaning-refinement path so the LLM can
 /// re-distill the term's description from its current usage cloud.
-pub fn recent_example_texts(
-    pool:    &DbPool,
-    user_id: &str,
-    term:    &str,
-    limit:   usize,
-) -> Vec<String> {
-    let Ok(conn) = pool.get() else { return vec![]; };
+pub fn recent_example_texts(pool: &DbPool, user_id: &str, term: &str, limit: usize) -> Vec<String> {
+    let Ok(conn) = pool.get() else {
+        return vec![];
+    };
     let Ok(mut stmt) = conn.prepare(
         "SELECT example_text FROM vocab_embedding_examples
           WHERE user_id = ?1 AND term = ?2
           ORDER BY recorded_at DESC
           LIMIT ?3",
-    ) else { return vec![]; };
-    stmt.query_map(
-        params![user_id, term.trim(), limit as i64],
-        |row| row.get::<_, String>(0),
-    )
+    ) else {
+        return vec![];
+    };
+    stmt.query_map(params![user_id, term.trim(), limit as i64], |row| {
+        row.get::<_, String>(0)
+    })
     .ok()
     .map(|rows| rows.filter_map(|r| r.ok()).collect())
     .unwrap_or_default()
@@ -196,8 +211,12 @@ pub fn recent_example_texts(
 ///
 /// Cheap: one batched UPDATE per call; idempotent.
 pub fn bump_last_used(pool: &DbPool, user_id: &str, terms: &[String]) {
-    if terms.is_empty() { return; }
-    let Ok(conn) = pool.get() else { return; };
+    if terms.is_empty() {
+        return;
+    }
+    let Ok(conn) = pool.get() else {
+        return;
+    };
     let now = now_ms();
     // SQLite doesn't have a clean batched UPDATE-IN; loop with prepared stmt.
     let Ok(mut stmt) = conn.prepare(
@@ -205,21 +224,57 @@ pub fn bump_last_used(pool: &DbPool, user_id: &str, terms: &[String]) {
             SET last_used = ?3,
                 use_count = use_count + 1
           WHERE user_id = ?1 AND term = ?2",
-    ) else { return; };
+    ) else {
+        return;
+    };
     for t in terms {
         let _ = stmt.execute(params![user_id, t.trim(), now]);
     }
 }
 
+pub fn has_centroid(pool: &DbPool, user_id: &str, term: &str) -> bool {
+    let Ok(conn) = pool.get() else {
+        return false;
+    };
+    conn.query_row(
+        "SELECT 1 FROM vocab_embeddings WHERE user_id = ?1 AND term = ?2 LIMIT 1",
+        params![user_id, term.trim()],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+pub fn has_example_ring(pool: &DbPool, user_id: &str, term: &str) -> bool {
+    let Ok(conn) = pool.get() else {
+        return false;
+    };
+    conn.query_row(
+        "SELECT 1 FROM vocab_embedding_examples
+          WHERE user_id = ?1 AND term = ?2
+          LIMIT 1",
+        params![user_id, term.trim()],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+pub fn rebuild_centroid_from_examples(pool: &DbPool, user_id: &str, term: &str) -> bool {
+    let Ok(conn) = pool.get() else {
+        return false;
+    };
+    let examples = load_example_embeddings(&conn, user_id, term.trim());
+    if examples.is_empty() {
+        return false;
+    }
+    let centroid = mean_normalised(&examples);
+    write_centroid(&conn, user_id, term.trim(), &centroid);
+    true
+}
+
 /// Internal: write the centroid into vocab_embeddings (with current ts).
-fn write_centroid(
-    conn:      &rusqlite::Connection,
-    user_id:   &str,
-    term:      &str,
-    centroid:  &[f32],
-) {
+fn write_centroid(conn: &rusqlite::Connection, user_id: &str, term: &str, centroid: &[f32]) {
     let blob = floats_to_blob(centroid);
-    let now  = now_ms();
+    let now = now_ms();
     let _ = conn.execute(
         "INSERT INTO vocab_embeddings (user_id, term, embedding, updated_at)
          VALUES (?1, ?2, ?3, ?4)
@@ -232,15 +287,17 @@ fn write_centroid(
 
 /// Internal: load all example embeddings for a (user, term).
 fn load_example_embeddings(
-    conn:    &rusqlite::Connection,
+    conn: &rusqlite::Connection,
     user_id: &str,
-    term:    &str,
+    term: &str,
 ) -> Vec<Vec<f32>> {
     let Ok(mut stmt) = conn.prepare(
         "SELECT embedding FROM vocab_embedding_examples
           WHERE user_id = ?1 AND term = ?2
           ORDER BY recorded_at DESC",
-    ) else { return vec![]; };
+    ) else {
+        return vec![];
+    };
     stmt.query_map(params![user_id, term], |row| row.get::<_, Vec<u8>>(0))
         .ok()
         .map(|iter| {
@@ -256,18 +313,28 @@ fn load_example_embeddings(
 /// other unit vectors.
 fn mean_normalised(vectors: &[Vec<f32>]) -> Vec<f32> {
     let n = vectors.len();
-    if n == 0 { return vec![]; }
+    if n == 0 {
+        return vec![];
+    }
     let dim = vectors[0].len();
     let mut sum = vec![0.0_f32; dim];
     for v in vectors {
-        if v.len() != dim { continue; }
-        for (s, &x) in sum.iter_mut().zip(v.iter()) { *s += x; }
+        if v.len() != dim {
+            continue;
+        }
+        for (s, &x) in sum.iter_mut().zip(v.iter()) {
+            *s += x;
+        }
     }
     let inv_n = 1.0 / n as f32;
-    for s in sum.iter_mut() { *s *= inv_n; }
+    for s in sum.iter_mut() {
+        *s *= inv_n;
+    }
     let norm = l2_norm(&sum);
     if norm > 0.0 {
-        for s in sum.iter_mut() { *s /= norm; }
+        for s in sum.iter_mut() {
+            *s /= norm;
+        }
     }
     sum
 }
@@ -301,7 +368,9 @@ fn use_count_factor(use_count: i64) -> f32 {
 /// behind. If the user later re-adds the same term, those zombie rows
 /// would resurface in the centroid recompute as ghost sightings.
 pub fn delete(pool: &DbPool, user_id: &str, term: &str) {
-    let Ok(conn) = pool.get() else { return; };
+    let Ok(conn) = pool.get() else {
+        return;
+    };
     let term_trim = term.trim();
     let _ = conn.execute(
         "DELETE FROM vocab_embeddings WHERE user_id = ?1 AND term = ?2",
@@ -319,12 +388,12 @@ pub fn delete(pool: &DbPool, user_id: &str, term: &str) {
 /// Filters by `language` — passes rows whose vocabulary.language is NULL
 /// (legacy / language-agnostic) or matches.
 pub fn top_k_relevant(
-    pool:        &DbPool,
-    user_id:     &str,
-    query:       &[f32],
-    language:    &str,
-    k:           usize,
-    min_sim:     f32,
+    pool: &DbPool,
+    user_id: &str,
+    query: &[f32],
+    language: &str,
+    k: usize,
+    min_sim: f32,
 ) -> Vec<VocabTerm> {
     let conn = match pool.get() {
         Ok(c) => c,
@@ -344,39 +413,40 @@ pub fn top_k_relevant(
         Err(_) => return vec![],
     };
 
-    let rows: Vec<VocabRow> = stmt.query_map(params![user_id, language], |row| {
-        let blob: Vec<u8> = row.get(1)?;
-        Ok((
-            row.get::<_, String>(0)?,
-            blob,
-            row.get::<_, f64>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, Option<String>>(6)?,
-            row.get::<_, Option<String>>(7)?,
-            row.get::<_, Option<String>>(8)?,
-        ))
-    })
-    .ok()
-    .map(|iter| {
-        iter.filter_map(|r| r.ok())
-            .filter_map(|(term, blob, weight, uc, lu, src, ctx, ty, mn)| {
-                blob_to_floats(&blob).map(|embedding| VocabRow {
-                    term,
-                    embedding,
-                    weight,
-                    use_count: uc,
-                    last_used: lu,
-                    source: src,
-                    example_context: ctx,
-                    term_type: ty,
-                    meaning: mn,
+    let rows: Vec<VocabRow> = stmt
+        .query_map(params![user_id, language], |row| {
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                blob,
+                row.get::<_, f64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        })
+        .ok()
+        .map(|iter| {
+            iter.filter_map(|r| r.ok())
+                .filter_map(|(term, blob, weight, uc, lu, src, ctx, ty, mn)| {
+                    blob_to_floats(&blob).map(|embedding| VocabRow {
+                        term,
+                        embedding,
+                        weight,
+                        use_count: uc,
+                        last_used: lu,
+                        source: src,
+                        example_context: ctx,
+                        term_type: ty,
+                        meaning: mn,
+                    })
                 })
-            })
-            .collect()
-    })
-    .unwrap_or_default();
+                .collect()
+        })
+        .unwrap_or_default();
 
     if rows.is_empty() {
         return vec![];
@@ -408,7 +478,7 @@ pub fn top_k_relevant(
                 return None;
             }
             let decay = decay_factor(row.last_used, now);
-            let usef  = use_count_factor(row.use_count);
+            let usef = use_count_factor(row.use_count);
             Some((cos * decay * usef, row))
         })
         .collect();
@@ -438,18 +508,50 @@ pub fn top_k_relevant(
 /// transcript's vector (for cosine). We need both for hybrid; either alone
 /// degrades gracefully.
 pub fn select_for_polish(
-    pool:            &DbPool,
-    user_id:         &str,
-    language:        &str,
+    pool: &DbPool,
+    user_id: &str,
+    language: &str,
     query_embedding: Option<&[f32]>,
-    n_top_weight:    usize,
-    k_relevant:      usize,
-    max_total:       usize,
-    min_sim:         f32,
+    n_top_weight: usize,
+    k_relevant: usize,
+    max_total: usize,
+    min_sim: f32,
 ) -> Vec<VocabTerm> {
     select_for_polish_hybrid(
-        pool, user_id, language, query_embedding, /* query_text = */ None,
-        n_top_weight, k_relevant, max_total, min_sim,
+        pool,
+        user_id,
+        language,
+        query_embedding,
+        /* query_text = */ None,
+        n_top_weight,
+        k_relevant,
+        max_total,
+        min_sim,
+    )
+}
+
+/// Shared selector for the final LLM polish prompt.
+///
+/// Voice and text polish should scope vocabulary identically so the final
+/// prompt only sees terms backed by transcript evidence instead of broad
+/// top-weight slates.
+pub fn select_for_prompt(
+    pool: &DbPool,
+    user_id: &str,
+    language: &str,
+    query_embedding: Option<&[f32]>,
+    query_text: Option<&str>,
+) -> Vec<VocabTerm> {
+    select_for_polish_hybrid(
+        pool,
+        user_id,
+        language,
+        query_embedding,
+        query_text,
+        PROMPT_VOCAB_TOP_WEIGHT,
+        PROMPT_VOCAB_K_RELEVANT,
+        PROMPT_VOCAB_MAX_TOTAL,
+        PROMPT_VOCAB_MIN_SIM,
     )
 }
 
@@ -484,19 +586,19 @@ pub fn select_for_polish(
 /// inclusion. `min_sim` is no longer applied as a gate (BM25 is the gate);
 /// it's effectively dead and kept for ABI compatibility.
 pub fn select_for_polish_hybrid(
-    pool:            &DbPool,
-    user_id:         &str,
-    language:        &str,
+    pool: &DbPool,
+    user_id: &str,
+    language: &str,
     query_embedding: Option<&[f32]>,
-    query_text:      Option<&str>,
-    n_top_weight:    usize,
-    k_relevant:      usize,
-    max_total:       usize,
-    _min_sim:        f32,
+    query_text: Option<&str>,
+    n_top_weight: usize,
+    k_relevant: usize,
+    max_total: usize,
+    _min_sim: f32,
 ) -> Vec<VocabTerm> {
     use crate::store::{vocab_fts, vocabulary};
     let mut chosen: Vec<VocabTerm> = Vec::with_capacity(max_total);
-    let mut seen:   std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Bucket 1 — Starred (always). User-pinned terms bypass the lexical
     // gate because they represent explicit user intent.
@@ -504,7 +606,9 @@ pub fn select_for_polish_hybrid(
     for t in all.iter().filter(|t| t.source == "starred") {
         if seen.insert(t.term.to_ascii_lowercase()) {
             chosen.push(t.clone());
-            if chosen.len() >= max_total { return chosen; }
+            if chosen.len() >= max_total {
+                return chosen;
+            }
         }
     }
 
@@ -548,7 +652,12 @@ pub fn select_for_polish_hybrid(
         // LLM has nothing to align the transcript context against, which is
         // exactly the "vocab hallucinated into unrelated places" failure mode.
         // Starred terms (handled in Bucket 1 above) intentionally bypass this.
-        .filter(|vt| vt.meaning.as_deref().map(|m| !m.trim().is_empty()).unwrap_or(false))
+        .filter(|vt| {
+            vt.meaning
+                .as_deref()
+                .map(|m| !m.trim().is_empty())
+                .unwrap_or(false)
+        })
         // Quality gate 2 — context confirmed. The BM25 search runs over
         // (term, example_context) so an example_context-only hit can match
         // when the term itself isn't in the transcript at all (the user
@@ -599,7 +708,9 @@ pub fn select_for_polish_hybrid(
         if seen.insert(vt.term.to_ascii_lowercase()) {
             chosen.push(vt);
             gate_added += 1;
-            if chosen.len() >= max_total { return chosen; }
+            if chosen.len() >= max_total {
+                return chosen;
+            }
         }
     }
 
@@ -612,13 +723,15 @@ pub fn select_for_polish_hybrid(
     // Starred terms are still included from Bucket 1; this only adds
     // unstarred high-weight terms when we have no other way to populate
     // the prompt.
-    let _ = gate_added;  // kept for future telemetry
+    let _ = gate_added; // kept for future telemetry
     let lexical_gate_ran = matches!(query_text, Some(t) if !t.trim().is_empty());
     if !lexical_gate_ran {
         for t in all.iter().take(n_top_weight) {
             if seen.insert(t.term.to_ascii_lowercase()) {
                 chosen.push(t.clone());
-                if chosen.len() >= max_total { return chosen; }
+                if chosen.len() >= max_total {
+                    return chosen;
+                }
             }
         }
     }
@@ -629,18 +742,18 @@ pub fn select_for_polish_hybrid(
 /// Internal: per-term score within the lexically-gated set. Combines
 /// cosine on the term's centroid, time-decay, and log(1+use_count).
 fn score_within_set(
-    conn:    &Option<r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>>,
+    conn: &Option<r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>>,
     user_id: &str,
-    vt:      &VocabTerm,
-    q:       &[f32],
-    q_norm:  f32,
-    now:     i64,
+    vt: &VocabTerm,
+    q: &[f32],
+    q_norm: f32,
+    now: i64,
 ) -> f32 {
     // Default if we can't load embedding: fall back to weight × decay.
     let weight_decay = vt.weight as f32 * decay_factor(vt.last_used, now);
     let conn = match conn {
         Some(c) => c,
-        None    => return weight_decay,
+        None => return weight_decay,
     };
     let blob: Vec<u8> = match conn.query_row(
         "SELECT embedding FROM vocab_embeddings WHERE user_id=?1 AND term=?2",
@@ -652,10 +765,12 @@ fn score_within_set(
     };
     let centroid = match blob_to_floats(&blob) {
         Some(v) => v,
-        None    => return weight_decay,
+        None => return weight_decay,
     };
     let cn = l2_norm(&centroid);
-    if cn == 0.0 { return weight_decay; }
+    if cn == 0.0 {
+        return weight_decay;
+    }
     let cos = dot(&centroid, q) / (cn * q_norm);
     cos * decay_factor(vt.last_used, now) * use_count_factor(vt.use_count)
 }
@@ -678,14 +793,16 @@ mod tests {
     use r2d2_sqlite::SqliteConnectionManager;
 
     fn mem_pool() -> DbPool {
-        let mgr  = SqliteConnectionManager::memory();
+        let mgr = SqliteConnectionManager::memory();
         // r2d2's :memory: connections are per-connection isolated, so multi-
         // conn pools each get a fresh empty DB. Single-conn is correct; the
         // helpers in this module that take `pool: &DbPool` must be careful
         // never to hold a conn open while calling another store fn.
         let pool = r2d2::Pool::builder().max_size(1).build(mgr).unwrap();
-        pool.get().unwrap().execute_batch(
-            "CREATE TABLE local_user (id TEXT PRIMARY KEY);
+        pool.get()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE local_user (id TEXT PRIMARY KEY);
              INSERT INTO local_user(id) VALUES ('u1');
              CREATE TABLE vocabulary (
                  user_id                 TEXT NOT NULL REFERENCES local_user(id),
@@ -722,12 +839,20 @@ mod tests {
              CREATE VIRTUAL TABLE vocab_fts USING fts5(
                  user_id UNINDEXED, term, example_context,
                  tokenize = 'unicode61 remove_diacritics 2'
-             );"
-        ).unwrap();
+             );",
+            )
+            .unwrap();
         pool
     }
 
-    fn seed(pool: &DbPool, term: &str, weight: f64, source: &str, embedding: &[f32], language: &str) {
+    fn seed(
+        pool: &DbPool,
+        term: &str,
+        weight: f64,
+        source: &str,
+        embedding: &[f32],
+        language: &str,
+    ) {
         // Scope the conn so it's released before upsert_embedding takes its
         // own from the pool (max_size=1 in tests would deadlock otherwise).
         {
@@ -742,50 +867,71 @@ mod tests {
     }
 
     /// Build a tiny 4-d unit-ish vector for testing cosine math.
-    fn vec4(a: f32, b: f32, c: f32, d: f32) -> Vec<f32> { vec![a, b, c, d] }
+    fn vec4(a: f32, b: f32, c: f32, d: f32) -> Vec<f32> {
+        vec![a, b, c, d]
+    }
 
     // ── Centroid ring + drift detection ───────────────────────────────────────
 
     fn unit(v: Vec<f32>) -> Vec<f32> {
         let n = (v.iter().map(|x| x * x).sum::<f32>()).sqrt();
-        if n == 0.0 { v } else { v.into_iter().map(|x| x / n).collect() }
+        if n == 0.0 {
+            v
+        } else {
+            v.into_iter().map(|x| x / n).collect()
+        }
     }
 
     #[test]
     fn ring_buffer_caps_at_examples_ring_size() {
         let pool = mem_pool();
         // Seed the parent vocabulary row first.
-        pool.get().unwrap().execute(
-            "INSERT INTO vocabulary (user_id, term, weight, use_count, last_used)
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO vocabulary (user_id, term, weight, use_count, last_used)
              VALUES ('u1', 'TERM', 1.0, 1, ?1)",
-            params![now_ms()],
-        ).unwrap();
+                params![now_ms()],
+            )
+            .unwrap();
         // Push 15 example embeddings; ring should keep only the latest 10.
         for i in 0..15 {
             let emb = unit(vec![i as f32, 0.0, 0.0, 0.0]);
             record_example_and_recentre(&pool, "u1", "TERM", &emb, &format!("ex{i}"));
         }
         let conn = pool.get().unwrap();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM vocab_embedding_examples WHERE user_id='u1' AND term='TERM'",
-            [],
-            |r| r.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vocab_embedding_examples WHERE user_id='u1' AND term='TERM'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(count, EXAMPLES_RING_SIZE as i64);
     }
 
     #[test]
     fn centroid_is_mean_of_examples() {
         let pool = mem_pool();
-        pool.get().unwrap().execute(
-            "INSERT INTO vocabulary (user_id, term, weight, use_count, last_used)
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO vocabulary (user_id, term, weight, use_count, last_used)
              VALUES ('u1', 'X', 1.0, 1, ?1)",
-            params![now_ms()],
-        ).unwrap();
+                params![now_ms()],
+            )
+            .unwrap();
         record_example_and_recentre(&pool, "u1", "X", &unit(vec![1.0, 0.0, 0.0, 0.0]), "a");
         record_example_and_recentre(&pool, "u1", "X", &unit(vec![1.0, 0.0, 0.0, 0.0]), "b");
         // Centroid of two identical unit vectors should be the same vector.
-        let got = top_k_relevant(&pool, "u1", &unit(vec![1.0, 0.0, 0.0, 0.0]), "english", 5, 0.0);
+        let got = top_k_relevant(
+            &pool,
+            "u1",
+            &unit(vec![1.0, 0.0, 0.0, 0.0]),
+            "english",
+            5,
+            0.0,
+        );
         assert_eq!(got.len(), 1);
         // Cosine should be ~1.0 (identical to query).
     }
@@ -793,11 +939,14 @@ mod tests {
     #[test]
     fn centroid_shifts_toward_new_examples() {
         let pool = mem_pool();
-        pool.get().unwrap().execute(
-            "INSERT INTO vocabulary (user_id, term, weight, use_count, last_used)
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO vocabulary (user_id, term, weight, use_count, last_used)
              VALUES ('u1', 'X', 1.0, 1, ?1)",
-            params![now_ms()],
-        ).unwrap();
+                params![now_ms()],
+            )
+            .unwrap();
         // Start with examples in direction (1, 0, 0, 0).
         for _ in 0..3 {
             record_example_and_recentre(&pool, "u1", "X", &unit(vec![1.0, 0.0, 0.0, 0.0]), "old");
@@ -807,9 +956,27 @@ mod tests {
             record_example_and_recentre(&pool, "u1", "X", &unit(vec![0.0, 1.0, 0.0, 0.0]), "new");
         }
         // Centroid should now be closer to (0, 1, 0, 0) than (1, 0, 0, 0).
-        let against_new = top_k_relevant(&pool, "u1", &unit(vec![0.0, 1.0, 0.0, 0.0]), "english", 5, 0.0);
-        let against_old = top_k_relevant(&pool, "u1", &unit(vec![1.0, 0.0, 0.0, 0.0]), "english", 5, 0.0);
-        assert_eq!(against_new.len(), 1, "centroid should match the new direction");
+        let against_new = top_k_relevant(
+            &pool,
+            "u1",
+            &unit(vec![0.0, 1.0, 0.0, 0.0]),
+            "english",
+            5,
+            0.0,
+        );
+        let against_old = top_k_relevant(
+            &pool,
+            "u1",
+            &unit(vec![1.0, 0.0, 0.0, 0.0]),
+            "english",
+            5,
+            0.0,
+        );
+        assert_eq!(
+            against_new.len(),
+            1,
+            "centroid should match the new direction"
+        );
         // 'old' direction may also score above 0 cosine but lower; we don't
         // need a hard ordering — the key fact is centroid moved.
         let _ = against_old;
@@ -818,15 +985,36 @@ mod tests {
     #[test]
     fn cluster_spread_low_for_cohesive_examples() {
         let pool = mem_pool();
-        pool.get().unwrap().execute(
-            "INSERT INTO vocabulary (user_id, term, weight, use_count, last_used)
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO vocabulary (user_id, term, weight, use_count, last_used)
              VALUES ('u1', 'COHESIVE', 1.0, 1, ?1)",
-            params![now_ms()],
-        ).unwrap();
+                params![now_ms()],
+            )
+            .unwrap();
         // Three nearly-identical examples — variance should be ~0.
-        record_example_and_recentre(&pool, "u1", "COHESIVE", &unit(vec![1.0, 0.05, 0.0, 0.0]), "a");
-        record_example_and_recentre(&pool, "u1", "COHESIVE", &unit(vec![1.0, 0.0, 0.05, 0.0]), "b");
-        record_example_and_recentre(&pool, "u1", "COHESIVE", &unit(vec![1.0, 0.0, 0.0, 0.05]), "c");
+        record_example_and_recentre(
+            &pool,
+            "u1",
+            "COHESIVE",
+            &unit(vec![1.0, 0.05, 0.0, 0.0]),
+            "a",
+        );
+        record_example_and_recentre(
+            &pool,
+            "u1",
+            "COHESIVE",
+            &unit(vec![1.0, 0.0, 0.05, 0.0]),
+            "b",
+        );
+        record_example_and_recentre(
+            &pool,
+            "u1",
+            "COHESIVE",
+            &unit(vec![1.0, 0.0, 0.0, 0.05]),
+            "c",
+        );
         let s = cluster_spread(&pool, "u1", "COHESIVE");
         assert!(s < 0.1, "cohesive cluster spread should be low, got {s}");
     }
@@ -834,17 +1022,32 @@ mod tests {
     #[test]
     fn cluster_spread_high_for_bimodal_examples() {
         let pool = mem_pool();
-        pool.get().unwrap().execute(
-            "INSERT INTO vocabulary (user_id, term, weight, use_count, last_used)
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO vocabulary (user_id, term, weight, use_count, last_used)
              VALUES ('u1', 'MERCURY', 1.0, 1, ?1)",
-            params![now_ms()],
-        ).unwrap();
+                params![now_ms()],
+            )
+            .unwrap();
         // Half pointing one way (planet), half another (band).
         for _ in 0..3 {
-            record_example_and_recentre(&pool, "u1", "MERCURY", &unit(vec![1.0, 0.0, 0.0, 0.0]), "planet");
+            record_example_and_recentre(
+                &pool,
+                "u1",
+                "MERCURY",
+                &unit(vec![1.0, 0.0, 0.0, 0.0]),
+                "planet",
+            );
         }
         for _ in 0..3 {
-            record_example_and_recentre(&pool, "u1", "MERCURY", &unit(vec![0.0, 1.0, 0.0, 0.0]), "band");
+            record_example_and_recentre(
+                &pool,
+                "u1",
+                "MERCURY",
+                &unit(vec![0.0, 1.0, 0.0, 0.0]),
+                "band",
+            );
         }
         let s = cluster_spread(&pool, "u1", "MERCURY");
         assert!(s > 0.2, "bimodal cluster spread should be high, got {s}");
@@ -863,7 +1066,10 @@ mod tests {
         let now = 2_000_000_000_000_i64;
         let one_half_life_ago = now - 45 * 24 * 3600 * 1000;
         let f = decay_factor(one_half_life_ago, now);
-        assert!((f - 0.5).abs() < 0.01, "decay at 45d should be ~0.5, got {f}");
+        assert!(
+            (f - 0.5).abs() < 0.01,
+            "decay at 45d should be ~0.5, got {f}"
+        );
     }
 
     #[test]
@@ -871,17 +1077,20 @@ mod tests {
         let now = 2_000_000_000_000_i64;
         let two_half_lives_ago = now - 90 * 24 * 3600 * 1000;
         let f = decay_factor(two_half_lives_ago, now);
-        assert!((f - 0.25).abs() < 0.01, "decay at 90d should be ~0.25, got {f}");
+        assert!(
+            (f - 0.25).abs() < 0.01,
+            "decay at 90d should be ~0.25, got {f}"
+        );
     }
 
     #[test]
     fn use_count_factor_grows_logarithmically() {
-        let f1   = use_count_factor(1);
-        let f10  = use_count_factor(10);
+        let f1 = use_count_factor(1);
+        let f10 = use_count_factor(10);
         let f100 = use_count_factor(100);
         // Should be diminishing returns: 100× use is not 100× factor.
         assert!(f100 < 10.0 * f1, "use_count_factor should be sub-linear");
-        assert!(f10  > f1);
+        assert!(f10 > f1);
         assert!(f100 > f10);
     }
 
@@ -890,17 +1099,24 @@ mod tests {
         let pool = mem_pool();
         // Seed a row with last_used 1 day ago.
         let day_ago = now_ms() - 86_400_000;
-        pool.get().unwrap().execute(
-            "INSERT INTO vocabulary (user_id, term, weight, use_count, last_used)
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO vocabulary (user_id, term, weight, use_count, last_used)
              VALUES ('u1', 'TICK', 1.0, 0, ?1)",
-            params![day_ago],
-        ).unwrap();
+                params![day_ago],
+            )
+            .unwrap();
         bump_last_used(&pool, "u1", &["TICK".into()]);
-        let row: (i64, i64) = pool.get().unwrap().query_row(
-            "SELECT last_used, use_count FROM vocabulary WHERE term='TICK'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let row: (i64, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT last_used, use_count FROM vocabulary WHERE term='TICK'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert!(row.0 > day_ago, "last_used should advance");
         assert_eq!(row.1, 1, "use_count should increment");
     }
@@ -908,7 +1124,14 @@ mod tests {
     #[test]
     fn upsert_and_retrieve_round_trip() {
         let pool = mem_pool();
-        seed(&pool, "MACOBS", 2.0, "auto", &vec4(1.0, 0.0, 0.0, 0.0), "english");
+        seed(
+            &pool,
+            "MACOBS",
+            2.0,
+            "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0),
+            "english",
+        );
         let got = top_k_relevant(&pool, "u1", &vec4(1.0, 0.0, 0.0, 0.0), "english", 5, 0.0);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].term, "MACOBS");
@@ -918,35 +1141,79 @@ mod tests {
     fn cosine_ordering_correct() {
         let pool = mem_pool();
         // Aligned with query → high similarity
-        seed(&pool, "FINANCE", 1.0, "auto", &vec4(1.0, 0.0, 0.0, 0.0), "english");
+        seed(
+            &pool,
+            "FINANCE",
+            1.0,
+            "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0),
+            "english",
+        );
         // Orthogonal → zero
-        seed(&pool, "COOKING", 1.0, "auto", &vec4(0.0, 1.0, 0.0, 0.0), "english");
+        seed(
+            &pool,
+            "COOKING",
+            1.0,
+            "auto",
+            &vec4(0.0, 1.0, 0.0, 0.0),
+            "english",
+        );
         // Slightly aligned
-        seed(&pool, "ECONOMY", 1.0, "auto", &vec4(0.7, 0.3, 0.0, 0.0), "english");
+        seed(
+            &pool,
+            "ECONOMY",
+            1.0,
+            "auto",
+            &vec4(0.7, 0.3, 0.0, 0.0),
+            "english",
+        );
 
         let got = top_k_relevant(&pool, "u1", &vec4(1.0, 0.0, 0.0, 0.0), "english", 5, 0.0);
         assert_eq!(got.len(), 3);
-        assert_eq!(got[0].term, "FINANCE");   // sim = 1.0
-        assert_eq!(got[1].term, "ECONOMY");   // sim ≈ 0.92
-        assert_eq!(got[2].term, "COOKING");   // sim = 0.0
+        assert_eq!(got[0].term, "FINANCE"); // sim = 1.0
+        assert_eq!(got[1].term, "ECONOMY"); // sim ≈ 0.92
+        assert_eq!(got[2].term, "COOKING"); // sim = 0.0
     }
 
     #[test]
     fn min_sim_filters_out_low_relevance() {
         let pool = mem_pool();
-        seed(&pool, "FINANCE", 1.0, "auto", &vec4(1.0, 0.0, 0.0, 0.0), "english");
-        seed(&pool, "COOKING", 1.0, "auto", &vec4(0.0, 1.0, 0.0, 0.0), "english");
+        seed(
+            &pool,
+            "FINANCE",
+            1.0,
+            "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0),
+            "english",
+        );
+        seed(
+            &pool,
+            "COOKING",
+            1.0,
+            "auto",
+            &vec4(0.0, 1.0, 0.0, 0.0),
+            "english",
+        );
         let got = top_k_relevant(&pool, "u1", &vec4(1.0, 0.0, 0.0, 0.0), "english", 5, 0.5);
-        assert_eq!(got.len(), 1);   // COOKING filtered (sim = 0.0)
+        assert_eq!(got.len(), 1); // COOKING filtered (sim = 0.0)
         assert_eq!(got[0].term, "FINANCE");
     }
 
     #[test]
     fn delete_clears_embedding() {
         let pool = mem_pool();
-        seed(&pool, "TERM", 1.0, "auto", &vec4(1.0, 0.0, 0.0, 0.0), "english");
+        seed(
+            &pool,
+            "TERM",
+            1.0,
+            "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0),
+            "english",
+        );
         delete(&pool, "u1", "TERM");
-        assert!(top_k_relevant(&pool, "u1", &vec4(1.0, 0.0, 0.0, 0.0), "english", 5, 0.0).is_empty());
+        assert!(
+            top_k_relevant(&pool, "u1", &vec4(1.0, 0.0, 0.0, 0.0), "english", 5, 0.0).is_empty()
+        );
     }
 
     #[test]
@@ -956,29 +1223,50 @@ mod tests {
         // same term later would resurrect those rows in the centroid
         // recompute. delete() must wipe both the centroid and the ring.
         let pool = mem_pool();
-        seed(&pool, "TERM", 1.0, "auto", &vec4(1.0, 0.0, 0.0, 0.0), "english");
+        seed(
+            &pool,
+            "TERM",
+            1.0,
+            "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0),
+            "english",
+        );
         record_example_and_recentre(&pool, "u1", "TERM", &unit(vec![1.0, 0.0, 0.0, 0.0]), "ex1");
         record_example_and_recentre(&pool, "u1", "TERM", &unit(vec![0.0, 1.0, 0.0, 0.0]), "ex2");
 
         delete(&pool, "u1", "TERM");
 
         let conn = pool.get().unwrap();
-        let ring_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM vocab_embedding_examples WHERE user_id='u1' AND term='TERM'",
-            [], |r| r.get(0),
-        ).unwrap();
-        assert_eq!(ring_count, 0,
-                   "examples ring must be cleared on term delete (no zombie sightings)");
+        let ring_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vocab_embedding_examples WHERE user_id='u1' AND term='TERM'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ring_count, 0,
+            "examples ring must be cleared on term delete (no zombie sightings)"
+        );
     }
 
     #[test]
     fn upsert_replaces_existing_embedding() {
         let pool = mem_pool();
-        seed(&pool, "TERM", 1.0, "auto", &vec4(1.0, 0.0, 0.0, 0.0), "english");
+        seed(
+            &pool,
+            "TERM",
+            1.0,
+            "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0),
+            "english",
+        );
         // Re-embed with a different vector.
         upsert_embedding(&pool, "u1", "TERM", &vec4(0.0, 1.0, 0.0, 0.0));
         // Original-direction query should now miss; new-direction should hit.
-        assert!(top_k_relevant(&pool, "u1", &vec4(1.0, 0.0, 0.0, 0.0), "english", 5, 0.5).is_empty());
+        assert!(
+            top_k_relevant(&pool, "u1", &vec4(1.0, 0.0, 0.0, 0.0), "english", 5, 0.5).is_empty()
+        );
         assert_eq!(
             top_k_relevant(&pool, "u1", &vec4(0.0, 1.0, 0.0, 0.0), "english", 5, 0.5).len(),
             1,
@@ -997,29 +1285,35 @@ mod tests {
     /// `meaning` so the polish-prompt quality gate passes — tests for the
     /// NULL-meaning filter use a separate helper.
     fn seed_with_context(
-        pool:    &DbPool,
-        term:    &str,
-        weight:  f64,
-        source:  &str,
+        pool: &DbPool,
+        term: &str,
+        weight: f64,
+        source: &str,
         embedding: &[f32],
-        language:  &str,
-        context:   &str,
+        language: &str,
+        context: &str,
     ) {
         seed_with_context_and_meaning(
-            pool, term, weight, source, embedding, language, context,
+            pool,
+            term,
+            weight,
+            source,
+            embedding,
+            language,
+            context,
             Some("Test meaning."),
         );
     }
 
     fn seed_with_context_and_meaning(
-        pool:      &DbPool,
-        term:      &str,
-        weight:    f64,
-        source:    &str,
+        pool: &DbPool,
+        term: &str,
+        weight: f64,
+        source: &str,
         embedding: &[f32],
-        language:  &str,
-        context:   &str,
-        meaning:   Option<&str>,
+        language: &str,
+        context: &str,
+        meaning: Option<&str>,
     ) {
         {
             let conn = pool.get().unwrap();
@@ -1033,7 +1327,8 @@ mod tests {
                 "INSERT INTO vocab_fts (user_id, term, example_context)
                  VALUES ('u1', ?1, ?2)",
                 params![term, context],
-            ).unwrap();
+            )
+            .unwrap();
         }
         upsert_embedding(pool, "u1", term, embedding);
     }
@@ -1041,18 +1336,31 @@ mod tests {
     #[test]
     fn lexical_gate_includes_term_when_transcript_mentions_it_directly() {
         let pool = mem_pool();
-        seed_with_context(&pool, "MACOBS", 1.0, "auto",
-            &vec4(1.0, 0.0, 0.0, 0.0), "english",
-            "MACOBS ka IPO ka 12 hazaar batana");
+        seed_with_context(
+            &pool,
+            "MACOBS",
+            1.0,
+            "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0),
+            "english",
+            "MACOBS ka IPO ka 12 hazaar batana",
+        );
 
         let chosen = select_for_polish_hybrid(
-            &pool, "u1", "english",
+            &pool,
+            "u1",
+            "english",
             Some(&vec4(1.0, 0.0, 0.0, 0.0)),
-            Some("the MACOBS announcement"),     // term itself appears in transcript
-            5, 5, 10, 0.0,
+            Some("the MACOBS announcement"), // term itself appears in transcript
+            5,
+            5,
+            10,
+            0.0,
         );
-        assert!(chosen.iter().any(|v| v.term == "MACOBS"),
-                "term-itself match must include the entry");
+        assert!(
+            chosen.iter().any(|v| v.term == "MACOBS"),
+            "term-itself match must include the entry"
+        );
     }
 
     #[test]
@@ -1065,20 +1373,33 @@ mod tests {
         // "main corps" → "MACOBS") is handled by the deterministic
         // stt_replacements layer, not by polish-prompt vocab injection.
         let pool = mem_pool();
-        seed_with_context(&pool, "MACOBS", 1.0, "auto",
-            &vec4(1.0, 0.0, 0.0, 0.0), "english",
-            "MACOBS ka IPO ka 12 hazaar batana");
+        seed_with_context(
+            &pool,
+            "MACOBS",
+            1.0,
+            "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0),
+            "english",
+            "MACOBS ka IPO ka 12 hazaar batana",
+        );
 
         // Transcript shares "ka", "IPO", "hazaar" with example_context but
         // contains no token phonetically close to MACOBS.
         let chosen = select_for_polish_hybrid(
-            &pool, "u1", "english",
+            &pool,
+            "u1",
+            "english",
             Some(&vec4(1.0, 0.0, 0.0, 0.0)),
             Some("main corps ka IPO ka 12 hazaar batana"),
-            5, 5, 10, 0.0,
+            5,
+            5,
+            10,
+            0.0,
         );
-        assert!(!chosen.iter().any(|v| v.term == "MACOBS"),
-                "example_context-only overlap must NOT include the entry under the strict gate");
+        assert!(
+            !chosen.iter().any(|v| v.term == "MACOBS"),
+            "example_context-only overlap must NOT include the entry under the strict gate"
+        );
     }
 
     #[test]
@@ -1088,35 +1409,62 @@ mod tests {
         // with tembeess or its context. Lexical gate must EXCLUDE tembeess
         // → no over-replacement possible at the polish-prompt layer.
         let pool = mem_pool();
-        seed_with_context(&pool, "tembeess", 4.0, "auto",
-            &vec4(1.0, 0.0, 0.0, 0.0), "english",
-            "tembeess team meeting on Friday");
+        seed_with_context(
+            &pool,
+            "tembeess",
+            4.0,
+            "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0),
+            "english",
+            "tembeess team meeting on Friday",
+        );
 
         let chosen = select_for_polish_hybrid(
-            &pool, "u1", "english",
-            Some(&vec4(0.99, 0.0, 0.0, 0.0)),  // semantically near (cosine high)
-            Some("what time is it"),            // BUT no lexical overlap
-            5, 5, 10, 0.0,
+            &pool,
+            "u1",
+            "english",
+            Some(&vec4(0.99, 0.0, 0.0, 0.0)), // semantically near (cosine high)
+            Some("what time is it"),          // BUT no lexical overlap
+            5,
+            5,
+            10,
+            0.0,
         );
-        assert!(!chosen.iter().any(|v| v.term == "tembeess"),
-                "lexical gate must exclude tembeess for unrelated transcripts even if cosine is high");
+        assert!(
+            !chosen.iter().any(|v| v.term == "tembeess"),
+            "lexical gate must exclude tembeess for unrelated transcripts even if cosine is high"
+        );
     }
 
     #[test]
     fn lexical_gate_starred_always_included_regardless_of_overlap() {
         let pool = mem_pool();
-        seed_with_context(&pool, "PINNED", 0.5, "starred",
-            &vec4(0.0, 1.0, 0.0, 0.0), "english",
-            "PINNED is my favourite term");
+        seed_with_context(
+            &pool,
+            "PINNED",
+            0.5,
+            "starred",
+            &vec4(0.0, 1.0, 0.0, 0.0),
+            "english",
+            "PINNED is my favourite term",
+        );
 
         // Transcript shares NO words with PINNED or its context.
         let chosen = select_for_polish_hybrid(
-            &pool, "u1", "english", None,
+            &pool,
+            "u1",
+            "english",
+            None,
             Some("the cat sat on the mat"),
-            5, 5, 10, 0.0,
+            5,
+            5,
+            10,
+            0.0,
         );
-        assert!(chosen.iter().any(|v| v.term == "PINNED"),
-                "starred terms always included regardless of lexical match");
+        assert!(
+            chosen.iter().any(|v| v.term == "PINNED"),
+            "starred terms always included regardless of lexical match"
+        );
     }
 
     #[test]
@@ -1126,19 +1474,31 @@ mod tests {
         // possible because no vocab in scope. Top-weight fallback only runs
         // when no transcript was passed at all (legacy callers).
         let pool = mem_pool();
-        seed_with_context(&pool, "tembeess", 5.0, "auto",
-            &vec4(1.0, 0.0, 0.0, 0.0), "english",
-            "tembeess Friday team meeting");
+        seed_with_context(
+            &pool,
+            "tembeess",
+            5.0,
+            "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0),
+            "english",
+            "tembeess Friday team meeting",
+        );
 
         let chosen = select_for_polish_hybrid(
-            &pool, "u1", "english",
-            Some(&vec4(0.99, 0.0, 0.0, 0.0)),  // semantically near
-            Some("what time is it"),            // no lexical anchor
-            10,  // n_top_weight — must NOT fire because gate ran (text was passed)
-            5, 25, 0.0,
+            &pool,
+            "u1",
+            "english",
+            Some(&vec4(0.99, 0.0, 0.0, 0.0)), // semantically near
+            Some("what time is it"),          // no lexical anchor
+            10, // n_top_weight — must NOT fire because gate ran (text was passed)
+            5,
+            25,
+            0.0,
         );
-        assert!(chosen.is_empty(),
-                "lexical gate ran with no matches → vocab block must be empty (got: {chosen:?})");
+        assert!(
+            chosen.is_empty(),
+            "lexical gate ran with no matches → vocab block must be empty (got: {chosen:?})"
+        );
     }
 
     #[test]
@@ -1147,19 +1507,36 @@ mod tests {
         // starred + top-weight. Used by select_for_polish wrapper for
         // backward compatibility.
         let pool = mem_pool();
-        seed_with_context(&pool, "STARRED", 0.5, "starred", &vec4(0.0, 1.0, 0.0, 0.0), "english", "");
-        seed_with_context(&pool, "HEAVY",   4.0, "auto",    &vec4(0.0, 0.0, 1.0, 0.0), "english", "");
+        seed_with_context(
+            &pool,
+            "STARRED",
+            0.5,
+            "starred",
+            &vec4(0.0, 1.0, 0.0, 0.0),
+            "english",
+            "",
+        );
+        seed_with_context(
+            &pool,
+            "HEAVY",
+            4.0,
+            "auto",
+            &vec4(0.0, 0.0, 1.0, 0.0),
+            "english",
+            "",
+        );
 
         let chosen = select_for_polish_hybrid(
-            &pool, "u1", "english",
-            None,     // no embedding
-            None,     // no transcript → lexical gate doesn't run
+            &pool, "u1", "english", None, // no embedding
+            None, // no transcript → lexical gate doesn't run
             5, 5, 10, 0.0,
         );
         let names: Vec<&str> = chosen.iter().map(|v| v.term.as_str()).collect();
         assert!(names.contains(&"STARRED"));
-        assert!(names.contains(&"HEAVY"),
-                "legacy no-text callers fall back to top-weight (otherwise empty)");
+        assert!(
+            names.contains(&"HEAVY"),
+            "legacy no-text callers fall back to top-weight (otherwise empty)"
+        );
     }
 
     #[test]
@@ -1167,25 +1544,46 @@ mod tests {
         // When multiple terms BOTH appear in the transcript, cosine + decay
         // + use_count determines the order within the gated set.
         let pool = mem_pool();
-        seed_with_context(&pool, "MACOBS",  1.0, "auto",
-            &vec4(1.0, 0.0, 0.0, 0.0), "english", "MACOBS ka IPO ka 12 hazaar");
-        seed_with_context(&pool, "OTHERCO", 1.0, "auto",
-            &vec4(0.0, 1.0, 0.0, 0.0), "english", "OTHERCO ka IPO date hai");
+        seed_with_context(
+            &pool,
+            "MACOBS",
+            1.0,
+            "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0),
+            "english",
+            "MACOBS ka IPO ka 12 hazaar",
+        );
+        seed_with_context(
+            &pool,
+            "OTHERCO",
+            1.0,
+            "auto",
+            &vec4(0.0, 1.0, 0.0, 0.0),
+            "english",
+            "OTHERCO ka IPO date hai",
+        );
 
         // Query embedding aligns with MACOBS (1,0,0,0) > OTHERCO (0,1,0,0).
         // Transcript directly contains both terms — passes the strict gate.
         let chosen = select_for_polish_hybrid(
-            &pool, "u1", "english",
+            &pool,
+            "u1",
+            "english",
             Some(&vec4(1.0, 0.0, 0.0, 0.0)),
             Some("MACOBS and OTHERCO IPO tomorrow"),
-            5, 5, 10, 0.0,
+            5,
+            5,
+            10,
+            0.0,
         );
         assert!(chosen.iter().any(|v| v.term == "MACOBS"));
         assert!(chosen.iter().any(|v| v.term == "OTHERCO"));
-        let macobs_idx  = chosen.iter().position(|v| v.term == "MACOBS").unwrap();
+        let macobs_idx = chosen.iter().position(|v| v.term == "MACOBS").unwrap();
         let otherco_idx = chosen.iter().position(|v| v.term == "OTHERCO").unwrap();
-        assert!(macobs_idx < otherco_idx,
-                "MACOBS (cosine-near to query) should rank above OTHERCO");
+        assert!(
+            macobs_idx < otherco_idx,
+            "MACOBS (cosine-near to query) should rank above OTHERCO"
+        );
     }
 
     #[test]
@@ -1198,26 +1596,45 @@ mod tests {
         // bias and stt_replacements), just not in the polish prompt.
         let pool = mem_pool();
         seed_with_context_and_meaning(
-            &pool, "WITHMEANING", 1.0, "auto",
-            &vec4(1.0, 0.0, 0.0, 0.0), "english", "WITHMEANING context",
+            &pool,
+            "WITHMEANING",
+            1.0,
+            "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0),
+            "english",
+            "WITHMEANING context",
             Some("A test term with a stored meaning."),
         );
         seed_with_context_and_meaning(
-            &pool, "NOMEANING", 1.0, "auto",
-            &vec4(1.0, 0.0, 0.0, 0.0), "english", "NOMEANING context",
+            &pool,
+            "NOMEANING",
+            1.0,
+            "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0),
+            "english",
+            "NOMEANING context",
             None,
         );
 
         let chosen = select_for_polish_hybrid(
-            &pool, "u1", "english",
+            &pool,
+            "u1",
+            "english",
             Some(&vec4(1.0, 0.0, 0.0, 0.0)),
             Some("WITHMEANING and NOMEANING both appear here"),
-            5, 5, 10, 0.0,
+            5,
+            5,
+            10,
+            0.0,
         );
-        assert!(chosen.iter().any(|v| v.term == "WITHMEANING"),
-                "term with meaning must pass the gate");
-        assert!(!chosen.iter().any(|v| v.term == "NOMEANING"),
-                "term with NULL meaning must be filtered out");
+        assert!(
+            chosen.iter().any(|v| v.term == "WITHMEANING"),
+            "term with meaning must pass the gate"
+        );
+        assert!(
+            !chosen.iter().any(|v| v.term == "NOMEANING"),
+            "term with NULL meaning must be filtered out"
+        );
     }
 
     #[test]
@@ -1226,17 +1643,30 @@ mod tests {
         // gates — including the meaning filter.
         let pool = mem_pool();
         seed_with_context_and_meaning(
-            &pool, "STARRED_NOMEANING", 0.5, "starred",
-            &vec4(0.0, 1.0, 0.0, 0.0), "english", "starred context",
+            &pool,
+            "STARRED_NOMEANING",
+            0.5,
+            "starred",
+            &vec4(0.0, 1.0, 0.0, 0.0),
+            "english",
+            "starred context",
             None,
         );
         let chosen = select_for_polish_hybrid(
-            &pool, "u1", "english", None,
+            &pool,
+            "u1",
+            "english",
+            None,
             Some("anything goes"),
-            5, 5, 10, 0.0,
+            5,
+            5,
+            10,
+            0.0,
         );
-        assert!(chosen.iter().any(|v| v.term == "STARRED_NOMEANING"),
-                "starred terms bypass the meaning filter");
+        assert!(
+            chosen.iter().any(|v| v.term == "STARRED_NOMEANING"),
+            "starred terms bypass the meaning filter"
+        );
     }
 
     #[test]
@@ -1245,18 +1675,32 @@ mod tests {
         // a word that STT misheard but is phonetically close to a vocab
         // term, the term should still be retrieved.
         let pool = mem_pool();
-        seed_with_context(&pool, "EMIAC", 1.0, "auto",
-            &vec4(1.0, 0.0, 0.0, 0.0), "english", "EMIAC technology");
+        seed_with_context(
+            &pool,
+            "EMIAC",
+            1.0,
+            "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0),
+            "english",
+            "EMIAC technology",
+        );
 
         // "emyak" is a phonetic neighbour of "EMIAC" but not a substring.
         let chosen = select_for_polish_hybrid(
-            &pool, "u1", "english",
+            &pool,
+            "u1",
+            "english",
             Some(&vec4(1.0, 0.0, 0.0, 0.0)),
             Some("the emyak technology meeting"),
-            5, 5, 10, 0.0,
+            5,
+            5,
+            10,
+            0.0,
         );
-        assert!(chosen.iter().any(|v| v.term == "EMIAC"),
-                "phonetic match should include the term even without literal substring");
+        assert!(
+            chosen.iter().any(|v| v.term == "EMIAC"),
+            "phonetic match should include the term even without literal substring"
+        );
     }
 
     #[test]
@@ -1267,17 +1711,26 @@ mod tests {
         // the result to max_total regardless.
         for i in 0..50 {
             seed_with_context(
-                &pool, &format!("T{i}"), 1.0, "auto",
-                &vec4(i as f32, 0.0, 0.0, 0.0), "english",
+                &pool,
+                &format!("T{i}"),
+                1.0,
+                "auto",
+                &vec4(i as f32, 0.0, 0.0, 0.0),
+                "english",
                 "T context",
             );
         }
         let transcript: String = (0..50).map(|i| format!("T{i} ")).collect();
         let chosen = select_for_polish_hybrid(
-            &pool, "u1", "english",
+            &pool,
+            "u1",
+            "english",
             Some(&vec4(1.0, 0.0, 0.0, 0.0)),
             Some(&transcript),
-            100, 100, 5, 0.0,
+            100,
+            100,
+            5,
+            0.0,
         );
         assert_eq!(chosen.len(), 5);
     }

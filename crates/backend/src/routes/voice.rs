@@ -77,7 +77,10 @@ use crate::{
     embedder::gemini,
     llm::{
         gateway, gemini_direct, groq, openai_codex,
-        prompt::{build_system_prompt_with_vocab_entries, build_user_message, VocabEntry},
+        prompt::{
+            VocabEntry, build_system_prompt_with_vocab_entries, build_user_message,
+            vocab_terms_to_entries,
+        },
     },
     store::{
         history::{InsertRecording, insert_recording},
@@ -282,22 +285,10 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
             let uid_v    = user_id.clone();
             let lang_v   = prefs.output_language.clone();
             let emb_v    = embedding.clone();
-            const N_TOP_WEIGHT: usize = 8;
-            const K_RELEVANT:   usize = 12;
-            const MAX_TOTAL:    usize = 25;
-            const MIN_SIM:      f32   = 0.55;
             let txt_v = stt_transcript.clone();
             let chosen = tokio::task::spawn_blocking(move || {
-                // Hybrid selector: dense (cosine on time-decayed centroids)
-                // ⊕ sparse (BM25 on term + example_context) fused via RRF.
-                // Dense alone misses exact-match jargon (acronyms, IDs);
-                // BM25 alone misses semantic neighbours. Together they
-                // catch ~15-30% more relevant entries (Weaviate / OpenSearch
-                // hybrid-search docs).
-                vocab_embeddings::select_for_polish_hybrid(
-                    &pool_v, &uid_v, &lang_v,
-                    emb_v.as_deref(), Some(&txt_v),
-                    N_TOP_WEIGHT, K_RELEVANT, MAX_TOTAL, MIN_SIM,
+                vocab_embeddings::select_for_prompt(
+                    &pool_v, &uid_v, &lang_v, emb_v.as_deref(), Some(&txt_v),
                 )
             }).await.unwrap_or_default();
             if chosen.is_empty() {
@@ -313,12 +304,7 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
             } else {
                 info!("[voice] vocab selector picked {}/{} entries (relevance-aware)",
                       chosen.len(), vocab_full.len());
-                chosen.into_iter().map(|v| VocabEntry {
-                    term:      v.term,
-                    context:   v.example_context,
-                    term_type: v.term_type,
-                    meaning:   v.meaning,
-                }).collect()
+                vocab_terms_to_entries(chosen)
             }
         };
 
@@ -576,8 +562,8 @@ fn parse_confidence_marker(inner: &str) -> Option<String> {
     }
     // Word part = everything before the percentage, with any '?' and
     // surrounding whitespace stripped.
-    let word_part = without_pct[..split_at]
-        .trim_end_matches(|c: char| c == '?' || c.is_whitespace());
+    let word_part =
+        without_pct[..split_at].trim_end_matches(|c: char| c == '?' || c.is_whitespace());
     if word_part.is_empty() {
         return None;
     }
@@ -591,14 +577,23 @@ mod scrub_tests {
     #[test]
     fn canonical_form_strips_cleanly() {
         // Form we emit ourselves from STT.
-        assert_eq!(strip_confidence_markers("aaj [kaam?60%] tha"), "aaj kaam tha");
-        assert_eq!(strip_confidence_markers("[main?47%] meeting"), "main meeting");
+        assert_eq!(
+            strip_confidence_markers("aaj [kaam?60%] tha"),
+            "aaj kaam tha"
+        );
+        assert_eq!(
+            strip_confidence_markers("[main?47%] meeting"),
+            "main meeting"
+        );
     }
 
     #[test]
     fn malformed_llm_leaks_get_scrubbed() {
         // The actual user-reported failure: [main60%] with NO question mark.
-        assert_eq!(strip_confidence_markers("hello [main60%] there"), "hello main there");
+        assert_eq!(
+            strip_confidence_markers("hello [main60%] there"),
+            "hello main there"
+        );
         // Space instead of '?'
         assert_eq!(strip_confidence_markers("[main 60%] hai"), "main hai");
         // Both space and '?'
@@ -615,20 +610,25 @@ mod scrub_tests {
     #[test]
     fn non_marker_brackets_preserved() {
         // Plain footnote-style — must NOT be scrubbed.
-        assert_eq!(strip_confidence_markers("see [1] for context"), "see [1] for context");
-        assert_eq!(strip_confidence_markers("[note]"),               "[note]");
+        assert_eq!(
+            strip_confidence_markers("see [1] for context"),
+            "see [1] for context"
+        );
+        assert_eq!(strip_confidence_markers("[note]"), "[note]");
         // Bracketed text with no trailing percentage stays.
-        assert_eq!(strip_confidence_markers("[hello world]"),        "[hello world]");
+        assert_eq!(strip_confidence_markers("[hello world]"), "[hello world]");
         // Just a percentage with no word part — keep brackets, not a marker.
-        assert_eq!(strip_confidence_markers("[60%]"),                "[60%]");
-        assert_eq!(strip_confidence_markers("[%60]"),                "[%60]");
+        assert_eq!(strip_confidence_markers("[60%]"), "[60%]");
+        assert_eq!(strip_confidence_markers("[%60]"), "[%60]");
     }
 
     #[test]
     fn unclosed_bracket_doesnt_eat_rest_of_string() {
         // If the bracket never closes, emit it as-is — don't gobble the tail.
-        assert_eq!(strip_confidence_markers("hello [main60% rest"),
-                   "hello [main60% rest");
+        assert_eq!(
+            strip_confidence_markers("hello [main60% rest"),
+            "hello [main60% rest"
+        );
     }
 
     #[test]
