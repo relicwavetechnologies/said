@@ -44,6 +44,12 @@ pub struct ChunkReceiver {
     pub native_rate: u32,
 }
 
+/// Live microphone amplitude for UI visualizers.
+/// Values are normalized to roughly 0.0–1.0 and are intentionally lossy.
+pub struct LevelReceiver {
+    pub rx: mpsc::Receiver<f32>,
+}
+
 // ── Public recorder ───────────────────────────────────────────────────────────
 
 pub struct AudioRecorder {
@@ -53,6 +59,8 @@ pub struct AudioRecorder {
     /// Recorder's own copy of the chunk sender; dropped explicitly in `stop()`
     /// so the WS task sees the channel close when the cpal stream also ends.
     chunk_tx:    Option<mpsc::SyncSender<Vec<f32>>>,
+    level_rx:    Option<mpsc::Receiver<f32>>,
+    level_tx:    Option<mpsc::SyncSender<f32>>,
     native_rate: Option<u32>,
 }
 
@@ -62,6 +70,8 @@ impl AudioRecorder {
             cmd_tx:      None,
             chunk_rx:    None,
             chunk_tx:    None,
+            level_rx:    None,
+            level_tx:    None,
             native_rate: None,
         }
     }
@@ -83,6 +93,11 @@ impl AudioRecorder {
         let chunk_tx_cb = chunk_tx.clone();  // moved into cpal callback
         self.chunk_tx = Some(chunk_tx);      // dropped in stop() to close the channel
         self.chunk_rx = Some(chunk_rx);
+
+        let (level_tx, level_rx) = mpsc::sync_channel::<f32>(64);
+        let level_tx_cb = level_tx.clone();
+        self.level_tx = Some(level_tx);
+        self.level_rx = Some(level_rx);
 
         std::thread::spawn(move || {
             let host = cpal::default_host();
@@ -116,6 +131,12 @@ impl AudioRecorder {
                     frames_cb.lock().unwrap().extend_from_slice(data);
                     // Non-blocking send to WS pipeline; drop chunk on back-pressure
                     let _ = chunk_tx_cb.try_send(data.to_vec());
+                    if !data.is_empty() {
+                        let sum_sq = data.iter().map(|s| s * s).sum::<f32>();
+                        let rms = (sum_sq / data.len() as f32).sqrt();
+                        let boosted = (rms * 9.0).clamp(0.0, 1.0);
+                        let _ = level_tx_cb.try_send(boosted);
+                    }
                 },
                 |err| eprintln!("[rec] stream error: {err}"),
                 None,
@@ -164,6 +185,11 @@ impl AudioRecorder {
         Some(ChunkReceiver { rx, native_rate })
     }
 
+    pub fn take_level_receiver(&mut self) -> Option<LevelReceiver> {
+        let rx = self.level_rx.take()?;
+        Some(LevelReceiver { rx })
+    }
+
     pub fn stop(&mut self) -> Option<Vec<u8>> {
         let cmd_tx = self.cmd_tx.take()?;
 
@@ -171,6 +197,7 @@ impl AudioRecorder {
         // The cpal-callback copy will drop when the stream drops inside the thread.
         // Once both senders are gone the chunk_rx (held by the WS task) sees EOF.
         drop(self.chunk_tx.take());
+        drop(self.level_tx.take());
 
         let (reply_tx, reply_rx) = mpsc::channel();
         let _ = cmd_tx.send(RecCmd::Stop(reply_tx));

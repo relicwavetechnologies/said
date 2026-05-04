@@ -4,6 +4,7 @@ import { Sidebar } from "@/components/Sidebar";
 import { BrandMark } from "@/components/BrandMark";
 import { InviteTeamModal } from "@/components/InviteTeamModal";
 import { SettingsModal } from "@/components/SettingsModal";
+import { OnboardingFlow } from "@/components/OnboardingFlow";
 import { Topbar } from "@/components/Topbar";
 import { DashboardView } from "@/components/views/DashboardView";
 import { HistoryView } from "@/components/views/HistoryView";
@@ -30,9 +31,14 @@ import {
   getOpenAIStatus,
   initiateOpenAIOAuth,
   requestInputMonitoring,
+  requestMicrophone,
+  requestScreenRecording,
   submitEditFeedback,
   onVocabToast,
   deleteVocabularyTerm,
+  checkNotificationPermission,
+  requestNotifications,
+  type NotifPermission,
   type VocabToastPayload,
 } from "@/lib/invoke";
 import { useTheme } from "@/lib/useTheme";
@@ -96,6 +102,13 @@ export default function App() {
   const [activeView,  setActiveView]  = useState<ActiveView>("dashboard");
   const [inviteOpen,  setInviteOpen]  = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [onboardingComplete, setOnboardingComplete] = useState(() => {
+    try {
+      return localStorage.getItem("said:onboarding-complete") === "true";
+    } catch {
+      return false;
+    }
+  });
 
   // ── Retry toast ───────────────────────────────────────────────────────────
   const [retryToast, setRetryToast] = useState<{ message: string; audioId: string } | null>(null);
@@ -128,6 +141,8 @@ export default function App() {
   const [openAIConnected, setOpenAIConnected] = useState<boolean | null>(null);
   const [connectBusy,     setConnectBusy]     = useState(false);
   const [connectError,    setConnectError]    = useState("");
+  const [notifPerm,       setNotifPerm]       = useState<NotifPermission>("unknown");
+  const [notifBusy,       setNotifBusy]       = useState(false);
 
   const syncOpenAIConnection = useCallback(async () => {
     try {
@@ -147,14 +162,29 @@ export default function App() {
     setHistory(recs.map(recordingToHistoryItem));
   }, []);
 
+  const refreshSnapshot = useCallback(async () => {
+    const next = await invoke("get_snapshot");
+    setSnapshot(next);
+    return next;
+  }, []);
+
+  const refreshPermissionsSoon = useCallback(() => {
+    const delays = [500, 1500, 3000, 5000];
+    for (const delay of delays) {
+      setTimeout(() => {
+        void refreshSnapshot().catch(() => {});
+        void checkNotificationPermission().then(setNotifPerm).catch(() => {});
+      }, delay);
+    }
+  }, [refreshSnapshot]);
+
   // ── Bootstrap + auth check ─────────────────────────────────────────────────
   useEffect(() => {
     invoke("bootstrap")
       .then(async (snap) => {
         setSnapshot(snap as AppSnapshot);
-        // Cloud auth — skippable
-        const cloudStatus = await getCloudStatus();
-        setNeedsAuth(cloudStatus ? !cloudStatus.connected : false);
+        // Cloud auth is skippable; onboarding now starts with OpenAI instead.
+        setNeedsAuth(false);
         // OpenAI connection — REQUIRED
         await syncOpenAIConnection();
       })
@@ -165,6 +195,16 @@ export default function App() {
       });
     refreshHistory();
   }, [refreshHistory, syncOpenAIConnection]);
+
+  useEffect(() => {
+    let alive = true;
+    checkNotificationPermission().then((p) => {
+      if (alive) setNotifPerm(p);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   // ── OpenAI OAuth connect ───────────────────────────────────────────────────
   const handleOpenAIConnect = useCallback(async () => {
@@ -339,14 +379,27 @@ export default function App() {
     const interval = setInterval(async () => {
       if (busy) return;
       try {
-        const next = await invoke("get_snapshot");
-        setSnapshot(next);
+        await refreshSnapshot();
       } catch {
         // silently ignore
       }
     }, 5000);
     return () => clearInterval(interval);
-  }, [busy]);
+  }, [busy, refreshSnapshot]);
+
+  useEffect(() => {
+    const refresh = () => {
+      if (busy) return;
+      void refreshSnapshot().catch(() => {});
+      void checkNotificationPermission().then(setNotifPerm).catch(() => {});
+    };
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [busy, refreshSnapshot]);
 
   // ── Record toggle (button click) ───────────────────────────────────────────
   const handleToggle = useCallback(async () => {
@@ -376,10 +429,22 @@ export default function App() {
     try {
       const next = await invoke("request_accessibility");
       setSnapshot(next);
+      refreshPermissionsSoon();
     } catch (err: unknown) {
       setErrorBanner(err instanceof Error ? err.message : String(err));
     }
-  }, []);
+  }, [refreshPermissionsSoon]);
+
+  const handleMicrophone = useCallback(async () => {
+    setErrorBanner("");
+    try {
+      const next = await requestMicrophone();
+      setSnapshot(next);
+      refreshPermissionsSoon();
+    } catch (err: unknown) {
+      setErrorBanner(err instanceof Error ? err.message : String(err));
+    }
+  }, [refreshPermissionsSoon]);
 
   // ── Input Monitoring ───────────────────────────────────────────────────────
   const handleInputMonitoring = useCallback(async () => {
@@ -393,9 +458,39 @@ export default function App() {
           setSnapshot(next);
         } catch { /* ignore */ }
       }, 1000);
+      refreshPermissionsSoon();
     } catch (err: unknown) {
       setErrorBanner(err instanceof Error ? err.message : String(err));
     }
+  }, [refreshPermissionsSoon]);
+
+  const handleScreenRecording = useCallback(async () => {
+    setErrorBanner("");
+    try {
+      const next = await requestScreenRecording();
+      setSnapshot(next);
+      refreshPermissionsSoon();
+    } catch (err: unknown) {
+      setErrorBanner(err instanceof Error ? err.message : String(err));
+    }
+  }, [refreshPermissionsSoon]);
+
+  const handleNotifications = useCallback(async () => {
+    setNotifBusy(true);
+    try {
+      const result = await requestNotifications();
+      setNotifPerm(result);
+      refreshPermissionsSoon();
+    } finally {
+      setNotifBusy(false);
+    }
+  }, [refreshPermissionsSoon]);
+
+  const handleOnboardingFinish = useCallback(() => {
+    setOnboardingComplete(true);
+    try {
+      localStorage.setItem("said:onboarding-complete", "true");
+    } catch { /* ignore */ }
   }, []);
 
   // ── Navigation ─────────────────────────────────────────────────────────────
@@ -432,6 +527,10 @@ export default function App() {
   // ── Live status / token overlay for DashboardView ─────────────────────────
   // We pass these as extra props; DashboardView can render a streaming preview.
   const liveText = statusPhase === "polishing" ? tokenBuf : "";
+  const corePermissionsReady =
+    !!snapshot?.microphone_granted &&
+    !!snapshot?.accessibility_granted &&
+    !!snapshot?.input_monitoring_granted;
 
   /* ── Auth gate ──────────────────────────────────────────────────────────── */
   if (needsAuth === null || openAIConnected === null) {
@@ -447,6 +546,26 @@ export default function App() {
           <span className="text-[12px] text-muted-foreground">Starting Said…</span>
         </div>
       </div>
+    );
+  }
+
+  if (!openAIConnected || !corePermissionsReady || !onboardingComplete) {
+    return (
+      <OnboardingFlow
+        snapshot={snapshotWithHistory}
+        openAIConnected={!!openAIConnected}
+        connectBusy={connectBusy}
+        connectError={connectError}
+        notifPerm={notifPerm}
+        notifBusy={notifBusy}
+        onConnectOpenAI={handleOpenAIConnect}
+        onMicrophone={handleMicrophone}
+        onAccessibility={handleAccessibility}
+        onInputMonitoring={handleInputMonitoring}
+        onNotifications={handleNotifications}
+        onScreenRecording={handleScreenRecording}
+        onFinish={handleOnboardingFinish}
+      />
     );
   }
 
@@ -701,6 +820,8 @@ export default function App() {
         snapshot={snapshotWithHistory}
         onAccessibility={handleAccessibility}
         onInputMonitoring={handleInputMonitoring}
+        onMicrophone={handleMicrophone}
+        onScreenRecording={handleScreenRecording}
       />
 
       {/* ── Right column: topbar + content ───────────── */}

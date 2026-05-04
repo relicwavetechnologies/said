@@ -50,12 +50,15 @@ interface Props {
   snapshot:           AppSnapshot | null;
   onAccessibility:    () => void;
   onInputMonitoring:  () => void;
+  onMicrophone:       () => void;
+  onScreenRecording:  () => void;
   /** Optional initial section to land on. Defaults to "writing". */
   initialSection?:    SettingsSection;
 }
 
 export function SettingsModal({
-  open, onClose, snapshot, onAccessibility, onInputMonitoring, initialSection,
+  open, onClose, snapshot, onAccessibility, onInputMonitoring,
+  onMicrophone, onScreenRecording, initialSection,
 }: Props) {
   const [activeSection, setActiveSection] = useState<SettingsSection>(
     initialSection ?? "writing"
@@ -260,6 +263,8 @@ export function SettingsModal({
               snapshot={snapshot}
               onAccessibility={onAccessibility}
               onInputMonitoring={onInputMonitoring}
+              onMicrophone={onMicrophone}
+              onScreenRecording={onScreenRecording}
               activeSection={activeSection}
               hideHeader
               embedded

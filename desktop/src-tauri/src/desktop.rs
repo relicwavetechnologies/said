@@ -8,10 +8,12 @@ use std::time::Instant;
 
 use voice_polish_core::{all_modes, AppSnapshot, ProcessSummary};
 use voice_polish_paster::is_accessibility_granted;
-use voice_polish_recorder::{AudioRecorder, ChunkReceiver};
+use voice_polish_recorder::{AudioRecorder, ChunkReceiver, LevelReceiver};
 
 #[cfg(target_os = "macos")]
 use voice_polish_hotkey::is_input_monitoring_granted;
+
+use crate::permissions;
 
 // ── State machine ─────────────────────────────────────────────────────────────
 
@@ -61,10 +63,12 @@ impl DesktopApp {
             current_model:            "gpt-5.4-mini",
             auto_paste_supported:     cfg!(target_os = "macos"),
             accessibility_granted:    is_accessibility_granted(),
+            microphone_granted:       permissions::microphone_granted(),
             #[cfg(target_os = "macos")]
             input_monitoring_granted: is_input_monitoring_granted(),
             #[cfg(not(target_os = "macos"))]
             input_monitoring_granted: false,
+            screen_recording_granted: permissions::screen_recording_granted(),
             modes:       all_modes().to_vec(),
             last_result: self.last_result.clone(),
             last_error:  self.last_error.clone(),
@@ -79,6 +83,10 @@ impl DesktopApp {
     /// Returns `None` if the recorder hasn't started yet or the receiver was already taken.
     pub fn take_chunk_receiver(&mut self) -> Option<ChunkReceiver> {
         self.recorder.take_chunk_receiver()
+    }
+
+    pub fn take_level_receiver(&mut self) -> Option<LevelReceiver> {
+        self.recorder.take_level_receiver()
     }
 
     /// Begin recording. Returns the snapshot for the UI.

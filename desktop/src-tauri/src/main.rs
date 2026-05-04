@@ -5,6 +5,7 @@ mod backend;
 mod backend_guard;
 mod desktop;
 mod dg_stream; // P5: Deepgram WebSocket live streaming
+mod permissions;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -763,10 +764,6 @@ fn sync_status_bar(handle: &tauri::AppHandle, state: &str) {
         Ok(_) => tracing::info!("[status-bar] set_visible_on_all_workspaces ok"),
         Err(e) => tracing::warn!("[status-bar] set_visible_on_all_workspaces failed: {e}"),
     }
-    match win.set_focusable(false) {
-        Ok(_) => tracing::info!("[status-bar] set_focusable(false) ok"),
-        Err(e) => tracing::warn!("[status-bar] set_focusable(false) failed: {e}"),
-    }
     #[cfg(target_os = "macos")]
     schedule_status_bar_macos_tune(&win);
     match win.show() {
@@ -842,7 +839,6 @@ fn create_status_bar(app: &tauri::AppHandle) {
     .visible_on_all_workspaces(true)
     .skip_taskbar(true)
     .focused(false)
-    .focusable(false)
     .resizable(false)
     .shadow(false)
     .transparent(true)
@@ -1172,6 +1168,18 @@ fn request_input_monitoring(state: State<'_, SharedApp>) -> Result<AppSnapshot, 
     Ok(state.0.lock().map_err(|_| "lock failed")?.snapshot())
 }
 
+#[tauri::command]
+fn request_microphone(state: State<'_, SharedApp>) -> Result<AppSnapshot, String> {
+    permissions::request_microphone();
+    Ok(state.0.lock().map_err(|_| "lock failed")?.snapshot())
+}
+
+#[tauri::command]
+fn request_screen_recording(state: State<'_, SharedApp>) -> Result<AppSnapshot, String> {
+    permissions::request_screen_recording();
+    Ok(state.0.lock().map_err(|_| "lock failed")?.snapshot())
+}
+
 /// Run the 5-method AX field reading diagnostic on whatever is focused right now.
 /// The Tauri app already has Accessibility permission, so unlike a fresh standalone
 /// binary, this can always reach the focused application.
@@ -1313,6 +1321,30 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
             }));
             return;
         }
+    }
+
+    // Drive the floating HUD visualizer from the same microphone samples used
+    // by recording. This stays independent from Deepgram so the UI remains
+    // responsive even if streaming is disabled or falls back to HTTP STT.
+    let level_recv = shared.lock().ok().and_then(|mut d| d.take_level_receiver());
+    if let Some(level_recv) = level_recv {
+        let app_levels = app.clone();
+        std::thread::spawn(move || {
+            let mut smoothed = 0.0f32;
+            let mut last_emit = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(40))
+                .unwrap_or_else(std::time::Instant::now);
+            while let Ok(level) = level_recv.rx.recv() {
+                smoothed = smoothed.mul_add(0.68, level * 0.32);
+                if last_emit.elapsed() >= std::time::Duration::from_millis(33) {
+                    let _ = app_levels.emit("voice-level", serde_json::json!({
+                        "level": smoothed.clamp(0.0, 1.0),
+                    }));
+                    last_emit = std::time::Instant::now();
+                }
+            }
+            let _ = app_levels.emit("voice-level", serde_json::json!({ "level": 0.0 }));
+        });
     }
 
     // ── P5: Start Deepgram WS streaming immediately ────────────────────────────
@@ -3328,6 +3360,8 @@ fn main() {
             set_mode,
             request_accessibility,
             request_input_monitoring,
+            request_microphone,
+            request_screen_recording,
             diagnose_ax,
             // Cloud auth
             cloud_signup,
