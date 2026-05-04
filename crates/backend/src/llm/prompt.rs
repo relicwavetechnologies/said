@@ -241,102 +241,33 @@ pub fn build_system_prompt_with_vocab_entries(
          {corrections_block}\
          {prefs_block}\
          <task>\n\
-         The text below is a VOICE-TO-TEXT TRANSCRIPT — it was spoken aloud and transcribed \
-         by a speech recognition engine.\n\n\
+         The text below is a voice-to-text transcript. Polish it into clean, natural \
+         text in the output_language above.\n\n\
          CONFIDENCE MARKERS:\n\
-         Words the engine was uncertain about are marked as [word?XX%] where XX is the \
-         confidence percentage. For example, [dog?47%] means the engine heard \"dog\" with \
-         only 47% confidence. These are the words most likely to be WRONG.\n\n\
-         SPOKEN DICTATION PATTERNS:\n\
-         People often speak punctuation and symbols out loud. Recognise and convert them \
-         based on context — do NOT convert if it would change the meaning of a normal sentence.\n\
-         • \"at the rate\" / \"at rate\" → @ (only when clearly part of an email or handle)\n\
-         • \"dot com / dot in / dot org / dot net / dot io / dot co\" → .com / .in etc. \
-         (email or URL context)\n\
-         • \"double u double u double u\" → www\n\
-         • \"underscore\" → _ (identifier or handle context)\n\
-         • \"hyphen\" / \"dash\" → - (identifier context, NOT general speech)\n\
-         • \"slash\" → / (URL or path context)\n\
-         • \"hash\" / \"hashtag\" → # (handle or ID context)\n\
-         • \"colon slash slash\" → :// (URL context)\n\
-         Context examples:\n\
-         ✓ \"abhishek at the rate gmail dot com\" → \"abhishek@gmail.com\"\n\
-         ✓ \"visit double u double u double u dot company dot com\" → \"visit www.company.com\"\n\
-         ✓ \"my handle is john underscore doe\" → \"my handle is john_doe\"\n\
-         ✗ \"growing at the rate of 10 percent\" → keep as-is (not an email)\n\
-         ✗ \"put a dot here\" → keep as-is (not a URL)\n\
-         ✗ \"there is a dash of salt\" → keep as-is (not an identifier)\n\n\
-         YOUR JOB:\n\
-         1. Pay special attention to [word?XX%] markers — these are likely misheard. Use \
-         the SURROUNDING CONTEXT to figure out what the speaker actually meant.\n\
-         Examples: [dog?47%] in a tech discussion → \"doc\" (documentation). \
-         [male?52%] in an email context → \"mail\". [affect?61%] → \"effect\" or vice versa.\n\
-         CRITICAL — low confidence is NOT permission to drop the word. Every [word?XX%] \
-         marker MUST become some word in the output. If you cannot figure out what was \
-         meant, KEEP THE LITERAL WORD inside the marker (without the brackets and \
-         percentage). Never silently delete a low-confidence word — the speaker said \
-         something there and the user expects content, not a hole.\n\
-         ✗ Wrong:  Input  \"main [aaj?42%] office gaya\"\n\
-                   Output \"Main office gaya.\"        (dropped the low-confidence word — HOLE)\n\
-         ✓ Right:  Input  \"main [aaj?42%] office gaya\"\n\
-                   Output \"Main aaj office gaya.\"    (kept literal word, removed marker)\n\
-         ✓ Also right (with context-based correction):\n\
-                   Input  \"send the [dog?47%] to legal\"\n\
-                   Output \"Send the doc to legal.\"   (kept-and-corrected)\n\
-         2. If <personal_vocabulary> exists, KEEP those exact tokens unchanged. \
-         When a [word?XX%] marker is phonetically similar to a vocabulary term, prefer \
-         the vocabulary term — that is exactly the case the personal dictionary exists for.\n\
-         3. Even unmarked words can be wrong — use common sense for the whole sentence.\n\
-         4. Convert spoken dictation patterns (see above) when context is unambiguous.\n\
-         5. PRESERVE EVERY MEANINGFUL WORD. The ONLY words you may remove are:\n\
-            • Filler/stalling sounds: um, uh, hmm, er, ah, like, you know, basically, \
-              actually, matlab, toh, yaani, bas, you see\n\
-            • Stuttered repetitions of the same word: \"the the cat\" → \"the cat\"\n\
-           DO NOT drop names, numbers, dates, technical terms, jargon, brand names, \
-           emphasis words, adjectives, adverbs, or any content word — even if the \
-           sentence \"reads better\" without them. The user said it for a reason.\n\
-           ✗ Wrong:  Input  \"main aaj subah office gaya tha tenth floor pe\"\n\
-                     Output \"Main aaj office gaya tha.\"  (dropped \"subah\", \"tenth floor pe\")\n\
-           ✓ Right:  Input  \"main aaj subah office gaya tha tenth floor pe\"\n\
-                     Output \"Main aaj subah office gaya tha, tenth floor pe.\"\n\
-           Test before outputting: every content word from the input should be \
-           recoverable from your output (allowing only re-ordering, capitalization, \
-           and the filler removals listed above).\n\
-         6. Polish into clean, natural text — punctuation, capitalization, sentence \
-            boundaries. Do NOT shorten or summarise. Polishing is NOT editing.\n\
-         7. Output ONLY the polished text — no preamble, no commentary, no markdown.\n\
-         7a. CRITICAL: confidence markers like [word?XX%] are INPUT-only signals \
-         showing you which words to scrutinise. They MUST NEVER appear in your output. \
-         Drop the brackets, drop the percentage, keep only the corrected word.\n\
-         ✗ Wrong:  \"meeting [main?60%] mein hai\"  (marker leaked into output)\n\
-         ✗ Wrong:  \"meeting main 60% mein hai\"   (percentage stayed)\n\
-         ✗ Wrong:  \"meeting [main60%] mein hai\"  (any bracketed word+number is wrong)\n\
-         ✓ Right:  \"meeting main mein hai\"        (just the word, fully clean)\n\
-         8. The output_language rule above is ABSOLUTE — follow it for script and language.\n\
-         9. If <polish_preferences> exist, prefer the right-hand form when contextually appropriate.\n\
-         10. If <preferences> exist, match the user's style and word choices.\n\n\
-         IMPORTANT: Think about what the speaker INTENDED to say based on the overall \
-         topic and sentence meaning. Low-confidence words are hints, not gospel.\n\n\
-         SCRIPT FINAL CHECK (read before writing your first character):\n\
+         [word?XX%] = STT was XX% confident in that word. Treat as candidate fixes — \
+         use surrounding context to decide. Never drop a marked word; if unsure, keep \
+         the literal word and strip the brackets+percentage. Markers MUST NEVER appear \
+         in your output.\n\n\
+         DICTATION SYMBOLS (convert only when context makes it unambiguous):\n\
+         \"at the rate\" → @ · \"dot com / dot in / dot org / dot io\" → .com / .in / .org / .io · \
+         \"double u double u double u\" → www · \"underscore\" → _ · \"hyphen\"/\"dash\" → - · \
+         \"slash\" → / · \"hash\"/\"hashtag\" → # · \"colon slash slash\" → ://\n\
+         Don't convert in plain prose (\"growing at the rate of 10%\" stays as-is).\n\n\
+         RULES:\n\
+         1. Vocabulary terms in <personal_vocabulary> (if present) must be kept verbatim. \
+         Prefer them when a transcript token is phonetically close.\n\
+         2. Preserve every content word. Remove ONLY fillers (um, uh, hmm, like, you know, \
+         basically, matlab, toh, yaani, bas) and stuttered repetitions (\"the the cat\" → \"the cat\"). \
+         Do NOT drop names, numbers, dates, jargon, adjectives, adverbs.\n\
+         3. Fix grammar, punctuation, capitalization, sentence boundaries. Don't summarise or rewrite.\n\
+         4. Output ONLY the polished text — no preamble, no commentary, no markdown.\n\
+         5. <polish_preferences> are soft hints; prefer the right-hand form when context allows.\n\
+         6. <preferences> are SOFT examples of style; never import their words into the current transcript.\n\n\
+         SCRIPT CHECK before your first character:\n\
          {script_check}\n\n\
-         ════════════════════════════════════════════════════════════════════════\n\
-         FINAL CRITICAL RULE — SINGLE OUTPUT ENFORCEMENT (read this last):\n\
-         ════════════════════════════════════════════════════════════════════════\n\
-         Your entire response is the polished text, ONCE. Stop immediately after \
-         writing it. Never repeat. Never paraphrase your own output. Never offer \
-         alternatives or 'cleaner versions'. Even if the input was uncertain or \
-         had multiple plausible interpretations, you commit to ONE polished \
-         version and stop.\n\n\
-         BAD example (do NOT do this):\n\
-           Input: \"hello kya chal raha hai\"\n\
-           ✗ Output: \"Hello, kya chal raha hai? Hello, kaisa chal raha hai?\"\n\
-           ↑ The model paraphrased itself — two versions concatenated.\n\n\
-         GOOD example (do this):\n\
-           Input: \"hello kya chal raha hai\"\n\
-           ✓ Output: \"Hello, kya chal raha hai?\"\n\
-           ↑ One polished version. End of response.\n\n\
-         When you have written the polished text once, your response is COMPLETE. \
-         Do not continue. Do not 'try again with a cleaner version'. Stop.\
+         FINAL RULE — SINGLE OUTPUT:\n\
+         Write the polished text ONCE and stop. No repetition, no paraphrasing, no \"cleaner version\". \
+         Even on ambiguous input, commit to one version.\n\
          </task>"
     )
 }
@@ -573,23 +504,23 @@ mod tests {
         let p = prefs();
         let prompt = build_system_prompt_with_vocab(&p, &[], &[], &[]);
 
-        // Must contain the FINAL rule heading.
-        assert!(prompt.contains("FINAL CRITICAL RULE"),
+        // Must contain the final rule heading (compact form).
+        assert!(prompt.contains("FINAL RULE — SINGLE OUTPUT"),
                 "single-output rule must be present");
-        // Must contain the bad-example pattern that shows the failure mode.
-        assert!(prompt.contains("paraphrased itself"),
-                "bad-example explanation must be present");
+        // Must explicitly forbid repetition (the failure mode).
+        assert!(prompt.contains("No repetition") || prompt.contains("no repetition"),
+                "single-output rule must explicitly forbid repetition");
         // The FINAL rule must come AFTER all other task rules — verify by
         // checking position relative to a known earlier rule.
-        let pos_rule_7   = prompt.find("Output ONLY the polished text").unwrap();
-        let pos_final    = prompt.find("FINAL CRITICAL RULE").unwrap();
-        assert!(pos_final > pos_rule_7,
-                "FINAL CRITICAL RULE must come AFTER rule 7 (be the LAST instruction)");
+        let pos_output_only = prompt.find("Output ONLY the polished text").unwrap();
+        let pos_final       = prompt.find("FINAL RULE").unwrap();
+        assert!(pos_final > pos_output_only,
+                "FINAL RULE must come AFTER the output-only rule (be the LAST instruction)");
         // The final rule must be near the </task> closer for end-of-prompt
         // attention to fire on it.
         let pos_close = prompt.find("</task>").unwrap();
         assert!(pos_close - pos_final < 1500,
-                "FINAL CRITICAL RULE must be near </task> closer ({}+ chars away — should be < 1500)",
+                "FINAL RULE must be near </task> closer ({}+ chars away — should be < 1500)",
                 pos_close - pos_final);
     }
 

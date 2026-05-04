@@ -528,11 +528,44 @@ pub fn select_for_polish_hybrid(
         .map(|t| (t.term.to_ascii_lowercase(), t))
         .collect();
 
+    // Tokenize the transcript once for the term-presence + phonetic-match gates.
+    let transcript_lower = query_text.unwrap_or_default().to_ascii_lowercase();
+    let transcript_tokens: Vec<&str> = transcript_lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+
     let mut gated: Vec<VocabTerm> = lexical_hits
         .iter()
         .filter_map(|term| {
             let key = term.to_ascii_lowercase();
             by_term_lower.get(&key).map(|vt| (*vt).clone())
+        })
+        // Quality gate 1 — meaning must be filled in. A NULL meaning means
+        // either Groq+OpenAI both failed for this term or it was learned
+        // before the meaning pipeline existed. Without `means:` we can't
+        // semantically gate replacement decisions in the polish prompt; the
+        // LLM has nothing to align the transcript context against, which is
+        // exactly the "vocab hallucinated into unrelated places" failure mode.
+        // Starred terms (handled in Bucket 1 above) intentionally bypass this.
+        .filter(|vt| vt.meaning.as_deref().map(|m| !m.trim().is_empty()).unwrap_or(false))
+        // Quality gate 2 — context confirmed. The BM25 search runs over
+        // (term, example_context) so an example_context-only hit can match
+        // when the term itself isn't in the transcript at all (the user
+        // happened to use a similar surrounding word). Require either:
+        //   • the term appears as a substring of the transcript, OR
+        //   • some transcript token is phonetically close (sim ≥ 0.70) to
+        //     the term — handles STT mishearings of jargon.
+        .filter(|vt| {
+            let term_lower = vt.term.to_ascii_lowercase();
+            if transcript_lower.contains(&term_lower) {
+                return true;
+            }
+            let term_phon = crate::llm::phonetics::phonetic_key(&vt.term);
+            transcript_tokens.iter().any(|tok| {
+                let tok_phon = crate::llm::phonetics::phonetic_key(tok);
+                crate::llm::phonetics::similarity(&tok_phon, &term_phon) >= 0.70
+            })
         })
         .collect();
 
@@ -960,7 +993,9 @@ mod tests {
     // include unevidenced entries.
 
     /// Helper: also write a vocab_fts row (the in-memory FTS index) so
-    /// BM25 lookups in select_for_polish_hybrid can hit.
+    /// BM25 lookups in select_for_polish_hybrid can hit. Seeds a non-empty
+    /// `meaning` so the polish-prompt quality gate passes — tests for the
+    /// NULL-meaning filter use a separate helper.
     fn seed_with_context(
         pool:    &DbPool,
         term:    &str,
@@ -970,14 +1005,29 @@ mod tests {
         language:  &str,
         context:   &str,
     ) {
-        // Update the legacy seed() to also insert example_context + FTS row.
+        seed_with_context_and_meaning(
+            pool, term, weight, source, embedding, language, context,
+            Some("Test meaning."),
+        );
+    }
+
+    fn seed_with_context_and_meaning(
+        pool:      &DbPool,
+        term:      &str,
+        weight:    f64,
+        source:    &str,
+        embedding: &[f32],
+        language:  &str,
+        context:   &str,
+        meaning:   Option<&str>,
+    ) {
         {
             let conn = pool.get().unwrap();
             conn.execute(
                 "INSERT INTO vocabulary
-                   (user_id, term, weight, use_count, last_used, source, language, example_context)
-                 VALUES ('u1', ?1, ?2, 1, ?3, ?4, ?5, ?6)",
-                params![term, weight, now_ms(), source, language, context],
+                   (user_id, term, weight, use_count, last_used, source, language, example_context, meaning)
+                 VALUES ('u1', ?1, ?2, 1, ?3, ?4, ?5, ?6, ?7)",
+                params![term, weight, now_ms(), source, language, context, meaning],
             ).unwrap();
             conn.execute(
                 "INSERT INTO vocab_fts (user_id, term, example_context)
@@ -1006,23 +1056,29 @@ mod tests {
     }
 
     #[test]
-    fn lexical_gate_includes_term_when_transcript_overlaps_example_context() {
+    fn lexical_gate_excludes_term_on_example_context_only_overlap() {
+        // FOUNDATIONAL: "context confirmed" means the term itself must be
+        // present in the transcript (verbatim or phonetically close). An
+        // example_context-only overlap is NOT enough — that was the loose
+        // gate that caused the polish LLM to hallucinate vocab into
+        // unrelated places. Mishearing recovery for this case (e.g.
+        // "main corps" → "MACOBS") is handled by the deterministic
+        // stt_replacements layer, not by polish-prompt vocab injection.
         let pool = mem_pool();
         seed_with_context(&pool, "MACOBS", 1.0, "auto",
             &vec4(1.0, 0.0, 0.0, 0.0), "english",
             "MACOBS ka IPO ka 12 hazaar batana");
 
-        // Transcript shares "ka", "IPO", "hazaar" with the example_context.
-        // BM25 catches the overlap → MACOBS enters the prompt. This is the
-        // "main corps → MACOBS recovery" path that keeps working.
+        // Transcript shares "ka", "IPO", "hazaar" with example_context but
+        // contains no token phonetically close to MACOBS.
         let chosen = select_for_polish_hybrid(
             &pool, "u1", "english",
             Some(&vec4(1.0, 0.0, 0.0, 0.0)),
             Some("main corps ka IPO ka 12 hazaar batana"),
             5, 5, 10, 0.0,
         );
-        assert!(chosen.iter().any(|v| v.term == "MACOBS"),
-                "example_context overlap must include the entry");
+        assert!(!chosen.iter().any(|v| v.term == "MACOBS"),
+                "example_context-only overlap must NOT include the entry under the strict gate");
     }
 
     #[test]
@@ -1108,23 +1164,22 @@ mod tests {
 
     #[test]
     fn within_gated_set_cosine_ranks_higher_first() {
-        // When multiple lexical matches exist, cosine + decay + use_count
-        // determines the order within the gated set.
+        // When multiple terms BOTH appear in the transcript, cosine + decay
+        // + use_count determines the order within the gated set.
         let pool = mem_pool();
-        // Both contexts mention "IPO" so both lexically gate-pass.
         seed_with_context(&pool, "MACOBS",  1.0, "auto",
             &vec4(1.0, 0.0, 0.0, 0.0), "english", "MACOBS ka IPO ka 12 hazaar");
         seed_with_context(&pool, "OTHERCO", 1.0, "auto",
             &vec4(0.0, 1.0, 0.0, 0.0), "english", "OTHERCO ka IPO date hai");
 
         // Query embedding aligns with MACOBS (1,0,0,0) > OTHERCO (0,1,0,0).
+        // Transcript directly contains both terms — passes the strict gate.
         let chosen = select_for_polish_hybrid(
             &pool, "u1", "english",
             Some(&vec4(1.0, 0.0, 0.0, 0.0)),
-            Some("the IPO is tomorrow"),  // both gate-pass via "IPO"
+            Some("MACOBS and OTHERCO IPO tomorrow"),
             5, 5, 10, 0.0,
         );
-        // Both should be present; MACOBS first by cosine score.
         assert!(chosen.iter().any(|v| v.term == "MACOBS"));
         assert!(chosen.iter().any(|v| v.term == "OTHERCO"));
         let macobs_idx  = chosen.iter().position(|v| v.term == "MACOBS").unwrap();
@@ -1134,21 +1189,94 @@ mod tests {
     }
 
     #[test]
+    fn lexical_gate_filters_null_meaning_terms() {
+        // FOUNDATIONAL: terms with NULL meaning (Groq+OpenAI both failed,
+        // or learned before the meaning pipeline existed) must be filtered
+        // out of the polish prompt — the LLM has no semantic anchor for
+        // them, which is the documented hallucination failure mode. They
+        // remain in the vocabulary table (still useful for Deepgram keyterm
+        // bias and stt_replacements), just not in the polish prompt.
+        let pool = mem_pool();
+        seed_with_context_and_meaning(
+            &pool, "WITHMEANING", 1.0, "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0), "english", "WITHMEANING context",
+            Some("A test term with a stored meaning."),
+        );
+        seed_with_context_and_meaning(
+            &pool, "NOMEANING", 1.0, "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0), "english", "NOMEANING context",
+            None,
+        );
+
+        let chosen = select_for_polish_hybrid(
+            &pool, "u1", "english",
+            Some(&vec4(1.0, 0.0, 0.0, 0.0)),
+            Some("WITHMEANING and NOMEANING both appear here"),
+            5, 5, 10, 0.0,
+        );
+        assert!(chosen.iter().any(|v| v.term == "WITHMEANING"),
+                "term with meaning must pass the gate");
+        assert!(!chosen.iter().any(|v| v.term == "NOMEANING"),
+                "term with NULL meaning must be filtered out");
+    }
+
+    #[test]
+    fn lexical_gate_starred_bypasses_null_meaning_filter() {
+        // Starred terms represent explicit user intent and bypass quality
+        // gates — including the meaning filter.
+        let pool = mem_pool();
+        seed_with_context_and_meaning(
+            &pool, "STARRED_NOMEANING", 0.5, "starred",
+            &vec4(0.0, 1.0, 0.0, 0.0), "english", "starred context",
+            None,
+        );
+        let chosen = select_for_polish_hybrid(
+            &pool, "u1", "english", None,
+            Some("anything goes"),
+            5, 5, 10, 0.0,
+        );
+        assert!(chosen.iter().any(|v| v.term == "STARRED_NOMEANING"),
+                "starred terms bypass the meaning filter");
+    }
+
+    #[test]
+    fn lexical_gate_phonetic_match_includes_term() {
+        // The strict gate's second leg: phonetic match. If the user said
+        // a word that STT misheard but is phonetically close to a vocab
+        // term, the term should still be retrieved.
+        let pool = mem_pool();
+        seed_with_context(&pool, "EMIAC", 1.0, "auto",
+            &vec4(1.0, 0.0, 0.0, 0.0), "english", "EMIAC technology");
+
+        // "emyak" is a phonetic neighbour of "EMIAC" but not a substring.
+        let chosen = select_for_polish_hybrid(
+            &pool, "u1", "english",
+            Some(&vec4(1.0, 0.0, 0.0, 0.0)),
+            Some("the emyak technology meeting"),
+            5, 5, 10, 0.0,
+        );
+        assert!(chosen.iter().any(|v| v.term == "EMIAC"),
+                "phonetic match should include the term even without literal substring");
+    }
+
+    #[test]
     fn lexical_gate_caps_at_max_total() {
         let pool = mem_pool();
-        // Seed 50 terms whose example_contexts all contain "MEETING" so
-        // they all lexically gate-pass.
+        // Seed 50 terms whose names ARE in the transcript so they all pass
+        // the strict term-in-transcript gate. The cap should still clamp
+        // the result to max_total regardless.
         for i in 0..50 {
             seed_with_context(
                 &pool, &format!("T{i}"), 1.0, "auto",
                 &vec4(i as f32, 0.0, 0.0, 0.0), "english",
-                "MEETING with T",
+                "T context",
             );
         }
+        let transcript: String = (0..50).map(|i| format!("T{i} ")).collect();
         let chosen = select_for_polish_hybrid(
             &pool, "u1", "english",
             Some(&vec4(1.0, 0.0, 0.0, 0.0)),
-            Some("MEETING today"),
+            Some(&transcript),
             100, 100, 5, 0.0,
         );
         assert_eq!(chosen.len(), 5);

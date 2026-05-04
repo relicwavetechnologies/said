@@ -25,31 +25,33 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::{info, warn};
 
-const GROQ_ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions";
-const MEANING_MODEL: &str = "llama-3.1-8b-instant";
+const GROQ_ENDPOINT:   &str = "https://api.groq.com/openai/v1/chat/completions";
+const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
+const MEANING_MODEL:   &str = "llama-3.1-8b-instant";
+/// Used only when Groq is unreachable. gpt-4.1-nano is the smallest, cheapest
+/// OpenAI chat model — comparable cost to Groq and ~150–300 ms latency.
+const OPENAI_FALLBACK_MODEL: &str = "gpt-4.1-nano";
 const MAX_MEANING_CHARS: usize = 280;
 
 /// Generate the initial meaning for a freshly-promoted vocab term.
 ///
 /// `term` is the canonical spelling. `example` is the sentence the term was
-/// first observed in (`vocabulary.example_context`). Returns `None` when:
-///   • API key is empty
-///   • API returns an error
-///   • Response can't be parsed
-///   • Returned text is empty after trimming
+/// first observed in (`vocabulary.example_context`).
+///
+/// Two-stage fallback: try Groq first (cheap + fast); if it returns None for
+/// any reason (no key, network error, parse failure, empty content), fall
+/// back to OpenAI gpt-4.1-nano via `OPENAI_API_KEY`. If both fail, returns
+/// None and the caller leaves `meaning` NULL (the polish prompt then filters
+/// the term out — see `select_for_polish_hybrid`).
 ///
 /// The caller persists the result via `vocabulary::update_meaning()`.
 pub async fn generate_initial(
-    client:  &Client,
-    api_key: &str,
-    term:    &str,
-    example: &str,
+    client:      &Client,
+    groq_key:    &str,
+    openai_key:  &str,
+    term:        &str,
+    example:     &str,
 ) -> Option<String> {
-    if api_key.is_empty() {
-        warn!("[meaning] no Groq API key — skipping generation for {term:?}");
-        return None;
-    }
-
     let user_message = format!(
         "TERM: {term}\n\
          EXAMPLE SENTENCE: \"{example}\"\n\n\
@@ -58,7 +60,7 @@ pub async fn generate_initial(
          Don't speculate beyond what the example demonstrates. If the example \
          doesn't make the meaning clear, say so plainly."
     );
-    call_groq(client, api_key, &user_message).await
+    call_with_fallback(client, groq_key, openai_key, &user_message, term).await
 }
 
 /// Refresh an existing meaning given the current meaning + observed examples.
@@ -68,12 +70,12 @@ pub async fn generate_initial(
 /// term in more diverse situations over time.
 pub async fn refine(
     client:           &Client,
-    api_key:          &str,
+    groq_key:         &str,
+    openai_key:       &str,
     term:             &str,
     current_meaning:  &str,
     examples:         &[String],
 ) -> Option<String> {
-    if api_key.is_empty() { return None; }
     if examples.is_empty() {
         return Some(current_meaning.to_string());
     }
@@ -95,7 +97,7 @@ pub async fn refine(
          new contexts that the current description doesn't cover. Output ONLY \
          the updated 1-2 sentence description, nothing else."
     );
-    call_groq(client, api_key, &user_message).await
+    call_with_fallback(client, groq_key, openai_key, &user_message, term).await
 }
 
 #[derive(Deserialize)]
@@ -117,9 +119,52 @@ means and what contexts it appears in. You are specific, you don't speculate, \
 and you output ONLY the description — no preamble, no formatting, no quotes \
 around the answer.";
 
-async fn call_groq(client: &Client, api_key: &str, user_message: &str) -> Option<String> {
+/// Try Groq first; on any failure fall back to OpenAI gpt-4.1-nano. Returns
+/// None only when both providers are unreachable / fail / return empty.
+/// `term` is included for diagnostic logging so we can tell which provider
+/// served which term.
+async fn call_with_fallback(
+    client:      &Client,
+    groq_key:    &str,
+    openai_key:  &str,
+    user_message: &str,
+    term:        &str,
+) -> Option<String> {
+    if !groq_key.is_empty() {
+        if let Some(text) = call_chat_completions(
+            client, GROQ_ENDPOINT, groq_key, MEANING_MODEL, user_message, "groq",
+        ).await {
+            info!("[meaning] {term:?} ← groq");
+            return Some(text);
+        }
+        warn!("[meaning] groq failed for {term:?} — trying openai fallback");
+    }
+    if !openai_key.is_empty() {
+        if let Some(text) = call_chat_completions(
+            client, OPENAI_ENDPOINT, openai_key, OPENAI_FALLBACK_MODEL, user_message, "openai",
+        ).await {
+            info!("[meaning] {term:?} ← openai (fallback)");
+            return Some(text);
+        }
+        warn!("[meaning] openai fallback also failed for {term:?}");
+    } else if groq_key.is_empty() {
+        warn!("[meaning] no groq key AND no openai key — meaning will stay NULL for {term:?}");
+    }
+    None
+}
+
+/// Standard OpenAI-compatible Chat Completions call — works for both Groq
+/// and OpenAI since Groq exposes the OpenAI-compatible endpoint shape.
+async fn call_chat_completions(
+    client:        &Client,
+    endpoint:      &str,
+    api_key:       &str,
+    model:         &str,
+    user_message:  &str,
+    provider_tag:  &str,
+) -> Option<String> {
     let body = json!({
-        "model":       MEANING_MODEL,
+        "model":       model,
         "temperature": 0.2,
         "max_tokens":  120,
         "messages": [
@@ -130,7 +175,7 @@ async fn call_groq(client: &Client, api_key: &str, user_message: &str) -> Option
 
     let t0 = std::time::Instant::now();
     let resp = match client
-        .post(GROQ_ENDPOINT)
+        .post(endpoint)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
         .json(&body)
@@ -140,18 +185,21 @@ async fn call_groq(client: &Client, api_key: &str, user_message: &str) -> Option
     {
         Ok(r) => r,
         Err(e) => {
-            warn!("[meaning] Groq request failed: {e}");
+            warn!("[meaning] {provider_tag} request failed: {e}");
             return None;
         }
     };
     if !resp.status().is_success() {
-        warn!("[meaning] Groq returned non-success: {}", resp.status());
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let preview = &body[..body.len().min(200)];
+        warn!("[meaning] {provider_tag} returned {status}: {preview}");
         return None;
     }
     let parsed: GroqResponse = match resp.json().await {
         Ok(p) => p,
         Err(e) => {
-            warn!("[meaning] Groq response parse failed: {e}");
+            warn!("[meaning] {provider_tag} response parse failed: {e}");
             return None;
         }
     };
@@ -160,17 +208,19 @@ async fn call_groq(client: &Client, api_key: &str, user_message: &str) -> Option
         .unwrap_or_default();
 
     if content.is_empty() {
-        warn!("[meaning] Groq returned empty content");
+        warn!("[meaning] {provider_tag} returned empty content");
         return None;
     }
 
-    // Cap to keep polish prompt bounded.
     let capped: String = if content.chars().count() > MAX_MEANING_CHARS {
         content.chars().take(MAX_MEANING_CHARS).collect::<String>() + "…"
     } else {
         content
     };
 
-    info!("[meaning] generated in {}ms ({} chars)", t0.elapsed().as_millis(), capped.len());
+    info!(
+        "[meaning] {provider_tag} generated in {}ms ({} chars)",
+        t0.elapsed().as_millis(), capped.len(),
+    );
     Some(capped)
 }

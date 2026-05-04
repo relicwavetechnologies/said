@@ -361,6 +361,19 @@ pub async fn classify(
                         correct.to_string(),
                         example_ctx.clone(),
                     );
+                    // Foundational decoupling: meaning generation must run
+                    // independently of the embedder. Previously it was fired
+                    // *inside* spawn_vocab_embedding's success path, which
+                    // meant a missing Gemini key or a single embed-API hiccup
+                    // silently skipped meaning forever — leaving terms with
+                    // NULL meaning that the polish prompt then filtered out.
+                    // Both jobs run in parallel; either one's failure no
+                    // longer kills the other.
+                    spawn_meaning_refresh(
+                        state.clone(),
+                        correct.to_string(),
+                        example_ctx.clone().unwrap_or_default(),
+                    );
                 }
                 // Foundational: store BOTH the polish-side span AND the
                 // raw transcript-side span as aliases for the canonical.
@@ -689,9 +702,16 @@ fn spawn_vocab_embedding(
                 );
             }
         });
-        // Wait for centroid + counter persistence before deciding on a
-        // meaning refresh (so meaning_needs_refresh sees the bumped count).
+        // Persist centroid + bumped counter, then return. Meaning generation
+        // is now triggered separately from the promotion path so it doesn't
+        // depend on the embedder running successfully — see
+        // spawn_meaning_refresh call site in the STT_ERROR handler.
         let _ = blocking.await;
+        // For long-tail use bumps (term retrieved + used in polish) we still
+        // want meaning to refresh as the counter crosses the threshold.
+        // meaning_needs_refresh is cheap (one row read) so calling it here
+        // when the counter just bumped is the right place — the call exits
+        // immediately if the threshold isn't crossed.
         spawn_meaning_refresh(state, term, example_context.unwrap_or_default());
     });
 }
@@ -712,17 +732,25 @@ fn spawn_meaning_refresh(state: AppState, term: String, latest_example: String) 
         let uid  = state.default_user_id.clone();
         let pool = state.pool.clone();
 
-        // Cheap synchronous gate — most calls exit here without touching Groq.
+        // Cheap synchronous gate — most calls exit here without touching the LLM.
         if !vocabulary::meaning_needs_refresh(&pool, &uid, &term) {
             return;
         }
 
-        let key = get_prefs(&pool, &uid)
-            .and_then(|p| p.groq_api_key)
+        // Resolve BOTH keys up-front. meaning::generate_initial / refine do a
+        // Groq → OpenAI fallback internally; we just plumb the keys through
+        // so a missing Groq key (or a Groq outage) still gets the meaning
+        // generated via OpenAI.
+        let prefs    = get_prefs(&pool, &uid);
+        let groq_key = prefs.as_ref()
+            .and_then(|p| p.groq_api_key.clone())
             .or_else(|| std::env::var("GROQ_API_KEY").ok())
             .unwrap_or_default();
-        if key.is_empty() {
-            // No Groq key — silent skip. Term still works without meaning.
+        let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+        if groq_key.is_empty() && openai_key.is_empty() {
+            warn!(
+                "[meaning] no Groq key AND no OPENAI_API_KEY — meaning will stay NULL for {term:?}"
+            );
             return;
         }
 
@@ -733,7 +761,9 @@ fn spawn_meaning_refresh(state: AppState, term: String, latest_example: String) 
                 let example = if latest_example.trim().is_empty() {
                     term.clone()
                 } else { latest_example.clone() };
-                meaning::generate_initial(&state.http_client, &key, &term, &example).await
+                meaning::generate_initial(
+                    &state.http_client, &groq_key, &openai_key, &term, &example,
+                ).await
             }
             // Refinement: hand the LLM the prior description + recent ring.
             Some(prev) => {
@@ -743,7 +773,9 @@ fn spawn_meaning_refresh(state: AppState, term: String, latest_example: String) 
                 if examples.is_empty() {
                     None
                 } else {
-                    meaning::refine(&state.http_client, &key, &term, prev, &examples).await
+                    meaning::refine(
+                        &state.http_client, &groq_key, &openai_key, &term, prev, &examples,
+                    ).await
                 }
             }
         };
