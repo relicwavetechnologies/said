@@ -1,0 +1,29 @@
+[package]
+name = "voice-polish"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[[bin]]
+name = "voice-polish"
+path = "src/main.rs"
+
+[dependencies]
+clap               = { version = "4", features = ["derive"] }
+dirs               = "5"
+futures            = "0.3"
+reqwest            = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+sha2               = "0.10"
+tokio              = { workspace = true }
+tokio-tungstenite  = "0.24"
+tracing            = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url                = "2"
+
+polish-backend       = { path = "../backend" }
+voice-polish-core    = { path = "../core" }
+voice-polish-hotkey  = { path = "../hotkey" }
+voice-polish-paster  = { path = "../paster" }
+voice-polish-recorder = { path = "../recorder" }

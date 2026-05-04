@@ -5892,6 +5892,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "voice-polish"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "dirs 5.0.1",
+ "futures",
+ "polish-backend",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "voice-polish-core",
+ "voice-polish-hotkey",
+ "voice-polish-paster",
+ "voice-polish-recorder",
+]
+
+[[package]]
 name = "voice-polish-core"
 version = "0.1.0"
 dependencies = [

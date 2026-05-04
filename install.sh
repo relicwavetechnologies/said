@@ -15,7 +15,6 @@
 #    vp delete       → remove everything
 # ══════════════════════════════════════════════════════════════════════════════
 
-DEFAULT_GATEWAY_KEY="cnsc_gw_23450226f2fdcaa1f661284ae8d54c12acae140c51c24fc7"
 INSTALL_URL="https://raw.githubusercontent.com/relicwavetechnologies/said/main/install.sh"
 REPO="relicwavetechnologies/said"
 
@@ -79,31 +78,11 @@ rm -f "$INSTALL_DIR/voice-polish"
 
 ok "Binary downloaded $(du -h "$APP_EXEC" | cut -f1 | xargs) — tag $TAG"
 
-# ── 3. API key ──────────────────────────────────────────────────────────────
-step "3/5" "API key"
-
-EXISTING_KEY=""
-[ -f "$INSTALL_DIR/.env" ] && EXISTING_KEY=$(grep "^GATEWAY_API_KEY=" "$INSTALL_DIR/.env" 2>/dev/null | cut -d= -f2-)
-
-if [ -n "$EXISTING_KEY" ] && [ "$EXISTING_KEY" != "$DEFAULT_GATEWAY_KEY" ]; then
-    skip "Custom API key already in .env"
-    GATEWAY_KEY="$EXISTING_KEY"
-else
-    echo ""
-    echo -e "  ${BOLD}Enter your Gateway API key${NC} (press Enter to use the default shared key):"
-    echo -e "  ${CYAN}[leave blank for the shared key]${NC}"
-    echo -n "  Key: "
-    read -r USER_KEY
-    if [ -n "$USER_KEY" ]; then
-        GATEWAY_KEY="$USER_KEY"
-        ok "Using your custom API key"
-    else
-        GATEWAY_KEY="$DEFAULT_GATEWAY_KEY"
-        note "Using default shared key"
-    fi
-    printf 'GATEWAY_API_KEY=%s\n' "$GATEWAY_KEY" > "$INSTALL_DIR/.env"
-    ok ".env written"
-fi
+# ── 3. Standalone config ────────────────────────────────────────────────────
+step "3/5" "Standalone config"
+note "This standalone build stores its own Deepgram key + OpenAI OAuth token locally"
+note "No shared app DB and no gateway API key are used anymore"
+ok "Config flow updated"
 
 # ── 4. .app bundle ──────────────────────────────────────────────────────────
 step "4/5" "Configuring .app bundle"
@@ -253,6 +232,23 @@ case "${1:-}" in
     else
       echo "○ Stopped"
     fi
+    if [ -x "$APP_EXEC" ]; then
+      echo ""
+      "$APP_EXEC" status
+    fi
+    ;;
+  auth)
+    "$APP_EXEC" auth
+    ;;
+  deepgram-key)
+    if [ -n "${2:-}" ]; then
+      "$APP_EXEC" deepgram-key "$2"
+    else
+      "$APP_EXEC" deepgram-key
+    fi
+    ;;
+  disconnect-openai)
+    "$APP_EXEC" disconnect-openai
     ;;
   logs)
     echo "── stdout (/tmp/voice-polish.log) ──"
@@ -339,6 +335,9 @@ case "${1:-}" in
     echo "  vp stop           stop"
     echo "  vp restart        stop + start (use after granting permissions)"
     echo "  vp status         is it running?"
+    echo "  vp auth           connect ChatGPT OAuth for this standalone app"
+    echo "  vp deepgram-key   save your Deepgram API key"
+    echo "  vp disconnect-openai  clear the saved OpenAI token"
     echo "  vp logs           recent output"
     echo "  vp errors         recent errors"
     echo "  vp doctor         full diagnostics"
@@ -359,51 +358,40 @@ for PROFILE in "$HOME/.zshrc" "$HOME/.bash_profile"; do
 done
 ok "vp command installed"
 
-# ── Launch via LaunchAgent (logs captured to /tmp/voice-polish.*) ─────────────
-echo ""
-info "Starting Voice Polish …"
-> "$LOG_OUT"
-> "$LOG_ERR"
-launchctl bootout "gui/$(id -u)/$PLIST_NAME" 2>/dev/null || true
-pkill -f "VoicePolish.app/Contents/MacOS" 2>/dev/null || true
-rm -f /tmp/voice-polish.lock
-sleep 1
-launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || \
-    launchctl load "$PLIST_PATH" 2>/dev/null || true
-sleep 3
-
-if pgrep -f "VoicePolish.app/Contents/MacOS" &>/dev/null; then
-    ok "App running — look for ● in your menu bar"
-else
-    echo -e "  ${YELLOW}⚠  App may not have started. Errors:${NC}"
-    cat "$LOG_ERR" 2>/dev/null || true
-fi
-
 # ── Permission instructions ───────────────────────────────────────────────────
 echo ""
 echo "══════════════════════════════════════════════"
-echo -e "${YELLOW}${BOLD}⚠️  2 permissions required — takes 1 minute${NC}"
+echo -e "${YELLOW}${BOLD}⚠️  Setup required before first run${NC}"
 echo "══════════════════════════════════════════════"
 echo ""
-echo -e "  Run this to open both settings pages automatically:"
-echo -e "  ${CYAN}${BOLD}vp permissions${NC}"
+echo -e "  ${BOLD}1.${NC} Save your Deepgram key:"
+echo -e "     ${CYAN}${BOLD}vp deepgram-key${NC}"
 echo ""
-echo -e "  Or open manually:"
+echo -e "  ${BOLD}2.${NC} Connect ChatGPT OAuth for this standalone app:"
+echo -e "     ${CYAN}${BOLD}vp auth${NC}"
 echo ""
-echo -e "  ${BOLD}1. Input Monitoring${NC}  (for the fn+Shift hotkey)"
+echo -e "  ${BOLD}3.${NC} Open the required macOS permission panes:"
+echo -e "     ${CYAN}${BOLD}vp permissions${NC}"
+echo ""
+echo -e "  ${BOLD}4.${NC} Start Voice Polish:"
+echo -e "     ${CYAN}${BOLD}vp${NC}"
+echo ""
+echo -e "  Permissions needed:"
+echo ""
+echo -e "  ${BOLD}• Input Monitoring${NC}  (for Caps Lock hold-to-record)"
 echo -e "     System Settings → Privacy & Security → Input Monitoring"
 echo -e "     Find ${BOLD}VoicePolish${NC} → toggle ${BOLD}ON${NC}"
 echo ""
-echo -e "  ${BOLD}2. Accessibility${NC}  (to paste text at your cursor)"
+echo -e "  ${BOLD}• Accessibility${NC}  (to paste text at your cursor)"
 echo -e "     System Settings → Privacy & Security → Accessibility"
 echo -e "     Find ${BOLD}VoicePolish${NC} → toggle ${BOLD}ON${NC}"
 echo ""
-echo -e "  ${BOLD}3. Microphone${NC}  (auto-prompted on first recording)"
+echo -e "  ${BOLD}• Microphone${NC}  (auto-prompted on first recording)"
 echo -e "     Just say Allow when the popup appears."
 echo ""
 echo "══════════════════════════════════════════════"
 echo -e "${GREEN}${BOLD}✅  Done!${NC}"
 echo ""
-echo -e "  ${BOLD}Hotkey:${NC}  Hold Shift → tap fn  (start / stop recording)"
+echo -e "  ${BOLD}Hotkey:${NC}  Hold Caps Lock to record, release to polish"
 echo -e "  ${BOLD}Manage:${NC}  type ${CYAN}vp${NC} in Terminal for all commands"
 echo ""
