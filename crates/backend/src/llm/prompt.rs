@@ -124,16 +124,17 @@ pub fn build_system_prompt_with_vocab_entries(
     let tone         = tone_description(&prefs.tone_preset);
     let script_check = script_final_check(&prefs.output_language);
 
-    // Vocabulary preservation block — each entry is rendered as a STRUCTURED
-    // hypothesis the LLM evaluates per transcript: canonical + lexical type +
-    // example context. The type signal ("Acronym", "Proper noun", etc) is
-    // what lets the LLM reason about whether a transcript candidate is
-    // type-compatible with the canonical, instead of requiring a hardcoded
-    // exception list of common words.
+    // Vocabulary block — compact form. Each entry shows canonical + type tag +
+    // example_context. The type tag carries the foundational signal (an
+    // acronym entry is type-incompatible with a single common word). We
+    // intentionally avoid verbose explanations that would expand the
+    // prompt with decision-style language ("you may emit", "candidates")
+    // — that framing pushes the LLM into evaluate-multiple-options mode
+    // and was the root cause of duplicate-output regressions.
     //
-    // Design principle: we give the LLM the data it needs (term + type +
-    // context) and a small set of TYPE-AWARE matching rules. The LLM is the
-    // brain. We don't enumerate words to skip.
+    // Two-line instruction = enough. The model uses the type+example
+    // signals to decide; the global single-output rule (in <task>) keeps
+    // it from emitting multiple variants.
     let vocab_block = if vocabulary_entries.is_empty() {
         String::new()
     } else {
@@ -144,45 +145,12 @@ pub fn build_system_prompt_with_vocab_entries(
             .join("\n");
         format!(
             "<personal_vocabulary>\n\
-             The user has a personal vocabulary. Each entry below is a CANDIDATE \
-             you may emit when the transcript contains a phrase that the entry \
-             would canonicalise. Each entry has THREE pieces of structured \
-             information:\n\n\
-             • **canonical**  — the exact spelling/case to emit if you decide \
-             the entry applies\n\
-             • **type**       — the lexical shape of the canonical (acronym / \
-             proper noun / brand / code identifier / phrase / other)\n\
-             • **example**    — the situation the canonical was observed in \
-             (gives you the SEMANTIC context that has to match)\n\n\
-             TYPE-AWARE MATCHING RULES (no exception list — reason from the type):\n\n\
-             1. **Verbatim match**: if the canonical appears verbatim in the \
-             transcript, emit it unchanged.\n\n\
-             2. **Mishearing recognition**: emit the canonical in place of a \
-             transcript span ONLY when ALL of the following hold:\n\
-                a) The transcript span is **type-compatible** with the canonical:\n\
-                   • acronym canonical → matched span must be a multi-word phrase \
-                     or a distinctly-shaped token (e.g. \"main corps\" matches \
-                     acronym MACOBS; bare \"main\" does NOT — single common words \
-                     are never type-compatible with acronyms).\n\
-                   • proper_noun canonical → matched span is a name-shaped token \
-                     phonetically close to the canonical (anees / aniss / etc \
-                     for Anish).\n\
-                   • brand / code_identifier canonical → matched span is the \
-                     same shape (mixed case, digit-bearing, hyphenated, etc).\n\
-                   • phrase canonical → matched span is the SAME-LENGTH phrase, \
-                     phonetically close.\n\
-                b) The transcript context **resembles** the entry's example. The \
-                example tells you the topic; without topic match, do not replace.\n\
-                c) Phonetic similarity is meaningfully high — sharing only the \
-                first letter is NOT enough.\n\n\
-             3. **Default to keeping the transcript as-is.** Over-replacement is \
-             far worse than under-replacement: the user can correct a missed \
-             term once and the system learns; a wrong replacement looks like \
-             a bug. When ANY of (a), (b), (c) is uncertain, leave the \
-             transcript word alone.\n\n\
-             4. **Do NOT translate, expand, or generate** vocabulary tokens out \
-             of thin air. They appear in the output only if you matched them \
-             against a transcript span using the rules above.\n\n\
+             User's personal terms. If a transcript phrase matches a term \
+             verbatim, KEEP the canonical spelling. If a phrase is phonetically \
+             similar to a term AND the surrounding context resembles the term's \
+             example, replace it with the canonical. If type doesn't fit (e.g. \
+             a single common word is never compatible with an acronym entry), \
+             leave the transcript unchanged.\n\n\
              {table}\n\
              </personal_vocabulary>\n\n"
         )
@@ -284,7 +252,25 @@ pub fn build_system_prompt_with_vocab_entries(
          IMPORTANT: Think about what the speaker INTENDED to say based on the overall \
          topic and sentence meaning. Low-confidence words are hints, not gospel.\n\n\
          SCRIPT FINAL CHECK (read before writing your first character):\n\
-         {script_check}\
+         {script_check}\n\n\
+         ════════════════════════════════════════════════════════════════════════\n\
+         FINAL CRITICAL RULE — SINGLE OUTPUT ENFORCEMENT (read this last):\n\
+         ════════════════════════════════════════════════════════════════════════\n\
+         Your entire response is the polished text, ONCE. Stop immediately after \
+         writing it. Never repeat. Never paraphrase your own output. Never offer \
+         alternatives or 'cleaner versions'. Even if the input was uncertain or \
+         had multiple plausible interpretations, you commit to ONE polished \
+         version and stop.\n\n\
+         BAD example (do NOT do this):\n\
+           Input: \"hello kya chal raha hai\"\n\
+           ✗ Output: \"Hello, kya chal raha hai? Hello, kaisa chal raha hai?\"\n\
+           ↑ The model paraphrased itself — two versions concatenated.\n\n\
+         GOOD example (do this):\n\
+           Input: \"hello kya chal raha hai\"\n\
+           ✓ Output: \"Hello, kya chal raha hai?\"\n\
+           ↑ One polished version. End of response.\n\n\
+         When you have written the polished text once, your response is COMPLETE. \
+         Do not continue. Do not 'try again with a cleaner version'. Stop.\
          </task>"
     )
 }
@@ -434,30 +420,36 @@ mod tests {
         assert!(prompt.contains("<personal_vocabulary>"), "vocab block should be emitted");
         assert!(prompt.contains("n8n"));
         assert!(prompt.contains("Vipassana"));
-        assert!(prompt.contains("Verbatim match"), "verbatim-keep instruction should appear");
-        assert!(prompt.contains("Mishearing recognition"),
-                "context-aware mishearing instruction should appear");
+        // Compact form: the "KEEP the canonical spelling" rule appears.
+        assert!(prompt.contains("KEEP the canonical"),
+                "verbatim-keep instruction should appear in compact form");
+        // The vocab block should NOT contain the verbose multi-rule form
+        // that caused duplicate-output regressions.
+        assert!(!prompt.contains("**Verbatim match**"),
+                "verbose numbered-rule form must be removed");
+        assert!(!prompt.contains("**Mishearing recognition**"),
+                "verbose numbered-rule form must be removed");
     }
 
     #[test]
     fn vocab_block_absent_when_no_terms() {
         let p = prefs();
         let prompt = build_system_prompt_with_vocab(&p, &[], &[], &[]);
-        // The opening tag (which only appears in the actual block, not the
-        // conditional reference in <task>) must not be present.
         assert!(!prompt.contains("<personal_vocabulary>\n"),
                 "expected no vocabulary block when terms are empty");
-        assert!(!prompt.contains("Mishearing recognition"),
+        assert!(!prompt.contains("KEEP the canonical"),
                 "vocab instructions should be gated on having terms");
     }
 
     #[test]
-    fn vocab_block_uses_type_aware_reasoning_not_stopword_list() {
-        // FOUNDATIONAL: the old prompt enumerated 18+ exception words
-        // ("main", "the", "a", "hai", "ka", ...) as a CRITICAL safeguard
-        // list. That was a patch — it didn't generalise to other languages
-        // or future common words. The new prompt drops the list entirely
-        // and instructs the LLM to reason from the term's TYPE.
+    fn vocab_block_compact_form_no_verbose_rules() {
+        // FOUNDATIONAL: the previous prompt had a 40+ line verbose vocab
+        // block with numbered rules + sub-bullets + Q&A-style examples.
+        // That framing pushed the LLM into "evaluate multiple candidates"
+        // mode and caused duplicate-output regressions (LLM would emit
+        // its first version, then a paraphrased "alternative").
+        // The compact form keeps the type+example signals and a 1-line
+        // rule — no Q&A examples, no decision-style language.
         let p = prefs();
         let entries = vec![VocabEntry {
             term:      "MACOBS".into(),
@@ -466,20 +458,50 @@ mod tests {
         }];
         let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
 
-        // The "COMMON-WORD SAFEGUARD" heading must be gone.
+        // Old verbose markers must all be GONE.
         assert!(!prompt.contains("COMMON-WORD SAFEGUARD"),
                 "stopword safeguard heading must be removed");
-        // The enumerated comma-separated stopword list shape must be gone.
-        // The old list contained "the", "a", "is", "of", "to", "in", "on",
-        // "and", "or" together. Check that this distinctive enumeration
-        // shape is absent.
         assert!(!prompt.contains("\"the\", \"a\", \"is\""),
                 "enumerated stopword list must be removed");
-        // The new prompt must instead contain the type-aware language.
-        assert!(prompt.contains("type-compatible"),
-                "type-compatible reasoning instruction must be present");
-        assert!(prompt.contains("acronym canonical"),
-                "type-specific rule for acronyms must be present");
+        assert!(!prompt.contains("type-compatible"),
+                "verbose 'type-compatible' explainer is gone (kept implicit in 1-line rule)");
+        assert!(!prompt.contains("Each entry below is a CANDIDATE"),
+                "decision-style 'CANDIDATE' framing must be gone");
+        // The new compact form must contain the type-shape rule inline.
+        assert!(prompt.contains("acronym entry"),
+                "compact rule mentions acronym type as the canonical example");
+    }
+
+    #[test]
+    fn task_block_ends_with_single_output_enforcement() {
+        // FOUNDATIONAL: the very last instruction the LLM sees before
+        // generation must be the single-output enforcement. End-of-prompt
+        // attention is strongest; placing the rule earlier (as a bullet
+        // in the middle of a numbered list) wasn't holding up against
+        // verbose vocab-block changes that pushed the LLM into
+        // multiple-output mode. Locking placement here is the regression
+        // test for the duplicate-polish bug.
+        let p = prefs();
+        let prompt = build_system_prompt_with_vocab(&p, &[], &[], &[]);
+
+        // Must contain the FINAL rule heading.
+        assert!(prompt.contains("FINAL CRITICAL RULE"),
+                "single-output rule must be present");
+        // Must contain the bad-example pattern that shows the failure mode.
+        assert!(prompt.contains("paraphrased itself"),
+                "bad-example explanation must be present");
+        // The FINAL rule must come AFTER all other task rules — verify by
+        // checking position relative to a known earlier rule.
+        let pos_rule_7   = prompt.find("Output ONLY the polished text").unwrap();
+        let pos_final    = prompt.find("FINAL CRITICAL RULE").unwrap();
+        assert!(pos_final > pos_rule_7,
+                "FINAL CRITICAL RULE must come AFTER rule 7 (be the LAST instruction)");
+        // The final rule must be near the </task> closer for end-of-prompt
+        // attention to fire on it.
+        let pos_close = prompt.find("</task>").unwrap();
+        assert!(pos_close - pos_final < 1500,
+                "FINAL CRITICAL RULE must be near </task> closer ({}+ chars away — should be < 1500)",
+                pos_close - pos_final);
     }
 
     #[test]

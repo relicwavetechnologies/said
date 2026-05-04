@@ -76,11 +76,21 @@ pub async fn stream_polish(
         return Err(format!("Codex API error {status}: {body}"));
     }
 
-    // Gap 5: true SSE streaming — yield tokens as they arrive, not after full buffer
+    // Gap 5: true SSE streaming — yield tokens as they arrive, not after full buffer.
+    //
+    // gpt-5 reasoning models can emit MULTIPLE output_text items in one
+    // response — typically a draft and a final. Without tracking the active
+    // output_item, naive concatenation of all output_text.delta events
+    // produces duplicated output ("Hello, aur kya chal raha haiHello, aur
+    // kya chal raha hai?"). We track the current output_item index and
+    // RESET on every new message-typed item so only the LAST item's text
+    // becomes the final polished output.
     let mut stream   = resp.bytes_stream();
     let mut polished = String::new();
     let mut buf      = String::new();  // incomplete SSE line buffer
     let mut ttft_ms: Option<u64> = None;
+    let mut current_message_item_idx: Option<i64> = None;
+    let mut item_resets = 0_usize;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("codex stream read error: {e}"))?;
@@ -99,6 +109,31 @@ pub async fn stream_polish(
             let Ok(evt) = serde_json::from_str::<serde_json::Value>(data) else { continue };
 
             match evt.get("type").and_then(|t| t.as_str()) {
+                // Track output-item lifecycle. When a new MESSAGE item starts
+                // and we already have one going, the previous one was a draft —
+                // reset the buffer + emit a stream RESET so the typing path can
+                // clear what it already typed.
+                Some("response.output_item.added") => {
+                    let item_type = evt.pointer("/item/type").and_then(|t| t.as_str()).unwrap_or("");
+                    let item_idx  = evt.get("output_index").and_then(|i| i.as_i64()).unwrap_or(-1);
+                    if item_type == "message" {
+                        if let Some(prev_idx) = current_message_item_idx {
+                            if item_idx != prev_idx {
+                                // Previous message item was a draft — discard it.
+                                item_resets += 1;
+                                warn!(
+                                    "[codex] new message output_item (idx {item_idx}) replaced draft (idx {prev_idx}) — \
+                                     {} chars discarded; reset stream",
+                                    polished.len(),
+                                );
+                                polished.clear();
+                                // Send a sentinel so the typing path can clear any partial output.
+                                let _ = token_tx.send("\u{1F}__RESET__\u{1F}".to_string()).await;
+                            }
+                        }
+                        current_message_item_idx = Some(item_idx);
+                    }
+                }
                 Some("response.output_text.delta") => {
                     let delta = evt.get("delta")
                         .and_then(|d| d.as_str())
@@ -107,12 +142,10 @@ pub async fn stream_polish(
                         if ttft_ms.is_none() {
                             let ms = start.elapsed().as_millis() as u64;
                             ttft_ms = Some(ms);
-                            // GAP-5 PROOF: first token time — proves streaming works
                             info!("[codex] GAP-5: first token in {ms}ms (true streaming, not buffered)");
                         }
                         polished.push_str(delta);
                         debug!("[codex] token: {delta:?}");
-                        // Send immediately — don't wait for full response
                         let _ = token_tx.send(delta.to_string()).await;
                     }
                 }
@@ -126,6 +159,12 @@ pub async fn stream_polish(
     }
 
     let polish_ms = start.elapsed().as_millis() as u64;
+    if item_resets > 0 {
+        warn!(
+            "[codex] {item_resets} draft item(s) discarded during stream — final polish: {} chars",
+            polished.len(),
+        );
+    }
     info!("[codex] done in {polish_ms}ms, {} chars", polished.len());
     Ok(PolishResult { polished, polish_ms })
 }

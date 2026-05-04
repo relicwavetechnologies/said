@@ -1563,6 +1563,20 @@ async fn run_voice_polish_sse(
     let done = api::stream_voice_polish(&ep, wav, target_app, pre_transcript, move |event| {
         match &event {
             api::PolishEvent::Token { token } => {
+                // RESET sentinel — emitted by openai_codex SSE parser when a
+                // new message output_item replaces a draft (gpt-5 reasoning
+                // models sometimes emit drafts followed by finals). The
+                // sentinel tells us to stop word-by-word typing and let the
+                // safety-paste path replace whatever was already typed with
+                // the final polished text.
+                if token == "\u{1F}__RESET__\u{1F}" {
+                    tracing::warn!("[main] LLM emitted draft + final — disabling word-by-word for this recording, will paste full output at end");
+                    // Mark as failed so the safety-paste path fires at the end.
+                    // Doesn't matter that we typed some draft tokens; the safety
+                    // paste will select-all-and-replace.
+                    fail_count2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
                 // Emit to UI for live preview
                 let _ = app_clone.emit("voice-token", serde_json::json!({ "token": token }));
                 // Type word-by-word directly into focused app via AX
@@ -1598,6 +1612,13 @@ async fn run_voice_polish_sse(
                     done.latency_ms.polish,
                     done.latency_ms.total,
                 );
+                // Diagnostic — logs the full polished text (capped) so we can
+                // tell the difference between an LLM that produced duplicate
+                // text vs a typing-path bug that doubled it. Caps at 400
+                // chars so very long polishes don't blow up the log.
+                let preview: String = done.polished.chars().take(400).collect();
+                let suffix = if done.polished.chars().count() > 400 { "…" } else { "" };
+                tracing::info!("[pipeline] polished text: {preview:?}{suffix}");
                 let _ = app_clone.emit("voice-done", done);
             }
             api::PolishEvent::Error { message, audio_id } => {
@@ -1637,8 +1658,12 @@ async fn run_voice_polish_sse(
                 "[main] word-by-word partial: {n_typed} ok, {n_failed} failed — clipboard paste for safety"
             );
             if !done.polished.is_empty() {
-                // Select-all and replace to avoid duplicating the partial text
-                match paster::paste(&done.polished) {
+                // Select-all and replace to avoid duplicating the partial text.
+                // Uses paster::paste_replacing which sends Cmd+A first, then Cmd+V.
+                // This is the key fix for the LLM-emits-duplicate bug AND for the
+                // case where word-by-word typing partially fails: the safety paste
+                // now actually REPLACES the partial output instead of appending.
+                match paster::paste_replacing(&done.polished) {
                     Ok(_) => {
                         output_pasted = true;
                     }
@@ -1678,6 +1703,14 @@ async fn run_voice_polish_sse(
             "[main] result stored ({} chars) — Ctrl+Cmd+V to paste again",
             done.polished.len()
         );
+        // Diagnostic: log the actual polished text (capped at 240 chars for
+        // privacy / log-volume reasons). This makes LLM-side regressions
+        // (e.g. duplicate-output bugs from prompt drift) immediately visible
+        // — without it we only see token counts and can't tell whether
+        // duplication is in the model output or in our typing path.
+        let preview: String = done.polished.chars().take(240).collect();
+        let suffix = if done.polished.chars().count() > 240 { "…" } else { "" };
+        tracing::info!("[main] polished text: {:?}{}", preview, suffix);
     }
 
     let output_status = if output_pasted { "pasted" } else { "manual_paste" };
