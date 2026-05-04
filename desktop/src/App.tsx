@@ -129,6 +129,15 @@ export default function App() {
   const [connectBusy,     setConnectBusy]     = useState(false);
   const [connectError,    setConnectError]    = useState("");
 
+  const syncOpenAIConnection = useCallback(async () => {
+    try {
+      const status = await getOpenAIStatus();
+      setOpenAIConnected(status?.connected ?? false);
+    } catch {
+      setOpenAIConnected(false);
+    }
+  }, []);
+
   // Theme (light/dark) — persisted in localStorage, applied to <html>
   const { theme, toggle: toggleTheme } = useTheme();
 
@@ -147,8 +156,7 @@ export default function App() {
         const cloudStatus = await getCloudStatus();
         setNeedsAuth(cloudStatus ? !cloudStatus.connected : false);
         // OpenAI connection — REQUIRED
-        const oaStatus = await getOpenAIStatus();
-        setOpenAIConnected(oaStatus?.connected ?? false);
+        await syncOpenAIConnection();
       })
       .catch((err: unknown) => {
         setErrorBanner(err instanceof Error ? err.message : String(err));
@@ -156,7 +164,7 @@ export default function App() {
         setOpenAIConnected(false); // still show connect gate on error
       });
     refreshHistory();
-  }, [refreshHistory]);
+  }, [refreshHistory, syncOpenAIConnection]);
 
   // ── OpenAI OAuth connect ───────────────────────────────────────────────────
   const handleOpenAIConnect = useCallback(async () => {
@@ -249,6 +257,10 @@ export default function App() {
       setSnapshot((p) => (p ? { ...p, state: "idle" } : p));
       setStatusPhase("");
       setTokenBuf("");
+      if (msg.toLowerCase().includes("openai isn't connected")) {
+        setConnectBusy(false);
+        void syncOpenAIConnection();
+      }
     });
 
     // Edit detected (legacy in-app toast — still fires as fallback)
@@ -319,7 +331,7 @@ export default function App() {
       unsubPending();
       unsubVocabToast();
     };
-  }, [refreshHistory]);
+  }, [refreshHistory, syncOpenAIConnection]);
 
   // ── Periodic snapshot poll — picks up Accessibility/Input Monitoring grants ──
   // 5 s is fast enough — permission changes require a user trip to System Settings.

@@ -92,6 +92,20 @@ use crate::{
     stt::deepgram,
 };
 
+fn invalidate_openai_session_on_auth_error(
+    pool: &crate::store::DbPool,
+    user_id: &str,
+    llm_provider: &str,
+    err: &str,
+) -> bool {
+    if llm_provider != "openai_codex" || !openai_codex::is_auth_error(err) {
+        return false;
+    }
+    openai_oauth::delete_token(pool, user_id);
+    warn!("[voice] invalidated stored OpenAI OAuth token after auth failure");
+    true
+}
+
 pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> impl IntoResponse {
     // ── Extract multipart fields ───────────────────────────────────────────────
     let mut wav_data: Vec<u8> = Vec::new();
@@ -341,7 +355,8 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
         );
 
         // ── STEP 5: LLM stream ────────────────────────────────────────────────────
-        let llm_provider  = prefs.llm_provider.clone();
+        let llm_provider = prefs.llm_provider.clone();
+        let llm_provider_for_task = llm_provider.clone();
         let (token_tx, mut token_rx) = mpsc::channel::<String>(64);
         let sys_p       = system_prompt.clone();
         let usr_m       = user_message.clone();
@@ -371,7 +386,7 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
         info!("[timing] LLM start — provider={llm_provider:?} model={model_for_llm:?}");
 
         let llm_task = tokio::spawn(async move {
-            if llm_provider == "openai_codex" {
+            if llm_provider_for_task == "openai_codex" {
                 let access_token = openai_token_opt.as_deref().unwrap_or("");
                 if access_token.is_empty() {
                     return Err("OpenAI not connected — go to Settings to connect your account".to_string());
@@ -379,11 +394,11 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
                 openai_codex::stream_polish(
                     &client_c, access_token, &model_for_llm, &sys_p, &usr_m, token_tx,
                 ).await
-            } else if llm_provider == "gemini_direct" {
+            } else if llm_provider_for_task == "gemini_direct" {
                 gemini_direct::stream_polish(
                     &client_c, &gk_gemini, &model_for_llm, &sys_p, &usr_m, token_tx,
                 ).await
-            } else if llm_provider == "groq" {
+            } else if llm_provider_for_task == "groq" {
                 groq::stream_polish(
                     &client_c, &gk_groq, &model_for_llm, &sys_p, &usr_m, token_tx,
                 ).await
@@ -401,9 +416,14 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
         let mut llm_result = match llm_task.await {
             Ok(Ok(r))   => r,
             Ok(Err(e))  => {
+                let message = if invalidate_openai_session_on_auth_error(&pool, &user_id, &llm_provider, &e) {
+                    "OpenAI not connected — go to Settings to connect your account".to_string()
+                } else {
+                    e.clone()
+                };
                 warn!("[voice] LLM error: {e}");
                 yield Ok(Event::default().event("error").data(
-                    json!({"message": e, "audio_id": aid}).to_string()
+                    json!({"message": message, "audio_id": aid}).to_string()
                 ));
                 return;
             }

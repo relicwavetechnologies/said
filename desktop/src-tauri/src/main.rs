@@ -955,7 +955,17 @@ fn tray_polish_message(app: &tauri::AppHandle, tone: &str) {
                 }
             }
             Ok(_) => tracing::warn!("[tray_polish] empty result from backend"),
-            Err(e) => tracing::warn!("[tray_polish] backend error: {e}"),
+            Err(e) => {
+                let human = humanize_error(&e);
+                tracing::warn!("[tray_polish] backend error: {e}");
+                let _ = app_clone.emit(
+                    "voice-error",
+                    serde_json::json!({
+                        "message": human,
+                        "audio_id": null,
+                    }),
+                );
+            }
         }
     });
 }
