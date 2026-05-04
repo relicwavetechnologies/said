@@ -530,8 +530,9 @@ body.statusbar-mode::before {
 html.statusbar-mode #app,
 body.statusbar-mode #app {
   display: flex;
+  flex-direction: column;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-end;
   width: 100vw;
   height: 100vh;
   background: transparent !important;
@@ -774,8 +775,6 @@ body.statusbar-mode #app {
 /* ── VoiceInk-style floating recorder HUD ─────────────────────────────────── */
 
 .sb-shell {
-  width: calc(100vw - 2px);
-  height: calc(100vh - 2px);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -791,6 +790,12 @@ body.statusbar-mode #app {
   letter-spacing: 0;
   cursor: default;
   animation: sb-hud-in 0.18s ease-out;
+  transition:
+    width 0.28s cubic-bezier(0.2, 0.9, 0.2, 1),
+    height 0.28s cubic-bezier(0.2, 0.9, 0.2, 1),
+    border-radius 0.22s ease,
+    border-color 0.18s ease,
+    box-shadow 0.18s ease;
 }
 
 .sb-shell--expanded {

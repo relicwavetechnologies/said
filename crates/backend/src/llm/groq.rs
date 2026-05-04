@@ -30,7 +30,7 @@ const GROQ_ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions";
 /// Default model — Llama 4 Scout, best quality + speed for Hinglish on Groq.
 pub const GROQ_MODEL_DEFAULT: &str = "meta-llama/llama-4-scout-17b-16e-instruct";
 /// Fast model — lower latency fallback.
-pub const GROQ_MODEL_FAST:    &str = "meta-llama/llama-4-scout-17b-16e-instruct";
+pub const GROQ_MODEL_FAST: &str = "meta-llama/llama-4-scout-17b-16e-instruct";
 
 // ── SSE types (identical to OpenAI format) ────────────────────────────────────
 
@@ -54,18 +54,22 @@ struct Delta {
 /// Each token is sent on `token_tx` as it arrives.
 /// Returns the final concatenated text + latency.
 pub async fn stream_polish(
-    client:        &Client,
-    groq_api_key:  &str,
-    model:         &str,
+    client: &Client,
+    groq_api_key: &str,
+    model: &str,
     system_prompt: &str,
-    user_message:  &str,
-    token_tx:      mpsc::Sender<String>,
+    user_message: &str,
+    token_tx: mpsc::Sender<String>,
 ) -> Result<PolishResult, String> {
     if groq_api_key.is_empty() {
         return Err("Groq API key not set — add it in Settings → API Keys".to_string());
     }
 
-    let model = if model.is_empty() { GROQ_MODEL_DEFAULT } else { model };
+    let model = if model.is_empty() {
+        GROQ_MODEL_DEFAULT
+    } else {
+        model
+    };
     let start = Instant::now();
 
     let body = json!({
@@ -94,27 +98,34 @@ pub async fn stream_polish(
     if !status.is_success() {
         let body_text = resp.text().await.unwrap_or_default();
         warn!("[groq] HTTP {status}: {body_text}");
-        return Err(format!("Groq API error {status}: {}", &body_text[..body_text.len().min(400)]));
+        return Err(format!(
+            "Groq API error {status}: {}",
+            &body_text[..body_text.len().min(400)]
+        ));
     }
 
     // Stream SSE response
-    let mut stream   = resp.bytes_stream();
+    let mut stream = resp.bytes_stream();
     let mut polished = String::new();
-    let mut buf      = String::new();
+    let mut buf = String::new();
     let mut ttft_ms: Option<u64> = None;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("Groq stream read error: {e}"))?;
-        let text  = String::from_utf8_lossy(&chunk);
+        let text = String::from_utf8_lossy(&chunk);
         buf.push_str(&text);
 
         while let Some(nl) = buf.find('\n') {
             let line = buf[..nl].trim().to_string();
             buf = buf[nl + 1..].to_string();
 
-            if !line.starts_with("data: ") { continue; }
+            if !line.starts_with("data: ") {
+                continue;
+            }
             let data = &line[6..];
-            if data == "[DONE]" { break; }
+            if data == "[DONE]" {
+                break;
+            }
 
             if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
                 for choice in chunk.choices {
@@ -138,5 +149,8 @@ pub async fn stream_polish(
     let polish_ms = start.elapsed().as_millis() as u64;
     info!("[groq] done in {polish_ms}ms, {} chars", polished.len());
 
-    Ok(PolishResult { polished, polish_ms })
+    Ok(PolishResult {
+        polished,
+        polish_ms,
+    })
 }

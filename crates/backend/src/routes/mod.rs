@@ -9,5 +9,5 @@ pub mod pending_edits;
 pub mod pre_embed;
 pub mod prefs;
 pub mod text;
-pub mod voice;
 pub mod vocabulary;
+pub mod voice;

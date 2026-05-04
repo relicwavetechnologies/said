@@ -16,29 +16,29 @@
 use futures::StreamExt;
 use reqwest::Client;
 use serde_json::json;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
-use std::time::Instant;
 
 pub use super::PolishResult;
 
 const CODEX_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
-const TOKEN_URL:       &str = "https://auth.openai.com/oauth/token";
-const CLIENT_ID:       &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 /// Available model IDs via the Codex Responses endpoint.
-pub const MODEL_SMART:  &str = "gpt-5.4";
-pub const MODEL_MINI:   &str = "gpt-5.4-mini";
+pub const MODEL_SMART: &str = "gpt-5.4";
+pub const MODEL_MINI: &str = "gpt-5.4-mini";
 
 /// Stream a polish operation through the Codex endpoint.
 /// `model` should be `MODEL_SMART` or `MODEL_MINI`.
 pub async fn stream_polish(
-    client:        &Client,
-    access_token:  &str,
-    model:         &str,
+    client: &Client,
+    access_token: &str,
+    model: &str,
     system_prompt: &str,
-    user_message:  &str,
-    token_tx:      mpsc::Sender<String>,
+    user_message: &str,
+    token_tx: mpsc::Sender<String>,
 ) -> Result<PolishResult, String> {
     let start = Instant::now();
 
@@ -85,16 +85,16 @@ pub async fn stream_polish(
     // kya chal raha hai?"). We track the current output_item index and
     // RESET on every new message-typed item so only the LAST item's text
     // becomes the final polished output.
-    let mut stream   = resp.bytes_stream();
+    let mut stream = resp.bytes_stream();
     let mut polished = String::new();
-    let mut buf      = String::new();  // incomplete SSE line buffer
+    let mut buf = String::new(); // incomplete SSE line buffer
     let mut ttft_ms: Option<u64> = None;
     let mut current_message_item_idx: Option<i64> = None;
     let mut item_resets = 0_usize;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("codex stream read error: {e}"))?;
-        let text  = String::from_utf8_lossy(&chunk);
+        let text = String::from_utf8_lossy(&chunk);
         buf.push_str(&text);
 
         // SSE lines end with \n; process all complete lines
@@ -102,11 +102,17 @@ pub async fn stream_polish(
             let line = buf[..nl].trim().to_string();
             buf = buf[nl + 1..].to_string();
 
-            if !line.starts_with("data: ") { continue; }
+            if !line.starts_with("data: ") {
+                continue;
+            }
             let data = &line[6..];
-            if data == "[DONE]" { break; }
+            if data == "[DONE]" {
+                break;
+            }
 
-            let Ok(evt) = serde_json::from_str::<serde_json::Value>(data) else { continue };
+            let Ok(evt) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
 
             match evt.get("type").and_then(|t| t.as_str()) {
                 // Track output-item lifecycle. When a new MESSAGE item starts
@@ -114,8 +120,14 @@ pub async fn stream_polish(
                 // reset the buffer + emit a stream RESET so the typing path can
                 // clear what it already typed.
                 Some("response.output_item.added") => {
-                    let item_type = evt.pointer("/item/type").and_then(|t| t.as_str()).unwrap_or("");
-                    let item_idx  = evt.get("output_index").and_then(|i| i.as_i64()).unwrap_or(-1);
+                    let item_type = evt
+                        .pointer("/item/type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
+                    let item_idx = evt
+                        .get("output_index")
+                        .and_then(|i| i.as_i64())
+                        .unwrap_or(-1);
                     if item_type == "message" {
                         if let Some(prev_idx) = current_message_item_idx {
                             if item_idx != prev_idx {
@@ -135,14 +147,14 @@ pub async fn stream_polish(
                     }
                 }
                 Some("response.output_text.delta") => {
-                    let delta = evt.get("delta")
-                        .and_then(|d| d.as_str())
-                        .unwrap_or("");
+                    let delta = evt.get("delta").and_then(|d| d.as_str()).unwrap_or("");
                     if !delta.is_empty() {
                         if ttft_ms.is_none() {
                             let ms = start.elapsed().as_millis() as u64;
                             ttft_ms = Some(ms);
-                            info!("[codex] GAP-5: first token in {ms}ms (true streaming, not buffered)");
+                            info!(
+                                "[codex] GAP-5: first token in {ms}ms (true streaming, not buffered)"
+                            );
                         }
                         polished.push_str(delta);
                         debug!("[codex] token: {delta:?}");
@@ -184,7 +196,7 @@ pub fn is_auth_error(raw: &str) -> bool {
 // ── Token refresh ─────────────────────────────────────────────────────────────
 
 pub struct RefreshedToken {
-    pub access_token:  String,
+    pub access_token: String,
     pub refresh_token: String,
     pub expires_at_ms: i64,
 }
@@ -206,22 +218,30 @@ pub async fn refresh_token(client: &Client, refresh_tok: &str) -> Result<Refresh
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body   = resp.text().await.unwrap_or_default();
+        let body = resp.text().await.unwrap_or_default();
         return Err(format!("refresh error {status}: {body}"));
     }
 
-    let v: serde_json::Value = resp.json().await
+    let v: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| format!("refresh parse failed: {e}"))?;
 
-    let access_token  = v["access_token"].as_str().unwrap_or("").to_string();
-    let refresh_token = v["refresh_token"].as_str()
-        .unwrap_or(refresh_tok).to_string();
-    let expires_in    = v["expires_in"].as_i64().unwrap_or(864_000);
+    let access_token = v["access_token"].as_str().unwrap_or("").to_string();
+    let refresh_token = v["refresh_token"]
+        .as_str()
+        .unwrap_or(refresh_tok)
+        .to_string();
+    let expires_in = v["expires_in"].as_i64().unwrap_or(864_000);
     let expires_at_ms = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64)
         + expires_in * 1000;
 
-    Ok(RefreshedToken { access_token, refresh_token, expires_at_ms })
+    Ok(RefreshedToken {
+        access_token,
+        refresh_token,
+        expires_at_ms,
+    })
 }

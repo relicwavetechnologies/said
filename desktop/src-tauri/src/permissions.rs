@@ -89,10 +89,18 @@ mod imp {
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
-    pub fn microphone_granted() -> bool { true }
-    pub fn request_microphone() -> bool { true }
-    pub fn screen_recording_granted() -> bool { true }
-    pub fn request_screen_recording() -> bool { true }
+    pub fn microphone_granted() -> bool {
+        true
+    }
+    pub fn request_microphone() -> bool {
+        true
+    }
+    pub fn screen_recording_granted() -> bool {
+        true
+    }
+    pub fn request_screen_recording() -> bool {
+        true
+    }
 }
 
 pub use imp::*;

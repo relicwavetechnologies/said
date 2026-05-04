@@ -161,6 +161,10 @@ pub fn router_with_state(state: AppState) -> Router {
     let authenticated = Router::new()
         .route("/v1/pre-embed", post(routes::pre_embed::handler))
         .route("/v1/voice/polish", post(routes::voice::polish))
+        .route(
+            "/v1/voice/polish-transcript",
+            post(routes::voice::polish_transcript),
+        )
         .route("/v1/text/polish", post(routes::text::polish))
         .route("/v1/edit-feedback", post(routes::feedback::submit))
         .route("/v1/classify-edit", post(routes::classify::classify))
@@ -186,7 +190,10 @@ pub fn router_with_state(state: AppState) -> Router {
             "/v1/recordings/:id",
             axum::routing::delete(routes::history::delete),
         )
-        .route("/v1/recordings/:id/audio", get(routes::history::audio))
+        .route(
+            "/v1/recordings/:id/audio",
+            get(routes::history::audio).post(routes::history::upload_audio),
+        )
         .route("/v1/preferences", get(routes::prefs::get_prefs))
         .route("/v1/preferences", patch(routes::prefs::patch_prefs))
         .route("/v1/corrections", get(routes::prefs::get_corrections))

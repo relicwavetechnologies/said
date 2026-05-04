@@ -9,7 +9,7 @@
 
 use axum::{
     extract::{Request, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     middleware::Next,
     response::Response,
 };
@@ -18,7 +18,7 @@ use crate::AppState;
 
 pub async fn require_secret(
     State(state): State<AppState>,
-    req:  Request,
+    req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
     let provided = req

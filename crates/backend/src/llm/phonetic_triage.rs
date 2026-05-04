@@ -65,7 +65,7 @@ pub fn triage(hunks: &[Hunk]) -> Vec<TriageDecision> {
 
 fn triage_one(hunk: &Hunk) -> TriageDecision {
     let polish = hunk.polish_window.trim();
-    let kept   = hunk.kept_window.trim();
+    let kept = hunk.kept_window.trim();
 
     // Pure insertions or deletions — we can't reason about transformations.
     // Send to LLM (it sees the full surrounding context).
@@ -74,7 +74,7 @@ fn triage_one(hunk: &Hunk) -> TriageDecision {
     }
 
     let polish_words = polish.split_whitespace().count();
-    let kept_words   = kept.split_whitespace().count();
+    let kept_words = kept.split_whitespace().count();
 
     // ── Multi-word polish → single jargon-y kept ────────────────────────
     // Canonical STT-error shape for acronyms / brand names: STT spelled
@@ -94,7 +94,11 @@ fn triage_one(hunk: &Hunk) -> TriageDecision {
         // words score 0.0 here so they fall through to Ambiguous.
         if kept_jargon >= 0.4 {
             return TriageDecision::Resolved(synthesize(
-                hunk, EditClass::SttError, polish, kept, 0.92,
+                hunk,
+                EditClass::SttError,
+                polish,
+                kept,
+                0.92,
             ));
         }
     }
@@ -109,8 +113,8 @@ fn triage_one(hunk: &Hunk) -> TriageDecision {
     // Single-word transformations: the heart of the triage. Compute the
     // cheap phonetic + edit-distance signals.
     let phon_sim = phonetics::similarity(polish, kept);
-    let lev      = levenshtein_chars(polish, kept);
-    let jargon   = phonetics::jargon_score(kept);
+    let lev = levenshtein_chars(polish, kept);
+    let jargon = phonetics::jargon_score(kept);
 
     // ── Clear STT_ERROR ──────────────────────────────────────────────────
     // Polish and kept sound alike (phonetic ≥ 0.7) and the spelling is close
@@ -136,7 +140,13 @@ fn triage_one(hunk: &Hunk) -> TriageDecision {
     //   • lev      ≥ 4     (visually distinct)
     //   • jargon   < 0.3   (the kept token isn't a name/code/brand)
     if phon_sim < 0.4 && lev >= 4 && jargon < 0.3 {
-        return TriageDecision::Resolved(synthesize(hunk, EditClass::UserRephrase, polish, kept, 0.85));
+        return TriageDecision::Resolved(synthesize(
+            hunk,
+            EditClass::UserRephrase,
+            polish,
+            kept,
+            0.85,
+        ));
     }
 
     // ── Everything else — too close to call without context ──────────────
@@ -150,17 +160,22 @@ fn synthesize(
     hunk: &Hunk,
     class: EditClass,
     transcript_form: &str,
-    correct_form:    &str,
-    confidence:      f64,
+    correct_form: &str,
+    confidence: f64,
 ) -> LabelledHunk {
     let extracted_term = match class {
         EditClass::SttError | EditClass::PolishError => Some(ExtractedTerm {
             transcript_form: transcript_form.to_string(),
-            correct_form:    correct_form.to_string(),
+            correct_form: correct_form.to_string(),
         }),
         _ => None,
     };
-    LabelledHunk { hunk: hunk.clone(), class, confidence, extracted_term }
+    LabelledHunk {
+        hunk: hunk.clone(),
+        class,
+        confidence,
+        extracted_term,
+    }
 }
 
 /// Levenshtein over Unicode chars (not bytes). Bounded by `max + 1` early
@@ -169,17 +184,19 @@ fn levenshtein_chars(a: &str, b: &str) -> usize {
     let av: Vec<char> = a.chars().collect();
     let bv: Vec<char> = b.chars().collect();
     let (n, m) = (av.len(), bv.len());
-    if n == 0 { return m; }
-    if m == 0 { return n; }
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
     let mut prev: Vec<usize> = (0..=m).collect();
     let mut curr: Vec<usize> = vec![0; m + 1];
     for i in 1..=n {
         curr[0] = i;
         for j in 1..=m {
             let cost = if av[i - 1] == bv[j - 1] { 0 } else { 1 };
-            curr[j] = (curr[j - 1] + 1)
-                .min(prev[j] + 1)
-                .min(prev[j - 1] + cost);
+            curr[j] = (curr[j - 1] + 1).min(prev[j] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -193,8 +210,8 @@ mod tests {
     fn h(polish: &str, kept: &str) -> Hunk {
         Hunk {
             transcript_window: polish.to_string(),
-            polish_window:     polish.to_string(),
-            kept_window:       kept.to_string(),
+            polish_window: polish.to_string(),
+            kept_window: kept.to_string(),
         }
     }
 
@@ -277,7 +294,10 @@ mod tests {
         let d = triage_one(&h("Main corps", "MACOBS"));
         match d {
             TriageDecision::Resolved(lh) => assert_eq!(lh.class, EditClass::SttError),
-            _ => panic!("expected Resolved STT_ERROR for Main corps -> MACOBS, got {:?}", d),
+            _ => panic!(
+                "expected Resolved STT_ERROR for Main corps -> MACOBS, got {:?}",
+                d
+            ),
         }
     }
 
@@ -287,7 +307,10 @@ mod tests {
         let d = triage_one(&h("Cloud Code", "ClaudeCode"));
         match d {
             TriageDecision::Resolved(lh) => assert_eq!(lh.class, EditClass::SttError),
-            _ => panic!("expected Resolved STT_ERROR for Cloud Code -> ClaudeCode, got {:?}", d),
+            _ => panic!(
+                "expected Resolved STT_ERROR for Cloud Code -> ClaudeCode, got {:?}",
+                d
+            ),
         }
     }
 

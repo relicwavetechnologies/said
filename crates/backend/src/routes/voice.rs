@@ -16,13 +16,15 @@
 //!     skipped, saving ~1.2–2 s on every recording.
 
 use axum::{
+    Json,
     extract::{Multipart, State},
     http::StatusCode,
     response::{
-        IntoResponse,
+        IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
 };
+use serde::Deserialize;
 use serde_json::json;
 use std::convert::Infallible;
 use std::time::Instant;
@@ -81,7 +83,7 @@ use crate::{
             VocabEntry, build_system_prompt_with_vocab_entries, build_user_message,
             resolved_vocab_terms_to_entries, vocab_terms_to_entries,
         },
-        vocab_resolver,
+        script, vocab_resolver,
     },
     store::{
         history::{InsertRecording, insert_recording},
@@ -106,6 +108,19 @@ fn invalidate_openai_session_on_auth_error(
     true
 }
 
+#[derive(Debug)]
+struct VoicePolishInput {
+    wav_data: Vec<u8>,
+    target_app: Option<String>,
+    pre_transcript: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TranscriptPolishRequest {
+    transcript: String,
+    target_app: Option<String>,
+}
+
 pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> impl IntoResponse {
     // ── Extract multipart fields ───────────────────────────────────────────────
     let mut wav_data: Vec<u8> = Vec::new();
@@ -126,6 +141,45 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
             _ => {}
         }
     }
+
+    polish_with_input(
+        state,
+        VoicePolishInput {
+            wav_data,
+            target_app,
+            pre_transcript,
+        },
+    )
+    .await
+}
+
+pub async fn polish_transcript(
+    State(state): State<AppState>,
+    Json(req): Json<TranscriptPolishRequest>,
+) -> impl IntoResponse {
+    let transcript = req.transcript.trim().to_string();
+    if transcript.is_empty() {
+        warn!("[voice] received empty transcript-only polish request");
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    polish_with_input(
+        state,
+        VoicePolishInput {
+            wav_data: Vec::new(),
+            target_app: req.target_app,
+            pre_transcript: Some(transcript),
+        },
+    )
+    .await
+}
+
+async fn polish_with_input(state: AppState, input: VoicePolishInput) -> Response {
+    let VoicePolishInput {
+        wav_data,
+        target_app,
+        pre_transcript,
+    } = input;
 
     // Allow empty WAV when the caller supplied a pre_transcript (P5 / WS path).
     if wav_data.is_empty() && pre_transcript.is_none() {
@@ -407,8 +461,24 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
             }
         });
 
-        // Yield each token as an SSE event
+        let enforce_roman_hinglish = prefs.output_language == "hinglish";
+
+        // Yield each token as an SSE event. For Hinglish we defensively
+        // romanize any Devanagari before it reaches the desktop's live typing
+        // path; otherwise a bad model token can already be pasted before the
+        // final result is scrubbed.
+        let mut saw_script_rewrite = false;
         while let Some(token) = token_rx.recv().await {
+            let token = if enforce_roman_hinglish && script::contains_devanagari(&token) {
+                if !saw_script_rewrite {
+                    saw_script_rewrite = true;
+                    yield Ok(Event::default().event("token")
+                        .data(json!({"token": "\u{1F}__RESET__\u{1F}"}).to_string()));
+                }
+                script::enforce_roman_hinglish(&token)
+            } else {
+                token
+            };
             yield Ok(Event::default().event("token")
                 .data(json!({"token": token}).to_string()));
         }
@@ -447,6 +517,16 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
                 llm_result.polished.len(), scrubbed.len(),
             );
             llm_result.polished = scrubbed;
+        }
+
+        if enforce_roman_hinglish && script::contains_devanagari(&llm_result.polished) {
+            let romanized = script::enforce_roman_hinglish(&llm_result.polished);
+            warn!(
+                "[voice] LLM emitted Devanagari in Hinglish mode — romanized {} → {} chars",
+                llm_result.polished.len(),
+                romanized.len(),
+            );
+            llm_result.polished = romanized;
         }
 
         let llm_ms   = llm_start.elapsed().as_millis() as i64;

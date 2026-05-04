@@ -153,9 +153,6 @@ where
     let client = Client::new();
 
     let mut form = reqwest::multipart::Form::new();
-    // Even when the WebSocket path already produced a pre_transcript, still
-    // send the WAV so the backend can persist it for history playback/download.
-    // The backend skips duplicate STT whenever pre_transcript is present.
     if !wav_data.is_empty() {
         form = form.part(
             "audio",
@@ -193,6 +190,87 @@ where
     }
 
     consume_sse(resp.bytes_stream(), on_event).await
+}
+
+/// Stream polish events when the desktop already has a final Deepgram transcript.
+/// This avoids the multipart WAV upload on the latency-critical path; callers can
+/// attach the WAV to the completed recording later with `upload_recording_audio`.
+pub async fn stream_voice_polish_transcript<F>(
+    ep: &BackendEndpoint,
+    transcript: String,
+    target_app: Option<String>,
+    on_event: F,
+) -> Result<PolishDone, String>
+where
+    F: FnMut(PolishEvent),
+{
+    let url = format!("{}/v1/voice/polish-transcript", ep.url);
+    let client = Client::new();
+    let body = serde_json::json!({
+        "transcript": transcript,
+        "target_app": target_app,
+    });
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", ep.bearer())
+        .header("Accept", "text/event-stream")
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| format!("voice polish transcript request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "voice/polish-transcript error {status}: {}",
+            &body[..body.len().min(300)]
+        ));
+    }
+
+    consume_sse(resp.bytes_stream(), on_event).await
+}
+
+pub async fn upload_recording_audio(
+    ep: &BackendEndpoint,
+    recording_id: &str,
+    wav_data: Vec<u8>,
+) -> Result<(), String> {
+    if wav_data.is_empty() {
+        return Ok(());
+    }
+
+    let url = format!("{}/v1/recordings/{}/audio", ep.url, recording_id);
+    let client = Client::new();
+    let form = reqwest::multipart::Form::new().part(
+        "audio",
+        reqwest::multipart::Part::bytes(wav_data)
+            .file_name("recording.wav")
+            .mime_str("audio/wav")
+            .map_err(|e| format!("mime error: {e}"))?,
+    );
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", ep.bearer())
+        .multipart(form)
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+        .await
+        .map_err(|e| format!("recording audio upload failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "recording audio upload error {status}: {}",
+            &body[..body.len().min(300)]
+        ));
+    }
+
+    Ok(())
 }
 
 /// Stream polish events for plain text.
@@ -789,8 +867,8 @@ pub struct ClassifyEditResponse {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CaptureMeta {
     pub time_since_paste_ms: u64,
-    pub app_switched:        bool,
-    pub matches_clipboard:   bool,
+    pub app_switched: bool,
+    pub matches_clipboard: bool,
 }
 
 pub async fn classify_edit(
@@ -799,7 +877,7 @@ pub async fn classify_edit(
     ai_output: &str,
     user_kept: &str,
     capture_method: &str,
-    capture_meta:   CaptureMeta,
+    capture_meta: CaptureMeta,
 ) -> Result<ClassifyEditResponse, String> {
     let url = format!("{}/v1/classify-edit", ep.url);
     let body = serde_json::json!({
@@ -840,13 +918,14 @@ pub async fn get_vocabulary_terms(ep: &BackendEndpoint) -> Result<Vec<String>, S
 /// Devanagari into English mode (or vice versa).  `None` returns the
 /// language-agnostic top-N (legacy behaviour).
 pub async fn get_vocabulary_terms_for_language(
-    ep:       &BackendEndpoint,
+    ep: &BackendEndpoint,
     language: Option<&str>,
 ) -> Result<Vec<String>, String> {
     let url = match language {
         Some(lang) if !lang.trim().is_empty() => format!(
             "{}/v1/vocabulary/terms?language={}",
-            ep.url, urlencoding_encode(lang),
+            ep.url,
+            urlencoding_encode(lang),
         ),
         _ => format!("{}/v1/vocabulary/terms", ep.url),
     };

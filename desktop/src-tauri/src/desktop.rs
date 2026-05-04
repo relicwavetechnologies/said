@@ -6,7 +6,7 @@
 
 use std::time::Instant;
 
-use voice_polish_core::{all_modes, AppSnapshot, ProcessSummary};
+use voice_polish_core::{AppSnapshot, ProcessSummary, all_modes};
 use voice_polish_paster::is_accessibility_granted;
 use voice_polish_recorder::{AudioRecorder, ChunkReceiver, LevelReceiver};
 
@@ -18,13 +18,17 @@ use crate::permissions;
 // ── State machine ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum AppState { Idle, Recording, Processing }
+pub enum AppState {
+    Idle,
+    Recording,
+    Processing,
+}
 
 impl AppState {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Idle       => "idle",
-            Self::Recording  => "recording",
+            Self::Idle => "idle",
+            Self::Recording => "recording",
             Self::Processing => "processing",
         }
     }
@@ -33,20 +37,20 @@ impl AppState {
 // ── DesktopApp ────────────────────────────────────────────────────────────────
 
 pub struct DesktopApp {
-    pub state:             AppState,
-    pub recorder:          AudioRecorder,
-    pub last_result:       Option<ProcessSummary>,
-    pub last_error:        Option<String>,
+    pub state: AppState,
+    pub recorder: AudioRecorder,
+    pub last_result: Option<ProcessSummary>,
+    pub last_error: Option<String>,
     pub recording_started: Option<Instant>,
 }
 
 impl DesktopApp {
     pub fn new() -> Self {
         Self {
-            state:             AppState::Idle,
-            recorder:          AudioRecorder::new(),
-            last_result:       None,
-            last_error:        None,
+            state: AppState::Idle,
+            recorder: AudioRecorder::new(),
+            last_result: None,
+            last_error: None,
             recording_started: None,
         }
     }
@@ -56,26 +60,26 @@ impl DesktopApp {
     /// Mode is always "mini" — model switching has been removed.
     pub fn snapshot(&self) -> AppSnapshot {
         AppSnapshot {
-            state:                    self.state.as_str().to_string(),
-            platform:                 std::env::consts::OS.to_string(),
-            current_mode:             "mini",
-            current_mode_label:       "Fast (gpt-5.4-mini)",
-            current_model:            "gpt-5.4-mini",
-            auto_paste_supported:     cfg!(target_os = "macos"),
-            accessibility_granted:    is_accessibility_granted(),
-            microphone_granted:       permissions::microphone_granted(),
+            state: self.state.as_str().to_string(),
+            platform: std::env::consts::OS.to_string(),
+            current_mode: "mini",
+            current_mode_label: "Fast (gpt-5.4-mini)",
+            current_model: "gpt-5.4-mini",
+            auto_paste_supported: cfg!(target_os = "macos"),
+            accessibility_granted: is_accessibility_granted(),
+            microphone_granted: permissions::microphone_granted(),
             #[cfg(target_os = "macos")]
             input_monitoring_granted: is_input_monitoring_granted(),
             #[cfg(not(target_os = "macos"))]
             input_monitoring_granted: false,
             screen_recording_granted: permissions::screen_recording_granted(),
-            modes:       all_modes().to_vec(),
+            modes: all_modes().to_vec(),
             last_result: self.last_result.clone(),
-            last_error:  self.last_error.clone(),
-            history:     vec![],
+            last_error: self.last_error.clone(),
+            history: vec![],
             total_words: 0,
             daily_streak: 0,
-            avg_wpm:     0,
+            avg_wpm: 0,
         }
     }
 
@@ -95,8 +99,8 @@ impl DesktopApp {
             return Err("still processing previous recording".into());
         }
         self.recorder.start()?;
-        self.state             = AppState::Recording;
-        self.last_error        = None;
+        self.state = AppState::Recording;
+        self.last_error = None;
         self.recording_started = Some(Instant::now());
         Ok(self.snapshot())
     }
@@ -116,14 +120,14 @@ impl DesktopApp {
     }
 
     pub fn finish_ok(&mut self, result: ProcessSummary) -> AppSnapshot {
-        self.state       = AppState::Idle;
+        self.state = AppState::Idle;
         self.last_result = Some(result);
-        self.last_error  = None;
+        self.last_error = None;
         self.snapshot()
     }
 
     pub fn finish_err(&mut self, err: String) -> AppSnapshot {
-        self.state      = AppState::Idle;
+        self.state = AppState::Idle;
         self.last_error = Some(err);
         self.snapshot()
     }

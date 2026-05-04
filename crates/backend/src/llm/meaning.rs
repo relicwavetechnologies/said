@@ -25,9 +25,9 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::{info, warn};
 
-const GROQ_ENDPOINT:   &str = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions";
 const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
-const MEANING_MODEL:   &str = "llama-3.1-8b-instant";
+const MEANING_MODEL: &str = "llama-3.1-8b-instant";
 /// Used only when Groq is unreachable. gpt-4.1-nano is the smallest, cheapest
 /// OpenAI chat model — comparable cost to Groq and ~150–300 ms latency.
 const OPENAI_FALLBACK_MODEL: &str = "gpt-4.1-nano";
@@ -46,11 +46,11 @@ const MAX_MEANING_CHARS: usize = 280;
 ///
 /// The caller persists the result via `vocabulary::update_meaning()`.
 pub async fn generate_initial(
-    client:      &Client,
-    groq_key:    &str,
-    openai_key:  &str,
-    term:        &str,
-    example:     &str,
+    client: &Client,
+    groq_key: &str,
+    openai_key: &str,
+    term: &str,
+    example: &str,
 ) -> Option<String> {
     let user_message = format!(
         "TERM: {term}\n\
@@ -69,12 +69,12 @@ pub async fn generate_initial(
 /// on new contexts. This handles term-meaning evolution as the user uses the
 /// term in more diverse situations over time.
 pub async fn refine(
-    client:           &Client,
-    groq_key:         &str,
-    openai_key:       &str,
-    term:             &str,
-    current_meaning:  &str,
-    examples:         &[String],
+    client: &Client,
+    groq_key: &str,
+    openai_key: &str,
+    term: &str,
+    current_meaning: &str,
+    examples: &[String],
 ) -> Option<String> {
     if examples.is_empty() {
         return Some(current_meaning.to_string());
@@ -124,16 +124,23 @@ around the answer.";
 /// `term` is included for diagnostic logging so we can tell which provider
 /// served which term.
 async fn call_with_fallback(
-    client:      &Client,
-    groq_key:    &str,
-    openai_key:  &str,
+    client: &Client,
+    groq_key: &str,
+    openai_key: &str,
     user_message: &str,
-    term:        &str,
+    term: &str,
 ) -> Option<String> {
     if !groq_key.is_empty() {
         if let Some(text) = call_chat_completions(
-            client, GROQ_ENDPOINT, groq_key, MEANING_MODEL, user_message, "groq",
-        ).await {
+            client,
+            GROQ_ENDPOINT,
+            groq_key,
+            MEANING_MODEL,
+            user_message,
+            "groq",
+        )
+        .await
+        {
             info!("[meaning] {term:?} ← groq");
             return Some(text);
         }
@@ -141,8 +148,15 @@ async fn call_with_fallback(
     }
     if !openai_key.is_empty() {
         if let Some(text) = call_chat_completions(
-            client, OPENAI_ENDPOINT, openai_key, OPENAI_FALLBACK_MODEL, user_message, "openai",
-        ).await {
+            client,
+            OPENAI_ENDPOINT,
+            openai_key,
+            OPENAI_FALLBACK_MODEL,
+            user_message,
+            "openai",
+        )
+        .await
+        {
             info!("[meaning] {term:?} ← openai (fallback)");
             return Some(text);
         }
@@ -156,12 +170,12 @@ async fn call_with_fallback(
 /// Standard OpenAI-compatible Chat Completions call — works for both Groq
 /// and OpenAI since Groq exposes the OpenAI-compatible endpoint shape.
 async fn call_chat_completions(
-    client:        &Client,
-    endpoint:      &str,
-    api_key:       &str,
-    model:         &str,
-    user_message:  &str,
-    provider_tag:  &str,
+    client: &Client,
+    endpoint: &str,
+    api_key: &str,
+    model: &str,
+    user_message: &str,
+    provider_tag: &str,
 ) -> Option<String> {
     let body = json!({
         "model":       model,
@@ -203,7 +217,9 @@ async fn call_chat_completions(
             return None;
         }
     };
-    let content = parsed.choices.first()
+    let content = parsed
+        .choices
+        .first()
         .map(|c| c.message.content.trim().to_string())
         .unwrap_or_default();
 
@@ -220,7 +236,8 @@ async fn call_chat_completions(
 
     info!(
         "[meaning] {provider_tag} generated in {}ms ({} chars)",
-        t0.elapsed().as_millis(), capped.len(),
+        t0.elapsed().as_millis(),
+        capped.len(),
     );
     Some(capped)
 }

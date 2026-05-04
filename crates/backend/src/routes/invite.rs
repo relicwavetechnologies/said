@@ -24,10 +24,10 @@
 //! back to opening the user's mail app via `mailto:`.
 
 /// Build-time key (baked in if RESEND_API_KEY was set during `cargo build`).
-const BUILD_TIME_KEY:  Option<&str> = option_env!("RESEND_API_KEY");
+const BUILD_TIME_KEY: Option<&str> = option_env!("RESEND_API_KEY");
 const BUILD_TIME_FROM: Option<&str> = option_env!("RESEND_FROM");
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{Json, extract::State, http::StatusCode};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::{info, warn};
@@ -58,23 +58,32 @@ const BODY_HTML: &str = "\
 
 pub async fn send(
     State(state): State<AppState>,
-    Json(body):   Json<InviteBody>,
+    Json(body): Json<InviteBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let to = body.to.trim();
     if to.is_empty() || !to.contains('@') {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid_email" })));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_email" })),
+        );
     }
 
     // Runtime env wins; otherwise fall back to the build-time bake.
     let api_key = std::env::var("RESEND_API_KEY")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| BUILD_TIME_KEY.map(str::to_string).filter(|s| !s.trim().is_empty()));
+        .or_else(|| {
+            BUILD_TIME_KEY
+                .map(str::to_string)
+                .filter(|s| !s.trim().is_empty())
+        });
 
     let api_key = match api_key {
         Some(k) => k,
         None => {
-            warn!("[invite] no RESEND_API_KEY (build-time or runtime) — returning email_not_configured");
+            warn!(
+                "[invite] no RESEND_API_KEY (build-time or runtime) — returning email_not_configured"
+            );
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({ "error": "email_not_configured" })),
@@ -85,7 +94,11 @@ pub async fn send(
     let from = std::env::var("RESEND_FROM")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| BUILD_TIME_FROM.map(str::to_string).filter(|s| !s.trim().is_empty()))
+        .or_else(|| {
+            BUILD_TIME_FROM
+                .map(str::to_string)
+                .filter(|s| !s.trim().is_empty())
+        })
         .unwrap_or_else(|| "Said <onboarding@resend.dev>".into());
 
     let payload = json!({
@@ -96,7 +109,8 @@ pub async fn send(
         "html":    BODY_HTML,
     });
 
-    let resp = state.http_client
+    let resp = state
+        .http_client
         .post("https://api.resend.com/emails")
         .bearer_auth(&api_key)
         .json(&payload)
@@ -110,7 +124,7 @@ pub async fn send(
         }
         Ok(r) => {
             let status = r.status();
-            let text   = r.text().await.unwrap_or_default();
+            let text = r.text().await.unwrap_or_default();
             warn!("[invite] resend error {status}: {text}");
             (
                 StatusCode::BAD_GATEWAY,

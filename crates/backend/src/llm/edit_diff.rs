@@ -33,10 +33,10 @@ pub struct Hunk {
     pub transcript_window: String,
     /// What the polish step produced for this region.  Empty for pure
     /// insertions (user added words that were never in the polish).
-    pub polish_window:     String,
+    pub polish_window: String,
     /// What the user actually kept for this region.  Empty for pure
     /// deletions (user removed words that were in the polish).
-    pub kept_window:       String,
+    pub kept_window: String,
 }
 
 /// Compute the structural diff.  Returns at most a few hunks for typical
@@ -89,42 +89,46 @@ pub fn diff(transcript: &str, polish: &str, user_kept: &str) -> Vec<Hunk> {
     let mut hunks: Vec<Hunk> = Vec::new();
     let mut polish_offset = 0_usize;
     let mut current_polish: Vec<String> = Vec::new();
-    let mut current_kept:   Vec<String> = Vec::new();
+    let mut current_kept: Vec<String> = Vec::new();
     let mut hunk_polish_start = 0_usize;
 
-    let flush =
-        |hunks:       &mut Vec<Hunk>,
-         current_polish: &mut Vec<String>,
-         current_kept:   &mut Vec<String>,
-         hunk_polish_start: usize,
-         polish_offset: usize,
-         t_tokens: &[&str],
-         positional_align: bool| {
-            if current_polish.is_empty() && current_kept.is_empty() {
-                return;
-            }
-            let polish_window = current_polish.join(" ");
-            let kept_window   = current_kept.join(" ");
-            let transcript_window = if positional_align {
-                t_tokens[hunk_polish_start..polish_offset].join(" ")
-            } else {
-                String::new() // unaligned — let the LLM see it as missing
-            };
-            hunks.push(Hunk {
-                transcript_window,
-                polish_window,
-                kept_window,
-            });
-            current_polish.clear();
-            current_kept.clear();
+    let flush = |hunks: &mut Vec<Hunk>,
+                 current_polish: &mut Vec<String>,
+                 current_kept: &mut Vec<String>,
+                 hunk_polish_start: usize,
+                 polish_offset: usize,
+                 t_tokens: &[&str],
+                 positional_align: bool| {
+        if current_polish.is_empty() && current_kept.is_empty() {
+            return;
+        }
+        let polish_window = current_polish.join(" ");
+        let kept_window = current_kept.join(" ");
+        let transcript_window = if positional_align {
+            t_tokens[hunk_polish_start..polish_offset].join(" ")
+        } else {
+            String::new() // unaligned — let the LLM see it as missing
         };
+        hunks.push(Hunk {
+            transcript_window,
+            polish_window,
+            kept_window,
+        });
+        current_polish.clear();
+        current_kept.clear();
+    };
 
     for op in &ops {
         match op {
             Op::Equal(_) => {
                 flush(
-                    &mut hunks, &mut current_polish, &mut current_kept,
-                    hunk_polish_start, polish_offset, &t_tokens, positional_align,
+                    &mut hunks,
+                    &mut current_polish,
+                    &mut current_kept,
+                    hunk_polish_start,
+                    polish_offset,
+                    &t_tokens,
+                    positional_align,
                 );
                 polish_offset += 1;
                 hunk_polish_start = polish_offset;
@@ -145,8 +149,13 @@ pub fn diff(transcript: &str, polish: &str, user_kept: &str) -> Vec<Hunk> {
         }
     }
     flush(
-        &mut hunks, &mut current_polish, &mut current_kept,
-        hunk_polish_start, polish_offset, &t_tokens, positional_align,
+        &mut hunks,
+        &mut current_polish,
+        &mut current_kept,
+        hunk_polish_start,
+        polish_offset,
+        &t_tokens,
+        positional_align,
     );
 
     hunks
@@ -156,8 +165,8 @@ pub fn diff(transcript: &str, polish: &str, user_kept: &str) -> Vec<Hunk> {
 #[derive(Debug)]
 enum Op {
     Equal(String),
-    Delete(String),  // present in polish, absent in user_kept
-    Insert(String),  // absent from polish, present in user_kept
+    Delete(String), // present in polish, absent in user_kept
+    Insert(String), // absent from polish, present in user_kept
 }
 
 #[cfg(test)]
@@ -180,7 +189,7 @@ mod tests {
         );
         assert_eq!(hunks.len(), 1);
         assert_eq!(hunks[0].polish_window, "written");
-        assert_eq!(hunks[0].kept_window,   "n8n");
+        assert_eq!(hunks[0].kept_window, "n8n");
         assert_eq!(hunks[0].transcript_window, "written");
     }
 
@@ -188,8 +197,9 @@ mod tests {
     fn pure_prefix_insertion_yields_one_hunk_with_empty_polish() {
         // The email-link bug case: user added a markdown link before the polish.
         let polish = "Anish at Gmail dot com ka zara batana";
-        let kept   = "[anish@gmail.com](mailto:anish@gmail.com) Anish at Gmail dot com ka zara batana";
-        let hunks  = diff(polish, polish, kept);
+        let kept =
+            "[anish@gmail.com](mailto:anish@gmail.com) Anish at Gmail dot com ka zara batana";
+        let hunks = diff(polish, polish, kept);
         assert_eq!(hunks.len(), 1, "should produce exactly one insertion hunk");
         assert_eq!(hunks[0].polish_window, "");
         assert!(hunks[0].kept_window.starts_with("["));
@@ -204,14 +214,14 @@ mod tests {
         let hunks = diff("hello big world", "hello big world", "hello world");
         assert_eq!(hunks.len(), 1);
         assert_eq!(hunks[0].polish_window, "big");
-        assert_eq!(hunks[0].kept_window,   "");
+        assert_eq!(hunks[0].kept_window, "");
     }
 
     #[test]
     fn multiple_separated_substitutions_produce_multiple_hunks() {
         let polish = "the quick brown fox jumps";
-        let kept   = "a quick red fox runs";
-        let hunks  = diff(polish, polish, kept);
+        let kept = "a quick red fox runs";
+        let hunks = diff(polish, polish, kept);
         assert!(hunks.len() >= 2, "expected multiple hunks, got: {hunks:?}");
     }
 
@@ -233,9 +243,9 @@ mod tests {
         // candidates can ONLY come from the texts themselves, so the bad
         // candidates are unreachable by construction.
         let transcript = "Anish at Gmail dot com ka zara batana kaun sa mail ID par bhejna hai";
-        let polish     = "Anish at Gmail dot com ka zara batana kaun sa mail ID par bhejna hai";
-        let kept       = "[anish@gmail.com](mailto:anish@gmail.com) Anish at Gmail dot com ka zara batana kaun sa mail ID par bhejna hai";
-        let hunks      = diff(transcript, polish, kept);
+        let polish = "Anish at Gmail dot com ka zara batana kaun sa mail ID par bhejna hai";
+        let kept = "[anish@gmail.com](mailto:anish@gmail.com) Anish at Gmail dot com ka zara batana kaun sa mail ID par bhejna hai";
+        let hunks = diff(transcript, polish, kept);
         for h in &hunks {
             assert!(!h.kept_window.contains("अनीष"));
             assert!(!h.kept_window.contains("का"));

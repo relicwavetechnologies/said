@@ -26,7 +26,7 @@
 use rusqlite::params;
 use tracing::info;
 
-use super::{now_ms, DbPool};
+use super::{DbPool, now_ms};
 use crate::llm::phonetics;
 
 /// Default k.  Lower = faster learning + more false positives.  Higher =
@@ -52,12 +52,12 @@ pub enum PromotionDecision {
 /// phonetic key for the same correct_form, we treat it as a different
 /// term entirely — overwrite the row at count = 1.
 pub fn record_sighting(
-    pool:            &DbPool,
-    user_id:         &str,
-    correct_form:    &str,
+    pool: &DbPool,
+    user_id: &str,
+    correct_form: &str,
     transcript_form: &str,
     output_language: &str,
-    k:               i64,
+    k: i64,
 ) -> Option<PromotionDecision> {
     let conn = pool.get().ok()?;
     let correct = correct_form.trim();
@@ -85,8 +85,16 @@ pub fn record_sighting(
                    (user_id, correct_form, transcript_form, phonetic_key,
                     output_language, sighting_count, first_seen, last_seen)
                  VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6)",
-                params![user_id, correct, transcript_form.trim(), phon_key, output_language, now],
-            ).ok()?;
+                params![
+                    user_id,
+                    correct,
+                    transcript_form.trim(),
+                    phon_key,
+                    output_language,
+                    now
+                ],
+            )
+            .ok()?;
             (1_i64, false)
         }
         Some((count, existing_key)) if existing_key == phon_key => {
@@ -95,8 +103,16 @@ pub fn record_sighting(
                 "UPDATE pending_promotions
                     SET sighting_count = ?4, last_seen = ?5, transcript_form = ?6
                   WHERE user_id = ?1 AND correct_form = ?2 AND output_language = ?3",
-                params![user_id, correct, output_language, next, now, transcript_form.trim()],
-            ).ok()?;
+                params![
+                    user_id,
+                    correct,
+                    output_language,
+                    next,
+                    now,
+                    transcript_form.trim()
+                ],
+            )
+            .ok()?;
             (next, false)
         }
         Some((_count, _other_key)) => {
@@ -106,16 +122,29 @@ pub fn record_sighting(
                     SET sighting_count = 1, first_seen = ?5, last_seen = ?5,
                         transcript_form = ?6, phonetic_key = ?7
                   WHERE user_id = ?1 AND correct_form = ?2 AND output_language = ?3",
-                params![user_id, correct, output_language, /*placeholder*/ 0, now, transcript_form.trim(), phon_key],
-            ).ok()?;
+                params![
+                    user_id,
+                    correct,
+                    output_language,
+                    /*placeholder*/ 0,
+                    now,
+                    transcript_form.trim(),
+                    phon_key
+                ],
+            )
+            .ok()?;
             (1_i64, true)
         }
     };
 
     let decision = if new_count >= k {
-        PromotionDecision::Promote { sighting_count: new_count }
+        PromotionDecision::Promote {
+            sighting_count: new_count,
+        }
     } else {
-        PromotionDecision::Pending { sighting_count: new_count }
+        PromotionDecision::Pending {
+            sighting_count: new_count,
+        }
     };
     info!(
         "[pending-promo] sighting term={correct:?} lang={output_language:?} count={new_count} reset={was_reset} k={k} → {decision:?}",
@@ -125,7 +154,9 @@ pub fn record_sighting(
 
 /// Drop the pending row after a successful promotion.  Idempotent.
 pub fn delete(pool: &DbPool, user_id: &str, correct_form: &str, output_language: &str) {
-    let Ok(conn) = pool.get() else { return; };
+    let Ok(conn) = pool.get() else {
+        return;
+    };
     let _ = conn.execute(
         "DELETE FROM pending_promotions
           WHERE user_id = ?1 AND correct_form = ?2 AND output_language = ?3",
@@ -138,24 +169,30 @@ pub fn delete(pool: &DbPool, user_id: &str, correct_form: &str, output_language:
 /// any queued promotion sightings for it should die too — otherwise a
 /// future K-event tick could resurrect the deleted term silently.
 pub fn delete_all_for_term(pool: &DbPool, user_id: &str, correct_form: &str) -> usize {
-    let Ok(conn) = pool.get() else { return 0; };
+    let Ok(conn) = pool.get() else {
+        return 0;
+    };
     conn.execute(
         "DELETE FROM pending_promotions
           WHERE user_id = ?1 AND correct_form = ?2",
         params![user_id, correct_form.trim()],
-    ).unwrap_or(0)
+    )
+    .unwrap_or(0)
 }
 
 /// Aging: drop pending rows older than `max_age_ms` (e.g. 30 days).  Called
 /// periodically by the route or a background tick.
 pub fn prune_stale(pool: &DbPool, user_id: &str, max_age_ms: i64) -> usize {
-    let Ok(conn) = pool.get() else { return 0; };
+    let Ok(conn) = pool.get() else {
+        return 0;
+    };
     let cutoff = now_ms() - max_age_ms;
     conn.execute(
         "DELETE FROM pending_promotions
           WHERE user_id = ?1 AND last_seen < ?2",
         params![user_id, cutoff],
-    ).unwrap_or(0)
+    )
+    .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -164,7 +201,7 @@ mod tests {
     use r2d2_sqlite::SqliteConnectionManager;
 
     fn mem_pool() -> DbPool {
-        let mgr  = SqliteConnectionManager::memory();
+        let mgr = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(mgr).unwrap();
         let conn = pool.get().unwrap();
         conn.execute_batch(
@@ -180,8 +217,9 @@ mod tests {
                  first_seen       INTEGER NOT NULL,
                  last_seen        INTEGER NOT NULL,
                  UNIQUE(user_id, correct_form, output_language)
-             );"
-        ).unwrap();
+             );",
+        )
+        .unwrap();
         pool
     }
 
@@ -235,9 +273,9 @@ mod tests {
         // otherwise a later K-event in any locale could resurrect the
         // deleted term silently.
         let p = mem_pool();
-        record_sighting(&p, "u1", "MACOBS", "main corps", "english",  2).unwrap();
+        record_sighting(&p, "u1", "MACOBS", "main corps", "english", 2).unwrap();
         record_sighting(&p, "u1", "MACOBS", "main corps", "hinglish", 2).unwrap();
-        record_sighting(&p, "u1", "OTHER",  "uthhrr",     "english",  2).unwrap();
+        record_sighting(&p, "u1", "OTHER", "uthhrr", "english", 2).unwrap();
 
         let n = delete_all_for_term(&p, "u1", "MACOBS");
         assert_eq!(n, 2, "both MACOBS rows (english + hinglish) removed");
@@ -247,8 +285,11 @@ mod tests {
         assert_eq!(d, PromotionDecision::Pending { sighting_count: 1 });
         // Unrelated term is untouched.
         let d2 = record_sighting(&p, "u1", "OTHER", "uthhrr", "english", 2).unwrap();
-        assert_eq!(d2, PromotionDecision::Promote { sighting_count: 2 },
-                   "unrelated pending row must survive");
+        assert_eq!(
+            d2,
+            PromotionDecision::Promote { sighting_count: 2 },
+            "unrelated pending row must survive"
+        );
     }
 
     #[test]
@@ -256,10 +297,13 @@ mod tests {
         let p = mem_pool();
         record_sighting(&p, "u1", "ancient", "old", "english", 2).unwrap();
         // Manually backdate the row past the cutoff.
-        p.get().unwrap().execute(
-            "UPDATE pending_promotions SET last_seen = 0 WHERE correct_form = 'ancient'",
-            params![],
-        ).unwrap();
+        p.get()
+            .unwrap()
+            .execute(
+                "UPDATE pending_promotions SET last_seen = 0 WHERE correct_form = 'ancient'",
+                params![],
+            )
+            .unwrap();
         let pruned = prune_stale(&p, "u1", 1000);
         assert_eq!(pruned, 1);
     }

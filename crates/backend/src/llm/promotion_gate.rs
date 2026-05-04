@@ -60,8 +60,8 @@ pub fn script_matches(term: &str, output_language: &str) -> bool {
 
     match output_language {
         "english" | "hinglish" => all_ascii,
-        "hindi"                => any_devanagari || all_ascii, // Hindi mode tolerates either
-        _                      => true,                        // custom / unknown — allow
+        "hindi" => any_devanagari || all_ascii, // Hindi mode tolerates either
+        _ => true,                              // custom / unknown — allow
     }
 }
 
@@ -88,12 +88,12 @@ pub fn script_matches(term: &str, output_language: &str) -> bool {
 ///   • the extra-char count is < 3 (typo / minor extension, not concatenation)
 pub fn is_concatenation_pattern(polish: &str, kept: &str) -> bool {
     let polish = polish.trim();
-    let kept   = kept.trim();
+    let kept = kept.trim();
     if polish.is_empty() || kept.is_empty() || polish == kept {
         return false;
     }
     let polish_chars = polish.chars().count();
-    let kept_chars   = kept.chars().count();
+    let kept_chars = kept.chars().count();
     if polish_chars < 3 || kept_chars <= polish_chars {
         return false;
     }
@@ -127,7 +127,7 @@ pub fn is_concatenation_pattern(polish: &str, kept: &str) -> bool {
 /// classifier hallucinated word-level "corrections".
 pub fn looks_like_user_addition(polish: &str, user_kept: &str) -> bool {
     let polish_trim = polish.trim();
-    let kept_trim   = user_kept.trim();
+    let kept_trim = user_kept.trim();
 
     let p_len = polish_trim.chars().count();
     let k_len = kept_trim.chars().count();
@@ -174,70 +174,78 @@ mod tests {
 
     #[test]
     fn appears_handles_punctuation_boundaries() {
-        assert!(appears_in_user_kept("n8n", "Use [n8n](https://n8n.io) today."));
+        assert!(appears_in_user_kept(
+            "n8n",
+            "Use [n8n](https://n8n.io) today."
+        ));
     }
 
     #[test]
     fn appears_rejects_hallucinated_devanagari() {
         // The bug case: the LLM proposed "अनीष" but user_kept is all Roman.
         assert!(!appears_in_user_kept("अनीष", "Anish at Gmail dot com"));
-        assert!(!appears_in_user_kept("का",   "Anish at Gmail dot com ka zara batana"));
+        assert!(!appears_in_user_kept(
+            "का",
+            "Anish at Gmail dot com ka zara batana"
+        ));
     }
 
     // ── script_matches ────────────────────────────────────────────────────────
     #[test]
     fn script_blocks_devanagari_in_hinglish_mode() {
-        assert!(!script_matches("अनीष",  "hinglish"));
-        assert!(!script_matches("का",    "hinglish"));
-        assert!(!script_matches("ज़रा",  "english"));
+        assert!(!script_matches("अनीष", "hinglish"));
+        assert!(!script_matches("का", "hinglish"));
+        assert!(!script_matches("ज़रा", "english"));
     }
 
     #[test]
     fn script_allows_roman_in_hinglish_mode() {
-        assert!(script_matches("n8n",     "hinglish"));
-        assert!(script_matches("Vipassana","hinglish"));
-        assert!(script_matches("kaam",    "hinglish"));
+        assert!(script_matches("n8n", "hinglish"));
+        assert!(script_matches("Vipassana", "hinglish"));
+        assert!(script_matches("kaam", "hinglish"));
     }
 
     #[test]
     fn script_allows_devanagari_in_hindi_mode() {
         assert!(script_matches("अनीष", "hindi"));
-        assert!(script_matches("kaam", "hindi"));   // Hindi mode tolerates Roman jargon
+        assert!(script_matches("kaam", "hindi")); // Hindi mode tolerates Roman jargon
     }
 
     #[test]
     fn script_neutral_for_pure_digits() {
-        assert!(script_matches("123",    "hinglish"));
-        assert!(script_matches("v2.0",   "english"));
+        assert!(script_matches("123", "hinglish"));
+        assert!(script_matches("v2.0", "english"));
     }
 
     // ── looks_like_user_addition ──────────────────────────────────────────────
     #[test]
     fn user_addition_catches_markdown_link_prefix() {
-        let polish    = "Anish at Gmail dot com ka zara batana kaun sa mail ID par bhejna hai";
+        let polish = "Anish at Gmail dot com ka zara batana kaun sa mail ID par bhejna hai";
         let user_kept = "[anish@gmail.com](mailto:anish@gmail.com) Anish at Gmail dot com ka zara batana kaun sa mail ID par bhejna hai";
-        assert!(looks_like_user_addition(polish, user_kept),
-                "markdown link prefix must be detected as user addition");
+        assert!(
+            looks_like_user_addition(polish, user_kept),
+            "markdown link prefix must be detected as user addition"
+        );
     }
 
     #[test]
     fn user_addition_ignores_in_place_word_swap() {
         // Same length, words just swapped — a real correction.
-        let polish    = "I use written for automation";
+        let polish = "I use written for automation";
         let user_kept = "I use n8n     for automation";
         assert!(!looks_like_user_addition(polish, user_kept));
     }
 
     #[test]
     fn user_addition_catches_full_rewrite() {
-        let polish    = "short";
+        let polish = "short";
         let user_kept = "this is a totally different sentence rewritten from scratch";
         assert!(looks_like_user_addition(polish, user_kept));
     }
 
     #[test]
     fn user_addition_tolerates_small_typo_fix() {
-        let polish    = "the meeting was good";
+        let polish = "the meeting was good";
         let user_kept = "the meeting was great";
         assert!(!looks_like_user_addition(polish, user_kept));
     }
@@ -271,20 +279,20 @@ mod tests {
     fn concatenation_ignored_for_clean_swap() {
         // Genuine STT correction — n8n is NOT a substring of written.
         assert!(!is_concatenation_pattern("written", "n8n"));
-        assert!(!is_concatenation_pattern("Anis",    "anish"));
+        assert!(!is_concatenation_pattern("Anis", "anish"));
     }
 
     #[test]
     fn concatenation_ignored_when_polish_too_short() {
         // 1-2 char polish forms make false positives trivial — skip.
         assert!(!is_concatenation_pattern("ai", "aiden"));
-        assert!(!is_concatenation_pattern("a",  "anish"));
+        assert!(!is_concatenation_pattern("a", "anish"));
     }
 
     #[test]
     fn concatenation_ignored_when_equal() {
         assert!(!is_concatenation_pattern("hello", "hello"));
-        assert!(!is_concatenation_pattern("",      ""));
+        assert!(!is_concatenation_pattern("", ""));
     }
 
     #[test]

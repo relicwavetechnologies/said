@@ -42,12 +42,12 @@ pub use super::PolishResult;
 ///
 /// Drop-in replacement for `gateway::stream_polish` — same signature.
 pub async fn stream_polish(
-    client:        &Client,
-    api_key:       &str,
-    model:         &str,
+    client: &Client,
+    api_key: &str,
+    model: &str,
     system_prompt: &str,
-    user_message:  &str,
-    token_tx:      mpsc::Sender<String>,
+    user_message: &str,
+    token_tx: mpsc::Sender<String>,
 ) -> Result<PolishResult, String> {
     info!(
         "[gemini_direct] ┌──── REQUEST → {} ────────────────────────────",
@@ -87,27 +87,31 @@ pub async fn stream_polish(
         ));
     }
 
-    let mut stream   = resp.bytes_stream();
+    let mut stream = resp.bytes_stream();
     let mut polished = String::new();
-    let mut buf      = String::new();
+    let mut buf = String::new();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("stream read error: {e}"))?;
-        let text  = String::from_utf8_lossy(&chunk);
+        let text = String::from_utf8_lossy(&chunk);
         buf.push_str(&text);
 
         while let Some(newline_pos) = buf.find('\n') {
             let line = buf[..newline_pos].trim().to_string();
             buf = buf[newline_pos + 1..].to_string();
 
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
 
             let data = match line.strip_prefix("data: ") {
                 Some(d) => d.trim(),
-                None    => continue,
+                None => continue,
             };
 
-            if data == "[DONE]" { break; }
+            if data == "[DONE]" {
+                break;
+            }
 
             match serde_json::from_str::<StreamChunk>(data) {
                 Ok(chunk) => {
@@ -132,7 +136,13 @@ pub async fn stream_polish(
     }
 
     let polish_ms = start.elapsed().as_millis() as u64;
-    info!("[gemini_direct] finished in {polish_ms}ms, {} chars", polished.len());
+    info!(
+        "[gemini_direct] finished in {polish_ms}ms, {} chars",
+        polished.len()
+    );
 
-    Ok(PolishResult { polished, polish_ms })
+    Ok(PolishResult {
+        polished,
+        polish_ms,
+    })
 }

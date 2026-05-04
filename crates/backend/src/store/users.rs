@@ -5,11 +5,11 @@ use super::DbPool;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalUser {
-    pub id:           String,
-    pub email:        String,
-    pub cloud_token:  Option<String>,
+    pub id: String,
+    pub email: String,
+    pub cloud_token: Option<String>,
     pub license_tier: String,
-    pub created_at:   i64,
+    pub created_at: i64,
 }
 
 pub fn update_cloud_auth(pool: &DbPool, user_id: &str, token: &str, tier: &str) {
@@ -38,11 +38,11 @@ pub fn get_user(pool: &DbPool, user_id: &str) -> Option<LocalUser> {
         params![user_id],
         |row| {
             Ok(LocalUser {
-                id:           row.get(0)?,
-                email:        row.get(1)?,
-                cloud_token:  row.get(2)?,
+                id: row.get(0)?,
+                email: row.get(1)?,
+                cloud_token: row.get(2)?,
                 license_tier: row.get(3)?,
-                created_at:   row.get(4)?,
+                created_at: row.get(4)?,
             })
         },
     )

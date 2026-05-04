@@ -10,6 +10,7 @@ pub mod phonetics;
 pub mod pre_filter;
 pub mod promotion_gate;
 pub mod prompt;
+pub mod script;
 pub mod vocab_resolver;
 
 /// Shared result type returned by all LLM streaming clients.

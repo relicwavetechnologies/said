@@ -37,12 +37,12 @@ pub use super::PolishResult;
 /// Each token is sent on `token_tx` as it arrives.
 /// Returns the final concatenated text + latency.
 pub async fn stream_polish(
-    client:        &Client,
-    api_key:       &str,
-    model:         &str,
+    client: &Client,
+    api_key: &str,
+    model: &str,
     system_prompt: &str,
-    user_message:  &str,
-    token_tx:      mpsc::Sender<String>,
+    user_message: &str,
+    token_tx: mpsc::Sender<String>,
 ) -> Result<PolishResult, String> {
     // ── Debug: dump the full prompt being sent to the LLM ─────────────────────
     info!(
@@ -83,16 +83,19 @@ pub async fn stream_polish(
     let status = resp.status();
     if !status.is_success() {
         let body_text = resp.text().await.unwrap_or_default();
-        return Err(format!("Gateway error {status}: {}", &body_text[..body_text.len().min(300)]));
+        return Err(format!(
+            "Gateway error {status}: {}",
+            &body_text[..body_text.len().min(300)]
+        ));
     }
 
-    let mut stream    = resp.bytes_stream();
-    let mut polished  = String::new();
-    let mut buf       = String::new(); // SSE line buffer
+    let mut stream = resp.bytes_stream();
+    let mut polished = String::new();
+    let mut buf = String::new(); // SSE line buffer
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("stream read error: {e}"))?;
-        let text  = String::from_utf8_lossy(&chunk);
+        let text = String::from_utf8_lossy(&chunk);
         buf.push_str(&text);
 
         // SSE lines are separated by \n; double-\n separates events
@@ -100,15 +103,19 @@ pub async fn stream_polish(
             let line = buf[..newline_pos].trim().to_string();
             buf = buf[newline_pos + 1..].to_string();
 
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
 
             // Strip "data: " prefix
             let data = match line.strip_prefix("data: ") {
                 Some(d) => d.trim(),
-                None    => continue,
+                None => continue,
             };
 
-            if data == "[DONE]" { break; }
+            if data == "[DONE]" {
+                break;
+            }
 
             match serde_json::from_str::<StreamChunk>(data) {
                 Ok(chunk) => {
@@ -136,16 +143,19 @@ pub async fn stream_polish(
     let polish_ms = start.elapsed().as_millis() as u64;
     debug!("[llm] finished in {polish_ms}ms, {} chars", polished.len());
 
-    Ok(PolishResult { polished, polish_ms })
+    Ok(PolishResult {
+        polished,
+        polish_ms,
+    })
 }
 
 /// Non-streaming variant for test/debug use.
 pub async fn polish_blocking(
-    client:        &Client,
-    api_key:       &str,
-    model:         &str,
+    client: &Client,
+    api_key: &str,
+    model: &str,
     system_prompt: &str,
-    user_message:  &str,
+    user_message: &str,
 ) -> Result<String, String> {
     let body = json!({
         "model": model,
@@ -166,11 +176,17 @@ pub async fn polish_blocking(
         .map_err(|e| format!("gateway request failed: {e}"))?;
 
     #[derive(Deserialize)]
-    struct ChatResp { choices: Vec<ChatChoice> }
+    struct ChatResp {
+        choices: Vec<ChatChoice>,
+    }
     #[derive(Deserialize)]
-    struct ChatChoice { message: ChatMsg }
+    struct ChatChoice {
+        message: ChatMsg,
+    }
     #[derive(Deserialize)]
-    struct ChatMsg { content: String }
+    struct ChatMsg {
+        content: String,
+    }
 
     let data: ChatResp = resp
         .json()

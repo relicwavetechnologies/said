@@ -7,37 +7,38 @@
 //! When the full /v1/voice/polish request arrives ~500ms later, the embedding
 //! is already in the SQLite cache → 0ms embed wait instead of 250–300ms.
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{Json, extract::State, http::StatusCode};
 use serde::Deserialize;
 use tracing::{debug, info};
 
-use crate::{embedder::gemini, AppState};
+use crate::{AppState, embedder::gemini};
 
 #[derive(Deserialize)]
 pub struct PreEmbedBody {
     pub text: String,
 }
 
-pub async fn handler(
-    State(state): State<AppState>,
-    Json(body): Json<PreEmbedBody>,
-) -> StatusCode {
+pub async fn handler(State(state): State<AppState>, Json(body): Json<PreEmbedBody>) -> StatusCode {
     let text = body.text.trim().to_string();
     if text.is_empty() {
         return StatusCode::BAD_REQUEST;
     }
 
-    debug!("[pre-embed] received {} chars — spawning background embed", text.len());
+    debug!(
+        "[pre-embed] received {} chars — spawning background embed",
+        text.len()
+    );
 
-    let pool        = state.pool.clone();
+    let pool = state.pool.clone();
     let http_client = state.http_client.clone();
-    let user_id     = state.default_user_id.as_str().to_string();
+    let user_id = state.default_user_id.as_str().to_string();
     let prefs_cache = state.prefs_cache.clone();
 
     // Fire-and-forget — caller gets 202 immediately, embedding stores in SQLite cache.
     tokio::spawn(async move {
         // Use the in-memory prefs cache (30 s TTL) — zero SQLite hits on warm path.
-        let gemini_key = crate::get_prefs_cached(&prefs_cache, &pool, &user_id).await
+        let gemini_key = crate::get_prefs_cached(&prefs_cache, &pool, &user_id)
+            .await
             .and_then(|p| p.gemini_api_key)
             .or_else(|| std::env::var("GEMINI_API_KEY").ok())
             .unwrap_or_default();
@@ -49,8 +50,12 @@ pub async fn handler(
 
         let start = std::time::Instant::now();
         match gemini::embed(&http_client, &pool, &text, &gemini_key).await {
-            Some(_) => info!("[pre-embed] cached in {}ms ({} chars)", start.elapsed().as_millis(), text.len()),
-            None    => debug!("[pre-embed] embed returned None"),
+            Some(_) => info!(
+                "[pre-embed] cached in {}ms ({} chars)",
+                start.elapsed().as_millis(),
+                text.len()
+            ),
+            None => debug!("[pre-embed] embed returned None"),
         }
     });
 

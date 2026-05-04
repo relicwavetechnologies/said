@@ -29,7 +29,7 @@ pub enum PreFilter {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EarlyDecision {
-    pub class:  &'static str,
+    pub class: &'static str,
     pub reason: &'static str,
 }
 
@@ -37,13 +37,9 @@ pub struct EarlyDecision {
 ///
 /// `output_language` is the user's preference (`english | hinglish | hindi |
 /// custom`).  Used for the script-mismatch check.
-pub fn run(
-    polish:          &str,
-    user_kept:       &str,
-    output_language: &str,
-) -> PreFilter {
+pub fn run(polish: &str, user_kept: &str, output_language: &str) -> PreFilter {
     let polish_t = polish.trim();
-    let kept_t   = user_kept.trim();
+    let kept_t = user_kept.trim();
 
     if polish_t == kept_t {
         return PreFilter::Drop;
@@ -55,7 +51,7 @@ pub fn run(
     // Empty polish but non-empty kept → user wrote everything → REWRITE
     if p_chars == 0 {
         return PreFilter::EarlyClass(EarlyDecision {
-            class:  "USER_REWRITE",
+            class: "USER_REWRITE",
             reason: "no polish text — user wrote everything from scratch",
         });
     }
@@ -63,7 +59,7 @@ pub fn run(
     // Big proportional growth → REWRITE shape (added significant content).
     if k_chars as f64 > (p_chars as f64) * 1.4 {
         return PreFilter::EarlyClass(EarlyDecision {
-            class:  "USER_REWRITE",
+            class: "USER_REWRITE",
             reason: "user_kept length > 1.4× polish — large additive change",
         });
     }
@@ -71,7 +67,7 @@ pub fn run(
     // Big absolute growth (markdown link, signature) → REWRITE shape.
     if k_chars > p_chars + 30 {
         return PreFilter::EarlyClass(EarlyDecision {
-            class:  "USER_REWRITE",
+            class: "USER_REWRITE",
             reason: "user_kept exceeds polish by >30 chars — likely added prefix/suffix",
         });
     }
@@ -82,7 +78,7 @@ pub fn run(
         let polish_kept_verbatim = idx > 0 || idx + p_chars < kept_t.len();
         if polish_kept_verbatim && extra_chars > 10 {
             return PreFilter::EarlyClass(EarlyDecision {
-                class:  "USER_REWRITE",
+                class: "USER_REWRITE",
                 reason: "polish kept verbatim with prefix/suffix added (e.g. markdown link)",
             });
         }
@@ -94,7 +90,7 @@ pub fn run(
     // STT/polish error.
     if !script_consistent(kept_t, output_language) {
         return PreFilter::EarlyClass(EarlyDecision {
-            class:  "USER_REPHRASE",
+            class: "USER_REPHRASE",
             reason: "user_kept script does not match output_language preference",
         });
     }
@@ -149,14 +145,17 @@ mod tests {
 
     #[test]
     fn whitespace_only_diff_drops() {
-        assert_eq!(run("hello world", "  hello  world  ", "english"), PreFilter::Drop);
+        assert_eq!(
+            run("hello world", "  hello  world  ", "english"),
+            PreFilter::Drop
+        );
     }
 
     #[test]
     fn email_link_prefix_caught_as_rewrite() {
         // The exact failure case from production logs.
         let polish = "Anish at Gmail dot com ka zara batana kaun sa mail ID par bhejna hai";
-        let kept   = "[anish@gmail.com](mailto:anish@gmail.com) Anish at Gmail dot com ka zara batana kaun sa mail ID par bhejna hai";
+        let kept = "[anish@gmail.com](mailto:anish@gmail.com) Anish at Gmail dot com ka zara batana kaun sa mail ID par bhejna hai";
         let result = run(polish, kept, "hinglish");
         match result {
             PreFilter::EarlyClass(d) => assert_eq!(d.class, "USER_REWRITE"),
@@ -168,9 +167,11 @@ mod tests {
     fn small_in_place_correction_passes_to_classifier() {
         // n8n case must reach the classifier.
         assert_eq!(
-            run("I use written for automation",
+            run(
+                "I use written for automation",
                 "I use n8n for automation",
-                "hinglish"),
+                "hinglish"
+            ),
             PreFilter::Pass,
         );
     }
@@ -179,7 +180,7 @@ mod tests {
     fn devanagari_majority_in_hinglish_mode_is_rephrase() {
         // User overrode polish into Devanagari while their pref is hinglish.
         let polish = "main kal jaunga";
-        let kept   = "मैं कल जाऊंगा";
+        let kept = "मैं कल जाऊंगा";
         let result = run(polish, kept, "hinglish");
         match result {
             PreFilter::EarlyClass(d) => assert_eq!(d.class, "USER_REPHRASE"),
@@ -190,14 +191,14 @@ mod tests {
     #[test]
     fn devanagari_in_hindi_mode_is_pass() {
         let polish = "मैं कल";
-        let kept   = "मैं आज";
+        let kept = "मैं आज";
         assert_eq!(run(polish, kept, "hindi"), PreFilter::Pass);
     }
 
     #[test]
     fn full_rewrite_is_caught() {
         let polish = "short";
-        let kept   = "completely different sentence with much more content than the original short";
+        let kept = "completely different sentence with much more content than the original short";
         match run(polish, kept, "english") {
             PreFilter::EarlyClass(d) => assert_eq!(d.class, "USER_REWRITE"),
             other => panic!("expected USER_REWRITE, got {other:?}"),
@@ -206,6 +207,9 @@ mod tests {
 
     #[test]
     fn typo_fix_passes() {
-        assert_eq!(run("the meeting was good", "the meeting was great", "english"), PreFilter::Pass);
+        assert_eq!(
+            run("the meeting was good", "the meeting was great", "english"),
+            PreFilter::Pass
+        );
     }
 }

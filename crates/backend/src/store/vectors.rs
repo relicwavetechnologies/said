@@ -15,9 +15,9 @@ use crate::{
 
 /// A row fetched from `preference_vectors` + its linked edit event.
 struct VectorRow {
-    embedding:   Vec<f32>,
-    ai_output:   String,
-    user_kept:   String,
+    embedding: Vec<f32>,
+    ai_output: String,
+    user_kept: String,
 }
 
 /// Insert (or replace) a preference vector for an edit event.
@@ -142,8 +142,18 @@ pub fn insert_edit_event(
         "INSERT INTO edit_events
          (id, user_id, recording_id, timestamp_ms, transcript, ai_output, user_kept, target_app)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![id, user_id, recording_id, now_ms, transcript, ai_output, user_kept, target_app],
-    ).ok()?;
+        params![
+            id,
+            user_id,
+            recording_id,
+            now_ms,
+            transcript,
+            ai_output,
+            user_kept,
+            target_app
+        ],
+    )
+    .ok()?;
 
     Some(id)
 }

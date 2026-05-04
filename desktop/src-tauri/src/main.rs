@@ -7,9 +7,9 @@ mod desktop;
 mod dg_stream; // P5: Deepgram WebSocket live streaming
 mod permissions;
 
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::io::{Read, Seek, SeekFrom};
 
 use tauri::{
     Emitter, Manager, State,
@@ -81,8 +81,7 @@ fn configure_status_bar_macos(win: &tauri::WebviewWindow) {
             ns_window.send_message(Sel::register("setCollectionBehavior:"), (behavior,));
         let _: Result<(), _> =
             ns_window.send_message(Sel::register("setLevel:"), (NS_STATUS_WINDOW_LEVEL,));
-        let _: Result<(), _> =
-            ns_window.send_message(Sel::register("orderFrontRegardless"), ());
+        let _: Result<(), _> = ns_window.send_message(Sel::register("orderFrontRegardless"), ());
         tracing::info!(
             "[status-bar] macOS tuned behavior={behavior:#x} level={NS_STATUS_WINDOW_LEVEL}"
         );
@@ -137,13 +136,7 @@ fn notify_macos(app: &tauri::AppHandle, title: &str, body: &str) {
     use tauri_plugin_notification::NotificationExt;
 
     if is_bundled_app() {
-        match app
-            .notification()
-            .builder()
-            .title(title)
-            .body(body)
-            .show()
-        {
+        match app.notification().builder().title(title).body(body).show() {
             Ok(_) => {
                 tracing::info!("[notify] plugin sent (Said icon): {title}");
                 return;
@@ -170,10 +163,8 @@ fn osa_fallback(title: &str, body: &str) {
     use std::process::{Command, Stdio};
     // AppleScript string literals: backslash-escape `\` and `"`.
     let title_esc = title.replace('\\', "\\\\").replace('"', "\\\"");
-    let body_esc  = body .replace('\\', "\\\\").replace('"', "\\\"");
-    let script = format!(
-        r#"display notification "{body_esc}" with title "{title_esc}""#
-    );
+    let body_esc = body.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(r#"display notification "{body_esc}" with title "{title_esc}""#);
     match Command::new("osascript")
         .arg("-e")
         .arg(&script)
@@ -181,7 +172,7 @@ fn osa_fallback(title: &str, body: &str) {
         .stderr(Stdio::piped())
         .spawn()
     {
-        Ok(_)  => tracing::info!("[notify] osa sent (no icon): {title}"),
+        Ok(_) => tracing::info!("[notify] osa sent (no icon): {title}"),
         Err(e) => tracing::warn!("[notify] osascript spawn failed: {e}"),
     }
 }
@@ -545,6 +536,13 @@ struct BackendHandleState(Mutex<Option<backend::BackendHandle>>);
 /// cancels the previous one so rapid recordings cannot stack poll loops.
 struct EditWatcherState(Mutex<Option<CancellationToken>>);
 
+/// The frontmost app PID when recording started.
+///
+/// We lock this before showing/updating our own UI, then the post-paste edit
+/// watcher reads that app directly instead of chasing whatever system focus is
+/// later. This matches OpenWhispr's target-PID monitoring model.
+struct EditTargetState(Mutex<Option<i32>>);
+
 /// P5: Holds the oneshot receiver that delivers the pre-transcript from the
 /// Deepgram WebSocket streaming task.  Replaced on every new recording.
 struct StreamingState(Mutex<Option<tokio::sync::oneshot::Receiver<String>>>);
@@ -577,10 +575,10 @@ struct PrewarmedWsState(Arc<tokio::sync::Mutex<Option<dg_stream::PrewarmedWs>>>)
 struct DebugLogs {
     desktop_path: String,
     backend_path: String,
-    desktop:      String,
-    backend:      String,
-    combined:     String,
-    truncated:    bool,
+    desktop: String,
+    backend: String,
+    combined: String,
+    truncated: bool,
 }
 
 /// Lightweight cache of tray-relevant prefs so `sync_tray` never needs async.
@@ -756,6 +754,37 @@ fn sync_status_bar(handle: &tauri::AppHandle, state: &str) {
     };
 
     tracing::info!("[status-bar] sync state={state}");
+    if state == "idle" {
+        tracing::info!("[status-bar] idle state — scheduling native hide");
+        let app = handle.clone();
+        tauri::async_runtime::spawn(async move {
+            // Let the React HUD finish its short "done/pasted/manual paste" flash,
+            // then make the native window invisible if no new recording started.
+            tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+            let still_idle = app
+                .try_state::<SharedApp>()
+                .and_then(|shared| {
+                    shared
+                        .0
+                        .lock()
+                        .ok()
+                        .map(|d| d.state == desktop::AppState::Idle)
+                })
+                .unwrap_or(true);
+            if !still_idle {
+                tracing::info!("[status-bar] hide skipped — app is active again");
+                return;
+            }
+            if let Some(win) = app.get_webview_window("status-bar") {
+                match win.hide() {
+                    Ok(_) => tracing::info!("[status-bar] hidden after idle"),
+                    Err(e) => tracing::warn!("[status-bar] hide after idle failed: {e}"),
+                }
+            }
+        });
+        return;
+    }
+
     match win.set_always_on_top(true) {
         Ok(_) => tracing::info!("[status-bar] set_always_on_top ok"),
         Err(e) => tracing::warn!("[status-bar] set_always_on_top failed: {e}"),
@@ -797,55 +826,54 @@ fn sync_tray(handle: &tauri::AppHandle, snap: &AppSnapshot) {
 /// Create the always-on-top floating status pill.
 ///
 /// The window loads the same SPA with an explicit statusbar marker so
-/// `main.tsx` renders `<StatusBar />` instead of the full app. It starts visible
-/// as a tiny idle hover pill and expands as React receives pipeline events.
+/// `main.tsx` renders `<StatusBar />` instead of the full app. It starts hidden
+/// at idle and is shown by `sync_status_bar()` when recording/processing begins.
 fn create_status_bar(app: &tauri::AppHandle) {
     if app.get_webview_window("status-bar").is_some() {
         tracing::info!("[status-bar] create skipped; window already exists");
         return;
     }
 
-    // Position: bottom-center, low above the dock. Keep the native idle window
-    // almost exactly pill-sized so no webview strip can show around it.
-    let idle_w = 72.0;
-    let idle_h = 20.0;
+    // Position: bottom-center, low above the dock. Match VoiceInk's panel model:
+    // keep a max-size transparent native canvas and expand the inner HUD inside it.
+    let idle_w = 300.0;
+    let idle_h = 142.0;
     let bottom_offset = 64.0;
     let (x, y) = if let Ok(Some(m)) = app.primary_monitor() {
         let sf = m.scale_factor();
-        let sw = m.size().width  as f64 / sf;
+        let sw = m.size().width as f64 / sf;
         let sh = m.size().height as f64 / sf;
         let mx = m.position().x as f64 / sf;
         let my = m.position().y as f64 / sf;
-        (mx + sw / 2.0 - idle_w / 2.0, my + sh - idle_h - bottom_offset)
+        (
+            mx + sw / 2.0 - idle_w / 2.0,
+            my + sh - idle_h - bottom_offset,
+        )
     } else {
         (560.0, 860.0)
     };
 
     let url = "index.html?view=statusbar#statusbar";
     tracing::info!(
-        "[status-bar] creating window url={url} x={x:.0} y={y:.0} size={idle_w:.0}x{idle_h:.0} visible=true"
+        "[status-bar] creating window url={url} x={x:.0} y={y:.0} size={idle_w:.0}x{idle_h:.0} visible=false"
     );
 
-    match tauri::WebviewWindowBuilder::new(
-        app,
-        "status-bar",
-        tauri::WebviewUrl::App(url.into()),
-    )
-    .title("Said")
-    .inner_size(idle_w, idle_h)
-    .position(x, y)
-    .decorations(false)
-    .always_on_top(true)
-    .visible_on_all_workspaces(true)
-    .skip_taskbar(true)
-    .focused(false)
-    .resizable(false)
-    .shadow(false)
-    .transparent(true)
-    .visible(true)
-    .build()
+    match tauri::WebviewWindowBuilder::new(app, "status-bar", tauri::WebviewUrl::App(url.into()))
+        .title("Said")
+        .inner_size(idle_w, idle_h)
+        .position(x, y)
+        .decorations(false)
+        .always_on_top(true)
+        .visible_on_all_workspaces(true)
+        .skip_taskbar(true)
+        .focused(false)
+        .resizable(false)
+        .shadow(false)
+        .transparent(true)
+        .visible(false)
+        .build()
     {
-        Ok(win)  => {
+        Ok(win) => {
             tracing::info!("[status-bar] window created label={}", win.label());
             match win.url() {
                 Ok(url) => tracing::info!("[status-bar] resolved url={url}"),
@@ -1099,8 +1127,9 @@ async fn patch_preferences(
                 drop(d);
                 sync_tray(&app, &snap);
             }
-            // Keep hot-path cache language in sync — no HTTP needed next recording.
-            hot_cache.0.write().await.language = p.language.clone();
+            // Keep hot-path cache in sync — no HTTP needed next recording.
+            let mut hot = hot_cache.0.write().await;
+            hot.language = p.language.clone();
         }
         Err(e) => tracing::warn!("[patch_prefs] backend error: {e}"),
     }
@@ -1213,11 +1242,14 @@ fn toggle_recording(
 
     match current_state {
         desktop::AppState::Idle => {
-            // Pre-unlock the focused app's AX tree before recording begins.
+            // Lock and pre-unlock the frontmost app before recording begins.
             #[cfg(target_os = "macos")]
             {
-                let pid = paster::unlock_focused_app_now();
-                tracing::debug!("[record] pre-unlocked AX for focused app pid={pid:?}");
+                let pid = paster::lock_frontmost_app_now();
+                tracing::debug!("[record] locked frontmost app for edit-watch pid={pid:?}");
+                if let Ok(mut target) = app.state::<EditTargetState>().0.lock() {
+                    *target = pid;
+                }
             }
             // Start recording and return immediately
             let snap = state
@@ -1229,6 +1261,13 @@ fn toggle_recording(
             Ok(snap)
         }
         desktop::AppState::Recording => {
+            let edit_target_pid = app
+                .state::<EditTargetState>()
+                .0
+                .lock()
+                .ok()
+                .and_then(|mut target| target.take());
+
             // Extract wav bytes synchronously, then hand off the async SSE pipeline
             let wav = state
                 .0
@@ -1259,6 +1298,7 @@ fn toggle_recording(
                         done.recording_id.clone(),
                         done.polished.clone(),
                         watch_start,
+                        edit_target_pid,
                     );
                 }
 
@@ -1294,15 +1334,18 @@ fn toggle_recording(
 
 /// Start recording. Called when user presses Caps Lock (or taps the button).
 fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
-    // Pre-unlock the focused app's AX tree BEFORE recording begins.
+    // Lock and pre-unlock the frontmost app's AX tree BEFORE recording begins.
     // Chrome / Electron need ~150-200 ms to build their accessibility cache after
     // AXEnhancedUserInterface / AXManualAccessibility is set.  By unlocking here
     // we give the browser the full dictation window (typically 2-10 s) to get
     // ready, so that post-paste edit detection can read AXValue reliably.
     #[cfg(target_os = "macos")]
     {
-        let pid = paster::unlock_focused_app_now();
-        tracing::debug!("[record] pre-unlocked AX for focused app pid={pid:?}");
+        let pid = paster::lock_frontmost_app_now();
+        tracing::debug!("[record] locked frontmost app for edit-watch pid={pid:?}");
+        if let Ok(mut target) = app.state::<EditTargetState>().0.lock() {
+            *target = pid;
+        }
     }
 
     let started = match shared.lock() {
@@ -1315,10 +1358,13 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
             let _ = app.emit("app-state", &snap);
         }
         Err(e) => {
-            let _ = app.emit("voice-error", serde_json::json!({
-                "message": e,
-                "audio_id": null,
-            }));
+            let _ = app.emit(
+                "voice-error",
+                serde_json::json!({
+                    "message": e,
+                    "audio_id": null,
+                }),
+            );
             return;
         }
     }
@@ -1337,9 +1383,12 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
             while let Ok(level) = level_recv.rx.recv() {
                 smoothed = smoothed.mul_add(0.68, level * 0.32);
                 if last_emit.elapsed() >= std::time::Duration::from_millis(33) {
-                    let _ = app_levels.emit("voice-level", serde_json::json!({
-                        "level": smoothed.clamp(0.0, 1.0),
-                    }));
+                    let _ = app_levels.emit(
+                        "voice-level",
+                        serde_json::json!({
+                            "level": smoothed.clamp(0.0, 1.0),
+                        }),
+                    );
                     last_emit = std::time::Instant::now();
                 }
             }
@@ -1356,9 +1405,9 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
             *g = Some(transcript_rx);
         }
 
-        let hot_cache_arc    = Arc::clone(&app.state::<HotPathCache>().0);
-        let backend_for_pe   = Arc::clone(&app.state::<BackendState>().0);
-        let prewarm_arc      = Arc::clone(&app.state::<PrewarmedWsState>().0);
+        let hot_cache_arc = Arc::clone(&app.state::<HotPathCache>().0);
+        let backend_for_pe = Arc::clone(&app.state::<BackendState>().0);
+        let prewarm_arc = Arc::clone(&app.state::<PrewarmedWsState>().0);
 
         tauri::async_runtime::spawn(async move {
             let deepgram_key = std::env::var("DEEPGRAM_API_KEY").unwrap_or_default();
@@ -1392,19 +1441,24 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
                 &keyterms,
                 pre_embed_ref,
                 prewarmed,
-            ).await;
+            )
+            .await;
 
-            tracing::info!("[dg_stream] pre-transcript: {}",
-                transcript.as_deref().unwrap_or("<none — WS produced no output>"));
+            tracing::info!(
+                "[dg_stream] pre-transcript: {}",
+                transcript
+                    .as_deref()
+                    .unwrap_or("<none — WS produced no output>")
+            );
             let _ = transcript_tx.send(transcript.unwrap_or_default());
 
             // ── Pre-warm the NEXT recording's WS connection immediately ──────────
             // Fires right after CloseStream+drain complete. By the time the user
             // presses the hotkey again, the TLS handshake is already done.
-            let key2      = deepgram_key.clone();
-            let lang2     = language.clone();
-            let terms2    = keyterms.clone();
-            let pw_arc2   = Arc::clone(&prewarm_arc);
+            let key2 = deepgram_key.clone();
+            let lang2 = language.clone();
+            let terms2 = keyterms.clone();
+            let pw_arc2 = Arc::clone(&prewarm_arc);
             tauri::async_runtime::spawn(async move {
                 if let Some(pw) = dg_stream::connect_ws(&key2, &lang2, &terms2).await {
                     *pw_arc2.lock().await = Some(pw);
@@ -1426,7 +1480,9 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
                                 r#"{"type":"KeepAlive"}"#.into(),
                             );
                             if pw.ws.send(ka).await.is_err() {
-                                tracing::warn!("[dg_stream] pre-warm keepalive failed — dropping stale WS");
+                                tracing::warn!(
+                                    "[dg_stream] pre-warm keepalive failed — dropping stale WS"
+                                );
                                 *guard = None;
                                 break;
                             }
@@ -1447,6 +1503,13 @@ fn do_finish_recording(
     app: tauri::AppHandle,
     back_arc: Arc<Mutex<Option<BackendEndpoint>>>,
 ) {
+    let edit_target_pid = app
+        .state::<EditTargetState>()
+        .0
+        .lock()
+        .ok()
+        .and_then(|mut target| target.take());
+
     // Extract wav bytes synchronously (near-instant, no I/O).
     // This also drops the recorder's chunk_tx, signalling the WS task to close.
     let wav = {
@@ -1559,6 +1622,7 @@ fn do_finish_recording(
                 done.recording_id.clone(),
                 done.polished.clone(),
                 watch_start,
+                edit_target_pid,
             );
         }
 
@@ -1622,7 +1686,7 @@ async fn run_voice_polish_sse(
             .unwrap_or_else(|| "none (will use HTTP STT)".into()),
     );
 
-    let done = api::stream_voice_polish(&ep, wav, target_app, pre_transcript, move |event| {
+    let mut on_polish_event = move |event| {
         match &event {
             api::PolishEvent::Token { token } => {
                 // RESET sentinel — emitted by openai_codex SSE parser when a
@@ -1632,7 +1696,9 @@ async fn run_voice_polish_sse(
                 // safety-paste path replace whatever was already typed with
                 // the final polished text.
                 if token == "\u{1F}__RESET__\u{1F}" {
-                    tracing::warn!("[main] LLM emitted draft + final — disabling word-by-word for this recording, will paste full output at end");
+                    tracing::warn!(
+                        "[main] LLM emitted draft + final — disabling word-by-word for this recording, will paste full output at end"
+                    );
                     // Mark as failed so the safety-paste path fires at the end.
                     // Doesn't matter that we typed some draft tokens; the safety
                     // paste will select-all-and-replace.
@@ -1647,7 +1713,10 @@ async fn run_voice_polish_sse(
                         let prev = typed_any2.swap(true, std::sync::atomic::Ordering::Relaxed);
                         let n = token_count2.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         if !prev {
-                            tracing::info!("[main] GAP-2: word-by-word typing started — first token {:?}", token);
+                            tracing::info!(
+                                "[main] GAP-2: word-by-word typing started — first token {:?}",
+                                token
+                            );
                         }
                         let _ = n;
                     }
@@ -1662,7 +1731,10 @@ async fn run_voice_polish_sse(
             }
             api::PolishEvent::Status { phase, transcript } => {
                 tracing::info!("[pipeline] status: phase={phase} transcript={transcript:?}");
-                let _ = app_clone.emit("voice-status", serde_json::json!({ "phase": phase, "transcript": transcript }));
+                let _ = app_clone.emit(
+                    "voice-status",
+                    serde_json::json!({ "phase": phase, "transcript": transcript }),
+                );
             }
             api::PolishEvent::Done(done) => {
                 tracing::info!(
@@ -1679,16 +1751,23 @@ async fn run_voice_polish_sse(
                 // text vs a typing-path bug that doubled it. Caps at 400
                 // chars so very long polishes don't blow up the log.
                 let preview: String = done.polished.chars().take(400).collect();
-                let suffix = if done.polished.chars().count() > 400 { "…" } else { "" };
+                let suffix = if done.polished.chars().count() > 400 {
+                    "…"
+                } else {
+                    ""
+                };
                 tracing::info!("[pipeline] polished text: {preview:?}{suffix}");
                 let _ = app_clone.emit("voice-done", done);
             }
             api::PolishEvent::Error { message, audio_id } => {
                 let human = humanize_error(&message);
-                let _ = app_clone.emit("voice-error", serde_json::json!({
-                    "message":  human.clone(),
-                    "audio_id": audio_id,
-                }));
+                let _ = app_clone.emit(
+                    "voice-error",
+                    serde_json::json!({
+                        "message":  human.clone(),
+                        "audio_id": audio_id,
+                    }),
+                );
                 // Native macOS banner — informational only.  In dev mode the
                 // osascript path can't attach action buttons (those require a
                 // bundled .app with a registered UNNotificationCategory), so
@@ -1706,8 +1785,23 @@ async fn run_voice_polish_sse(
                 );
             }
         }
-    })
-    .await?;
+    };
+
+    let mut deferred_audio_upload: Option<(BackendEndpoint, String, Vec<u8>)> = None;
+    let done = if let Some(transcript) = pre_transcript {
+        tracing::info!(
+            "[pipeline] fast path: sending transcript-only polish request, deferring WAV upload"
+        );
+        let done =
+            api::stream_voice_polish_transcript(&ep, transcript, target_app, &mut on_polish_event)
+                .await?;
+        if !wav.is_empty() {
+            deferred_audio_upload = Some((ep.clone(), done.recording_id.clone(), wav));
+        }
+        done
+    } else {
+        api::stream_voice_polish(&ep, wav, target_app, None, &mut on_polish_event).await?
+    };
 
     let n_typed = token_count.load(std::sync::atomic::Ordering::Relaxed);
     let n_failed = fail_count.load(std::sync::atomic::Ordering::Relaxed);
@@ -1771,11 +1865,19 @@ async fn run_voice_polish_sse(
         // — without it we only see token counts and can't tell whether
         // duplication is in the model output or in our typing path.
         let preview: String = done.polished.chars().take(240).collect();
-        let suffix = if done.polished.chars().count() > 240 { "…" } else { "" };
+        let suffix = if done.polished.chars().count() > 240 {
+            "…"
+        } else {
+            ""
+        };
         tracing::info!("[main] polished text: {:?}{}", preview, suffix);
     }
 
-    let output_status = if output_pasted { "pasted" } else { "manual_paste" };
+    let output_status = if output_pasted {
+        "pasted"
+    } else {
+        "manual_paste"
+    };
     let output_message = if output_pasted {
         "Pasted"
     } else {
@@ -1789,6 +1891,28 @@ async fn run_voice_polish_sse(
             "message": output_message,
         }),
     );
+
+    if let Some((ep_upload, recording_id, wav_upload)) = deferred_audio_upload {
+        let app_for_upload = app.clone();
+        tauri::async_runtime::spawn(async move {
+            match api::upload_recording_audio(&ep_upload, &recording_id, wav_upload).await {
+                Ok(()) => {
+                    tracing::info!(
+                        "[pipeline] deferred audio upload attached to recording {recording_id}"
+                    );
+                    let _ = app_for_upload.emit(
+                        "recording-audio-attached",
+                        serde_json::json!({ "recording_id": recording_id }),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[pipeline] deferred audio upload failed for recording {recording_id}: {e}"
+                    );
+                }
+            }
+        });
+    }
 
     Ok(done)
 }
@@ -1953,6 +2077,7 @@ fn retry_recording(
                 done.recording_id.clone(),
                 done.polished.clone(),
                 watch_start,
+                None,
             );
         }
 
@@ -2298,15 +2423,22 @@ fn get_debug_logs() -> DebugLogs {
     let backend_path = dir.join("backend.log");
     let (desktop, desktop_truncated) =
         read_recent_log(&desktop_path, "[main] said desktop starting");
-    let (backend, backend_truncated) =
-        read_recent_log(&backend_path, "polish-backend build=");
+    let (backend, backend_truncated) = read_recent_log(&backend_path, "polish-backend build=");
 
     let combined = format!(
         "── Said desktop ({}) ──\n{}\n\n── polish-backend ({}) ──\n{}",
         desktop_path.display(),
-        if desktop.trim().is_empty() { "(no desktop log found)" } else { desktop.trim_end() },
+        if desktop.trim().is_empty() {
+            "(no desktop log found)"
+        } else {
+            desktop.trim_end()
+        },
         backend_path.display(),
-        if backend.trim().is_empty() { "(no backend log found)" } else { backend.trim_end() },
+        if backend.trim().is_empty() {
+            "(no backend log found)"
+        } else {
+            backend.trim_end()
+        },
     );
 
     DebugLogs {
@@ -2358,6 +2490,7 @@ fn start_edit_watcher(
     recording_id: String,
     polished: String,
     watch_start: std::time::Instant,
+    target_pid: Option<i32>,
 ) {
     let token = {
         let st = app.state::<EditWatcherState>();
@@ -2379,7 +2512,16 @@ fn start_edit_watcher(
 
     let app_for_task = app.clone();
     tauri::async_runtime::spawn(async move {
-        watch_for_edit(token.clone(), back_arc, app_for_task.clone(), recording_id, polished, watch_start).await;
+        watch_for_edit(
+            token.clone(),
+            back_arc,
+            app_for_task.clone(),
+            recording_id,
+            polished,
+            watch_start,
+            target_pid,
+        )
+        .await;
 
         if !token.is_cancelled() {
             if let Ok(mut guard) = app_for_task.state::<EditWatcherState>().0.lock() {
@@ -2399,6 +2541,7 @@ async fn watch_for_edit(
     recording_id: String,
     polished: String,                // the AI-generated text we pasted
     watch_start: std::time::Instant, // captured at the call site, right after paste
+    target_pid: Option<i32>,
 ) {
     use std::time::Instant;
 
@@ -2408,38 +2551,62 @@ async fn watch_for_edit(
         return;
     }
 
-    // Snapshot the PID right after paste.
-    let initial_pid = blocking_ax_option("focused_pid initial", paster::focused_pid).await;
+    // Prefer the PID captured when recording started. That is the key
+    // OpenWhispr-style fix: we monitor the app the user dictated into, not
+    // whatever happens to be frontmost after our HUD/status UI has updated.
+    let focused_pid_after_paste =
+        blocking_ax_option("focused_pid after-paste", paster::focused_pid).await;
+    let initial_pid = target_pid.or(focused_pid_after_paste);
 
     // Attempt to get the initial field value.  Chrome / Electron may still be
     // building their AX cache even after the pre-unlock at recording-start, so
     // we retry a few times with increasing delays before declaring "AX blind".
     let post_paste = {
-        let mut val = blocking_ax_option(
-            "read_focused_value_first initial",
-            paster::read_focused_value_first,
-        ).await.unwrap_or_default();
+        let mut val =
+            blocking_ax_option(
+                "read_focused_value_first initial",
+                move || match initial_pid {
+                    Some(pid) => paster::read_focused_value_first_for_pid(pid),
+                    None => paster::read_focused_value_first(),
+                },
+            )
+            .await
+            .unwrap_or_default();
         if val.is_empty() {
             // 2nd attempt after 300 ms
             if !cancellable_sleep(&token, Duration::from_millis(300)).await {
-                tracing::info!("[edit-watch] watcher cancelled during initial retry for {recording_id}");
+                tracing::info!(
+                    "[edit-watch] watcher cancelled during initial retry for {recording_id}"
+                );
                 return;
             }
             val = blocking_ax_option(
                 "read_focused_value_first retry1",
-                paster::read_focused_value_first,
-            ).await.unwrap_or_default();
+                move || match initial_pid {
+                    Some(pid) => paster::read_focused_value_first_for_pid(pid),
+                    None => paster::read_focused_value_first(),
+                },
+            )
+            .await
+            .unwrap_or_default();
         }
         if val.is_empty() {
             // 3rd attempt after another 500 ms — AX tree should be ready by now
             if !cancellable_sleep(&token, Duration::from_millis(500)).await {
-                tracing::info!("[edit-watch] watcher cancelled during initial retry for {recording_id}");
+                tracing::info!(
+                    "[edit-watch] watcher cancelled during initial retry for {recording_id}"
+                );
                 return;
             }
             val = blocking_ax_option(
                 "read_focused_value_first retry2",
-                paster::read_focused_value_first,
-            ).await.unwrap_or_default();
+                move || match initial_pid {
+                    Some(pid) => paster::read_focused_value_first_for_pid(pid),
+                    None => paster::read_focused_value_first(),
+                },
+            )
+            .await
+            .unwrap_or_default();
         }
         val
     };
@@ -2450,7 +2617,7 @@ async fn watch_for_edit(
     // a UI placeholder ("Type / for commands") that replaces the actual edit.
     let mut best_candidate = post_paste.clone();
     let mut idle_at = Instant::now();
-    let started     = Instant::now();
+    let started = Instant::now();
     let mut last_change_at = Instant::now();
     let mut current_interval = EDIT_WATCH_FAST_INTERVAL;
     let mut last_pid = initial_pid;
@@ -2459,7 +2626,9 @@ async fn watch_for_edit(
     let mut app_switched_during_capture: bool = false;
 
     tracing::info!(
-        "[edit-watch] watching {recording_id} — initial field readable: {} (len={})",
+        "[edit-watch] watching {recording_id} — target_pid={:?} focused_after_paste={:?} initial field readable: {} (len={})",
+        target_pid,
+        focused_pid_after_paste,
         !post_paste.is_empty(),
         post_paste.len(),
     );
@@ -2474,32 +2643,51 @@ async fn watch_for_edit(
             return;
         }
 
-        // Check PID FIRST — if the user switched apps, break immediately WITHOUT
-        // reading the new app's field value.  If we read first, last_val gets
-        // overwritten with the new app's (empty) text, corrupting the diff.
+        // Check the frontmost PID first. With a locked target PID we keep
+        // monitoring that original app even if focus moves; without one, keep
+        // the old safety behavior and stop before reading another app's field.
         let now_pid = blocking_ax_option("focused_pid poll", paster::focused_pid).await;
         let pid_switched = matches!(
             (initial_pid, now_pid),
             (Some(a), Some(b)) if a != b
         );
-        if pid_switched {
+        if pid_switched && target_pid.is_none() {
             app_switched_during_capture = true;
             break;
+        } else if pid_switched {
+            app_switched_during_capture = true;
         }
 
-        // Still in the same app — read the current field value.
-        let now_val = if now_pid != last_pid {
+        // Read the current field value from the locked target app when we have
+        // one. This avoids accidentally sampling our HUD or a newly focused app.
+        let now_val = if let Some(pid) = initial_pid {
+            let fast = blocking_ax_option("read_focused_value_fast target-pid poll", move || {
+                paster::read_focused_value_fast_for_pid(pid)
+            })
+            .await;
+            if fast.as_ref().is_some_and(|v| !v.is_empty()) || post_paste.is_empty() {
+                fast
+            } else {
+                blocking_ax_option("read_focused_value_first target-pid fallback", move || {
+                    paster::read_focused_value_first_for_pid(pid)
+                })
+                .await
+            }
+        } else if now_pid != last_pid {
             last_pid = now_pid;
             blocking_ax_option(
                 "read_focused_value_first focus-change",
                 paster::read_focused_value_first,
-            ).await
+            )
+            .await
         } else {
             blocking_ax_option(
                 "read_focused_value_fast poll",
                 paster::read_focused_value_fast,
-            ).await
-        }.unwrap_or_default();
+            )
+            .await
+        }
+        .unwrap_or_default();
         if now_val != last_val {
             idle_at = Instant::now();
             last_change_at = Instant::now();
@@ -2536,11 +2724,11 @@ async fn watch_for_edit(
         last_val.clone()
     };
 
-    let final_pid = blocking_ax_option("focused_pid final", paster::focused_pid).await;
+    let final_front_pid = blocking_ax_option("focused_pid final", paster::focused_pid).await;
     tracing::info!(
-        "[edit-watch] done watching {recording_id} — field changed: {}, same app: {}",
+        "[edit-watch] done watching {recording_id} — field changed: {}, target still frontmost: {}",
         effective_val != post_paste,
-        matches!((initial_pid, final_pid), (Some(a), Some(b)) if a == b),
+        matches!((initial_pid, final_front_pid), (Some(a), Some(b)) if a == b),
     );
 
     // ── Determine user_kept + capture_method ───────────────────────────────────
@@ -2588,7 +2776,7 @@ async fn watch_for_edit(
         #[cfg(target_os = "macos")]
         {
             let same_app = matches!(
-                (initial_pid, final_pid),
+                (initial_pid, final_front_pid),
                 (Some(a), Some(b)) if a == b
             );
 
@@ -2736,14 +2924,23 @@ async fn watch_for_edit(
     if let Some(ref ep) = ep_opt {
         let capture_meta = api::CaptureMeta {
             time_since_paste_ms: watch_start.elapsed().as_millis() as u64,
-            app_switched:        app_switched_during_capture,
+            app_switched: app_switched_during_capture,
             // matches_clipboard is left false for now — wiring it requires
             // careful sequencing with the end-of-loop Cmd+A+C path; deferred
             // to a follow-up so this PR stays focused on the four foundational
             // accuracy fixes.
-            matches_clipboard:   false,
+            matches_clipboard: false,
         };
-        match api::classify_edit(ep, &recording_id, &polished, &user_kept, capture_method, capture_meta).await {
+        match api::classify_edit(
+            ep,
+            &recording_id,
+            &polished,
+            &user_kept,
+            capture_method,
+            capture_meta,
+        )
+        .await
+        {
             Ok(resp) => {
                 tracing::info!(
                     "[edit-watch] classifier: class={} promoted={} repeat={} learned={} notify={} reason={:?} pending={:?}",
@@ -3343,6 +3540,7 @@ fn main() {
         .manage(BackendState(backend_arc))
         .manage(BackendHandleState(Mutex::new(None)))
         .manage(EditWatcherState(Mutex::new(None)))
+        .manage(EditTargetState(Mutex::new(None)))
         .manage(StreamingState(Mutex::new(None)))
         .manage(TrayCache(Mutex::new(TrayCacheInner::default())))
         .manage(LatestResult(std::sync::Arc::new(Mutex::new(None))))

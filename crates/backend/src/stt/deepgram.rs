@@ -57,24 +57,28 @@ pub struct TranscriptResult {
 /// `keyterms` are personal-vocabulary terms that Deepgram should bias toward
 /// (Nova-3 keyterm prompting).  Pass an empty slice for no biasing.
 pub async fn transcribe(
-    client:   &Client,
-    api_key:  &str,
+    client: &Client,
+    api_key: &str,
     wav_data: Vec<u8>,
     language: &str,
     keyterms: &[String],
 ) -> Result<TranscriptResult, String> {
-    let lang = if language.is_empty() || language == "auto" { "hi" } else { language };
+    let lang = if language.is_empty() || language == "auto" {
+        "hi"
+    } else {
+        language
+    };
 
     // Build URL — smart_format intentionally omitted: it mangles numbers into
     // times/dates/phones (e.g. "2305" → "2 03:05") which breaks dictation of
     // email addresses, IDs, and numbers in Hindi context.
-    let mut url = format!(
-        "{DEEPGRAM_URL}?model=nova-3&language={lang}&punctuate=true"
-    );
+    let mut url = format!("{DEEPGRAM_URL}?model=nova-3&language={lang}&punctuate=true");
     let bias_count = keyterms.len().min(100);
     for term in keyterms.iter().take(100) {
         let cleaned = term.trim();
-        if cleaned.is_empty() { continue; }
+        if cleaned.is_empty() {
+            continue;
+        }
         url.push_str("&keyterm=");
         url.push_str(&urlencode(cleaned));
     }
@@ -82,7 +86,10 @@ pub async fn transcribe(
         debug!("[stt] biasing Deepgram with {bias_count} personal term(s)");
     }
 
-    debug!("[stt] sending {} bytes to Deepgram (lang={lang})", wav_data.len());
+    debug!(
+        "[stt] sending {} bytes to Deepgram (lang={lang})",
+        wav_data.len()
+    );
 
     let resp = client
         .post(&url)
@@ -127,7 +134,10 @@ pub async fn transcribe(
         enrich_words(&alt.words)
     };
 
-    debug!("[stt] transcript ({:.2}): {}", alt.confidence, alt.transcript);
+    debug!(
+        "[stt] transcript ({:.2}): {}",
+        alt.confidence, alt.transcript
+    );
     if uncertain_count > 0 {
         info!(
             "[stt] {} uncertain word(s) flagged (threshold < {:.0}%)",
@@ -191,9 +201,9 @@ mod tests {
     #[test]
     fn urlencode_basics() {
         assert_eq!(urlencode("hello"), "hello");
-        assert_eq!(urlencode("n8n"),   "n8n");
+        assert_eq!(urlencode("n8n"), "n8n");
         assert_eq!(urlencode("hi there"), "hi%20there");
-        assert_eq!(urlencode("a&b"),  "a%26b");
-        assert_eq!(urlencode("a=b"),  "a%3Db");
+        assert_eq!(urlencode("a&b"), "a%26b");
+        assert_eq!(urlencode("a=b"), "a%3Db");
     }
 }

@@ -7,33 +7,30 @@
 //! 4. Inserts an edit_event row (permanent learning corpus).
 //! 5. Fire-and-forget: embeds transcript → upserts preference_vector.
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{Json, extract::State, http::StatusCode};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::{
+    AppState,
     embedder::gemini,
     store::{corrections, history, prefs::get_prefs, vectors},
-    AppState,
 };
 
 #[derive(Deserialize)]
 pub struct FeedbackBody {
     pub recording_id: String,
-    pub user_kept:    String,
-    pub target_app:   Option<String>,
+    pub user_kept: String,
+    pub target_app: Option<String>,
 }
 
-pub async fn submit(
-    State(state): State<AppState>,
-    Json(body): Json<FeedbackBody>,
-) -> StatusCode {
+pub async fn submit(State(state): State<AppState>, Json(body): Json<FeedbackBody>) -> StatusCode {
     let pool = state.pool.clone();
 
     // ── Load recording ────────────────────────────────────────────────────────
     let rec = match history::get_recording(&pool, &body.recording_id) {
         Some(r) => r,
-        None    => return StatusCode::NOT_FOUND,
+        None => return StatusCode::NOT_FOUND,
     };
     if rec.user_id != state.default_user_id.as_str() {
         return StatusCode::FORBIDDEN;
@@ -81,11 +78,11 @@ pub async fn submit(
 
     // ── Fire-and-forget: embed transcript → upsert preference_vector ──────────
     {
-        let pool2        = pool.clone();
-        let transcript2  = rec.transcript.clone();
-        let user_id2     = rec.user_id.clone();
-        let event_id2    = edit_event_id.clone();
-        let http_client  = state.http_client.clone();
+        let pool2 = pool.clone();
+        let transcript2 = rec.transcript.clone();
+        let user_id2 = rec.user_id.clone();
+        let event_id2 = edit_event_id.clone();
+        let http_client = state.http_client.clone();
         // Resolve Gemini key from prefs, fall back to env var
         let gemini_key = get_prefs(&pool, &rec.user_id)
             .and_then(|p| p.gemini_api_key)

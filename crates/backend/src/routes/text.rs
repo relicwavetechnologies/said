@@ -29,7 +29,7 @@ use crate::{
             VocabEntry, build_system_prompt_with_vocab_entries, build_tray_system_prompt,
             build_user_message, resolved_vocab_terms_to_entries, vocab_terms_to_entries,
         },
-        vocab_resolver,
+        script, vocab_resolver,
     },
     store::{
         history::{InsertRecording, insert_recording},
@@ -239,12 +239,25 @@ pub async fn polish(
             }
         });
 
+        let enforce_roman_hinglish = tone_override.is_none() && prefs.output_language == "hinglish";
+
+        let mut saw_script_rewrite = false;
         while let Some(token) = token_rx.recv().await {
+            let token = if enforce_roman_hinglish && script::contains_devanagari(&token) {
+                if !saw_script_rewrite {
+                    saw_script_rewrite = true;
+                    yield Ok(Event::default().event("token")
+                        .data(json!({"token": "\u{1F}__RESET__\u{1F}"}).to_string()));
+                }
+                script::enforce_roman_hinglish(&token)
+            } else {
+                token
+            };
             yield Ok(Event::default().event("token")
                 .data(json!({"token": token}).to_string()));
         }
 
-        let llm_result = match llm_task.await {
+        let mut llm_result = match llm_task.await {
             Ok(Ok(r))  => r,
             Ok(Err(e)) => {
                 let message = if invalidate_openai_session_on_auth_error(&pool, &user_id, &llm_provider, &e) {
@@ -263,6 +276,16 @@ pub async fn polish(
                 return;
             }
         };
+
+        if enforce_roman_hinglish && script::contains_devanagari(&llm_result.polished) {
+            let romanized = script::enforce_roman_hinglish(&llm_result.polished);
+            warn!(
+                "[text] LLM emitted Devanagari in Hinglish mode — romanized {} → {} chars",
+                llm_result.polished.len(),
+                romanized.len(),
+            );
+            llm_result.polished = romanized;
+        }
 
         let total_ms     = total_start.elapsed().as_millis() as i64;
         let recording_id = Uuid::new_v4().to_string();

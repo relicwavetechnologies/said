@@ -47,18 +47,13 @@ struct EmbedValues {
 ///
 /// `api_key` should be the key from preferences (or env var fallback).
 /// Returns `None` if the key is empty or all retries fail (polish still works, just no RAG).
-pub async fn embed(
-    client: &Client,
-    pool: &DbPool,
-    text: &str,
-    api_key: &str,
-) -> Option<Vec<f32>> {
+pub async fn embed(client: &Client, pool: &DbPool, text: &str, api_key: &str) -> Option<Vec<f32>> {
     if api_key.is_empty() {
         warn!("[embedder] Gemini API key not set — skipping embedding");
         return None;
     }
 
-    let t0   = Instant::now();
+    let t0 = Instant::now();
     let hash = sha256_hex(text);
 
     // ── Cache lookup (spawn_blocking: sync SQLite inside async context) ─────────
@@ -68,8 +63,11 @@ pub async fn embed(
         .await
         .unwrap_or(None)
     {
-        info!("[embedder] GAP-4: cache HIT in {}ms ({DIMENSIONS}d, {} chars)",
-              t0.elapsed().as_millis(), text.len());
+        info!(
+            "[embedder] GAP-4: cache HIT in {}ms ({DIMENSIONS}d, {} chars)",
+            t0.elapsed().as_millis(),
+            text.len()
+        );
         return Some(cached);
     }
 
@@ -97,7 +95,11 @@ pub async fn embed(
                 warn!("[embedder] request error (attempt {}): {e}", attempt + 1);
             }
             Ok(r) if r.status().is_server_error() => {
-                warn!("[embedder] server error {} (attempt {})", r.status(), attempt + 1);
+                warn!(
+                    "[embedder] server error {} (attempt {})",
+                    r.status(),
+                    attempt + 1
+                );
             }
             Ok(r) if !r.status().is_success() => {
                 warn!("[embedder] unexpected status {} — giving up", r.status());
@@ -122,11 +124,16 @@ pub async fn embed(
                         {
                             let pool_s = pool.clone();
                             let hash_s = hash.clone();
-                            let vals   = values.clone();
-                            tokio::task::spawn_blocking(move || store_in_cache(&pool_s, &hash_s, &vals));
+                            let vals = values.clone();
+                            tokio::task::spawn_blocking(move || {
+                                store_in_cache(&pool_s, &hash_s, &vals)
+                            });
                         }
-                        info!("[embedder] GAP-4: API MISS → {DIMENSIONS}d in {}ms ({} chars)",
-                              t0.elapsed().as_millis(), text.len());
+                        info!(
+                            "[embedder] GAP-4: API MISS → {DIMENSIONS}d in {}ms ({} chars)",
+                            t0.elapsed().as_millis(),
+                            text.len()
+                        );
                         return Some(values);
                     }
                 }
@@ -149,11 +156,13 @@ fn sha256_hex(text: &str) -> String {
 /// Decode a 768-float BLOB from the cache.
 fn read_from_cache(pool: &DbPool, hash: &str) -> Option<Vec<f32>> {
     let conn = pool.get().ok()?;
-    let blob: Vec<u8> = conn.query_row(
-        "SELECT embedding FROM embedding_cache WHERE text_hash = ?1",
-        params![hash],
-        |row| row.get(0),
-    ).ok()?;
+    let blob: Vec<u8> = conn
+        .query_row(
+            "SELECT embedding FROM embedding_cache WHERE text_hash = ?1",
+            params![hash],
+            |row| row.get(0),
+        )
+        .ok()?;
 
     if blob.len() != DIMENSIONS * 4 {
         return None;
@@ -173,10 +182,7 @@ fn store_in_cache(pool: &DbPool, hash: &str, values: &[f32]) {
         Ok(c) => c,
         Err(_) => return,
     };
-    let blob: Vec<u8> = values
-        .iter()
-        .flat_map(|f| f.to_le_bytes())
-        .collect();
+    let blob: Vec<u8> = values.iter().flat_map(|f| f.to_le_bytes()).collect();
 
     let now_ms = crate::store::now_ms();
     let _ = conn.execute(

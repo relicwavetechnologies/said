@@ -1,15 +1,13 @@
-use axum::{
-    extract::State,
-    http::StatusCode,
-    Json,
-};
+use axum::{Json, extract::State, http::StatusCode};
 use serde::Serialize;
 use tracing::info;
 
 use crate::{
-    store::{corrections, prefs::{PrefsUpdate, Preferences}},
-    AppState,
-    get_prefs_cached, invalidate_prefs_cache,
+    AppState, get_prefs_cached, invalidate_prefs_cache,
+    store::{
+        corrections,
+        prefs::{Preferences, PrefsUpdate},
+    },
 };
 
 /// GET /v1/corrections — returns the "right" words from the user's correction
@@ -39,18 +37,34 @@ pub async fn patch_prefs(
     State(state): State<AppState>,
     Json(update): Json<PrefsUpdate>,
 ) -> Result<Json<Preferences>, StatusCode> {
-    info!("[patch_prefs] backend received: llm_provider={:?} selected_model={:?} gateway_key_set={} gemini_key_set={} groq_key_set={}",
+    info!(
+        "[patch_prefs] backend received: llm_provider={:?} selected_model={:?} gateway_key_set={} gemini_key_set={} groq_key_set={}",
         update.llm_provider,
         update.selected_model,
-        update.gateway_api_key.as_ref().map(|v| v.is_some()).unwrap_or(false),
-        update.gemini_api_key.as_ref().map(|v| v.is_some()).unwrap_or(false),
-        update.groq_api_key.as_ref().map(|v| v.is_some()).unwrap_or(false),
+        update
+            .gateway_api_key
+            .as_ref()
+            .map(|v| v.is_some())
+            .unwrap_or(false),
+        update
+            .gemini_api_key
+            .as_ref()
+            .map(|v| v.is_some())
+            .unwrap_or(false),
+        update
+            .groq_api_key
+            .as_ref()
+            .map(|v| v.is_some())
+            .unwrap_or(false),
     );
     let user_id = state.default_user_id.clone();
-    let prefs   = crate::store::prefs::update_prefs(&state.pool, &user_id, update)
+    let prefs = crate::store::prefs::update_prefs(&state.pool, &user_id, update)
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
     // Gap 3: invalidate cache so next request re-reads fresh prefs
     invalidate_prefs_cache(&state.prefs_cache).await;
-    info!("[patch_prefs] after update: llm_provider={:?}", prefs.llm_provider);
+    info!(
+        "[patch_prefs] after update: llm_provider={:?}",
+        prefs.llm_provider
+    );
     Ok(Json(prefs))
 }

@@ -30,7 +30,7 @@ use tracing::{info, warn};
 
 use super::edit_diff::Hunk;
 
-const GROQ_ENDPOINT:    &str = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions";
 const CLASSIFIER_MODEL: &str = "llama-3.1-8b-instant";
 
 /// Specific token-level correction extracted from inside a composite hunk.
@@ -51,7 +51,7 @@ pub struct ExtractedTerm {
     pub transcript_form: String,
     /// The correctly-spelled form the user wanted (must be a whole-word
     /// substring of `hunk.kept_window`).
-    pub correct_form:    String,
+    pub correct_form: String,
 }
 
 /// One labelled hunk — pairs a deterministic diff hunk with the LLM's class
@@ -60,9 +60,9 @@ pub struct ExtractedTerm {
 /// to `kept_window`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LabelledHunk {
-    pub hunk:           Hunk,
-    pub class:          EditClass,
-    pub confidence:     f64,
+    pub hunk: Hunk,
+    pub class: EditClass,
+    pub confidence: f64,
     /// When the LLM identifies a specific token within the hunk as the actual
     /// STT/polish error (vs. the whole hunk being the correction), it emits
     /// this field.  Stage-4 promotion prefers it over `kept_window`.
@@ -88,7 +88,9 @@ impl LabelledHunk {
     /// What the polish step produced.  No extraction equivalent — polish_form
     /// is always the hunk's polish window because polish errors are the WHOLE
     /// substituted region.
-    pub fn polish_form(&self) -> &str { &self.hunk.polish_window }
+    pub fn polish_form(&self) -> &str {
+        &self.hunk.polish_window
+    }
     /// The proposed correct form.  When `extracted_term` is present, returns
     /// the specific sub-token; else returns the full hunk's kept window.
     /// Stage-4 promotion uses THIS getter.
@@ -100,7 +102,9 @@ impl LabelledHunk {
     }
     /// Best guess at what was actually spoken.  For STT_ERROR this equals
     /// `correct_form()` (user restored what they actually said).
-    pub fn spoke(&self) -> &str { self.correct_form() }
+    pub fn spoke(&self) -> &str {
+        self.correct_form()
+    }
 }
 
 /// The four mutually-exclusive classes of edit.
@@ -116,19 +120,19 @@ pub enum EditClass {
 impl EditClass {
     pub fn as_str(self) -> &'static str {
         match self {
-            EditClass::SttError     => "STT_ERROR",
-            EditClass::PolishError  => "POLISH_ERROR",
+            EditClass::SttError => "STT_ERROR",
+            EditClass::PolishError => "POLISH_ERROR",
             EditClass::UserRephrase => "USER_REPHRASE",
-            EditClass::UserRewrite  => "USER_REWRITE",
+            EditClass::UserRewrite => "USER_REWRITE",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_uppercase().as_str() {
-            "STT_ERROR"     | "STTERROR"     => Some(Self::SttError),
-            "POLISH_ERROR"  | "POLISHERROR"  => Some(Self::PolishError),
+            "STT_ERROR" | "STTERROR" => Some(Self::SttError),
+            "POLISH_ERROR" | "POLISHERROR" => Some(Self::PolishError),
             "USER_REPHRASE" | "USERREPHRASE" => Some(Self::UserRephrase),
-            "USER_REWRITE"  | "USERREWRITE"  => Some(Self::UserRewrite),
+            "USER_REWRITE" | "USERREWRITE" => Some(Self::UserRewrite),
             _ => None,
         }
     }
@@ -141,8 +145,8 @@ impl EditClass {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClassifyResult {
-    pub class:      EditClass,
-    pub reason:     String,
+    pub class: EditClass,
+    pub reason: String,
     /// One entry per diff hunk (in input order).  Each carries the original
     /// hunk plus the LLM's class label and confidence.  The route uses the
     /// hunk's text — it never relies on the LLM having "invented" a term.
@@ -242,12 +246,12 @@ OUTPUT — strict JSON only, no markdown, no commentary:
 /// `hunks` MUST be non-empty.  Empty hunks should be short-circuited at the
 /// pre-filter stage (no learnable change → don't waste an API call).
 pub async fn classify_edit(
-    client:          &Client,
-    groq_api_key:    &str,
-    transcript:      &str,
-    ai_output:       &str,
-    user_kept:       &str,
-    hunks:           &[Hunk],
+    client: &Client,
+    groq_api_key: &str,
+    transcript: &str,
+    ai_output: &str,
+    user_kept: &str,
+    hunks: &[Hunk],
     output_language: &str,
 ) -> Option<ClassifyResult> {
     if groq_api_key.is_empty() {
@@ -312,19 +316,28 @@ pub async fn classify_edit(
         .await
     {
         Ok(r) => r,
-        Err(e) => { warn!("[classifier] request failed: {e}"); return None; }
+        Err(e) => {
+            warn!("[classifier] request failed: {e}");
+            return None;
+        }
     };
 
     let status = resp.status();
     if !status.is_success() {
         let body_text = resp.text().await.unwrap_or_default();
-        warn!("[classifier] HTTP {status}: {}", &body_text[..body_text.len().min(300)]);
+        warn!(
+            "[classifier] HTTP {status}: {}",
+            &body_text[..body_text.len().min(300)]
+        );
         return None;
     }
 
     let resp_json: serde_json::Value = match resp.json().await {
         Ok(v) => v,
-        Err(e) => { warn!("[classifier] parse error: {e}"); return None; }
+        Err(e) => {
+            warn!("[classifier] parse error: {e}");
+            return None;
+        }
     };
 
     let ms = start.elapsed().as_millis();
@@ -350,7 +363,11 @@ pub async fn classify_edit(
         .map(|r| {
             info!(
                 "[classifier] {ms}ms — overall={} labelled={}/{} mean_conf={:.2} reason={:?}",
-                r.class.as_str(), r.candidates.len(), hunks.len(), r.confidence, r.reason,
+                r.class.as_str(),
+                r.candidates.len(),
+                hunks.len(),
+                r.confidence,
+                r.reason,
             );
             r
         })
@@ -394,18 +411,18 @@ pub fn parse_label_response(s: &str, hunks: &[Hunk]) -> Option<ClassifyResult> {
         #[serde(default)]
         overall: String,
         #[serde(default)]
-        reason:  String,
+        reason: String,
         #[serde(default)]
-        labels:  Vec<RawLabel>,
+        labels: Vec<RawLabel>,
     }
     #[derive(Deserialize)]
     struct RawLabel {
         #[serde(default)]
-        hunk_index:     usize,
+        hunk_index: usize,
         #[serde(default)]
-        class:          String,
+        class: String,
         #[serde(default)]
-        confidence:     f64,
+        confidence: f64,
         #[serde(default)]
         extracted_term: Option<RawExtracted>,
     }
@@ -414,23 +431,25 @@ pub fn parse_label_response(s: &str, hunks: &[Hunk]) -> Option<ClassifyResult> {
         #[serde(default)]
         transcript_form: String,
         #[serde(default)]
-        correct_form:    String,
+        correct_form: String,
     }
 
     let raw: Raw = serde_json::from_str(s).ok()?;
     // Priority: STT_ERROR > POLISH_ERROR > USER_REPHRASE > USER_REWRITE.
     fn priority(c: EditClass) -> u8 {
         match c {
-            EditClass::SttError     => 4,
-            EditClass::PolishError  => 3,
+            EditClass::SttError => 4,
+            EditClass::PolishError => 3,
             EditClass::UserRephrase => 2,
-            EditClass::UserRewrite  => 1,
+            EditClass::UserRewrite => 1,
         }
     }
     let dominant_from_labels = || -> Option<EditClass> {
         let mut best: Option<EditClass> = None;
         for l in &raw.labels {
-            let Some(c) = EditClass::parse(&l.class) else { continue };
+            let Some(c) = EditClass::parse(&l.class) else {
+                continue;
+            };
             if best.map(priority).unwrap_or(0) < priority(c) {
                 best = Some(c);
             }
@@ -450,30 +469,28 @@ pub fn parse_label_response(s: &str, hunks: &[Hunk]) -> Option<ClassifyResult> {
         // Validate extracted_term against the hunk's actual text — both forms
         // must be whole-word substrings of the corresponding window.  This
         // makes hallucination impossible at the schema level.
-        let extracted_term = lbl
-            .and_then(|l| l.extracted_term.as_ref())
-            .and_then(|et| {
-                let tf = et.transcript_form.trim();
-                let cf = et.correct_form.trim();
-                if tf.is_empty() || cf.is_empty() {
-                    return None;
-                }
-                let polish_haystack     = if hunk.polish_window.is_empty() {
-                    &hunk.transcript_window
-                } else {
-                    &hunk.polish_window
-                };
-                if !is_whole_word_substring(tf, polish_haystack) {
-                    return None;
-                }
-                if !is_whole_word_substring(cf, &hunk.kept_window) {
-                    return None;
-                }
-                Some(ExtractedTerm {
-                    transcript_form: tf.to_string(),
-                    correct_form:    cf.to_string(),
-                })
-            });
+        let extracted_term = lbl.and_then(|l| l.extracted_term.as_ref()).and_then(|et| {
+            let tf = et.transcript_form.trim();
+            let cf = et.correct_form.trim();
+            if tf.is_empty() || cf.is_empty() {
+                return None;
+            }
+            let polish_haystack = if hunk.polish_window.is_empty() {
+                &hunk.transcript_window
+            } else {
+                &hunk.polish_window
+            };
+            if !is_whole_word_substring(tf, polish_haystack) {
+                return None;
+            }
+            if !is_whole_word_substring(cf, &hunk.kept_window) {
+                return None;
+            }
+            Some(ExtractedTerm {
+                transcript_form: tf.to_string(),
+                correct_form: cf.to_string(),
+            })
+        });
 
         labelled.push(LabelledHunk {
             hunk: hunk.clone(),
@@ -490,13 +507,12 @@ pub fn parse_label_response(s: &str, hunks: &[Hunk]) -> Option<ClassifyResult> {
     };
 
     Some(ClassifyResult {
-        class:      overall,
-        reason:     raw.reason,
+        class: overall,
+        reason: raw.reason,
         candidates: labelled,
         confidence: mean_conf,
     })
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -504,7 +520,11 @@ mod tests {
     use crate::llm::edit_diff::Hunk;
 
     fn hunk(t: &str, p: &str, k: &str) -> Hunk {
-        Hunk { transcript_window: t.into(), polish_window: p.into(), kept_window: k.into() }
+        Hunk {
+            transcript_window: t.into(),
+            polish_window: p.into(),
+            kept_window: k.into(),
+        }
     }
 
     #[test]
@@ -556,7 +576,7 @@ mod tests {
         // hunk gets safe-default USER_REPHRASE so we don't promote it.
         let hunks = vec![
             hunk("written", "written", "n8n"),
-            hunk("good",    "good",    "great"),
+            hunk("good", "good", "great"),
         ];
         let json = r#"{"overall":"STT_ERROR","reason":"only first labelled",
                        "labels":[{"hunk_index":0,"class":"STT_ERROR","confidence":0.9}]}"#;
@@ -625,10 +645,12 @@ mod tests {
         // The candidate's getters now return the extracted token, NOT the
         // whole hunk.  This is what Stage-4 promotion sees.
         assert_eq!(cand.transcript_form(), "Anis");
-        assert_eq!(cand.correct_form(),    "anish");
+        assert_eq!(cand.correct_form(), "anish");
         // The original hunk text is preserved for inspection.
-        assert_eq!(cand.hunk.kept_window,
-                   "[anish@gmail.com](mailto:anish@gmail.com)");
+        assert_eq!(
+            cand.hunk.kept_window,
+            "[anish@gmail.com](mailto:anish@gmail.com)"
+        );
         assert_eq!(cand.extracted_term.as_ref().unwrap().correct_form, "anish");
     }
 
@@ -643,8 +665,10 @@ mod tests {
                         "extracted_term":{"transcript_form":"written","correct_form":"FAKE"}
                       }]}"#;
         let r = parse_label_response(json, &hunks).unwrap();
-        assert!(r.candidates[0].extracted_term.is_none(),
-                "FAKE is not in kept_window — extraction must be rejected");
+        assert!(
+            r.candidates[0].extracted_term.is_none(),
+            "FAKE is not in kept_window — extraction must be rejected"
+        );
         // Getters fall back to kept_window.
         assert_eq!(r.candidates[0].correct_form(), "n8n");
     }
@@ -693,8 +717,10 @@ mod tests {
                         "extracted_term":{"transcript_form":"ai","correct_form":"ai"}
                       }]}"#;
         let r = parse_label_response(json, &hunks).unwrap();
-        assert!(r.candidates[0].extracted_term.is_none(),
-                "'ai' is a substring of 'anish' but not a whole word — must reject");
+        assert!(
+            r.candidates[0].extracted_term.is_none(),
+            "'ai' is a substring of 'anish' but not a whole word — must reject"
+        );
     }
 
     #[test]
@@ -710,7 +736,9 @@ mod tests {
                         "extracted_term":{"transcript_form":"Anis","correct_form":"anish"}
                       }]}"#;
         let r = parse_label_response(json, &hunks).unwrap();
-        let et = r.candidates[0].extracted_term.as_ref()
+        let et = r.candidates[0]
+            .extracted_term
+            .as_ref()
             .expect("'anish' is whole-word inside the link — must be accepted");
         assert_eq!(et.correct_form, "anish");
     }

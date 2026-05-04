@@ -26,30 +26,30 @@
 //! diff-derived hunk passes all four stages. The LLM cannot bypass this by
 //! claiming a correction that doesn't exist in the actual edit text.
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{Json, extract::State, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::{
+    AppState,
     llm::{
-        classifier, classifier::{EditClass, LabelledHunk},
-        edit_diff, edit_diff::Hunk,
-        meaning,
-        phonetic_triage, phonetics, pre_filter, promotion_gate,
+        classifier,
+        classifier::{EditClass, LabelledHunk},
+        edit_diff,
+        edit_diff::Hunk,
+        meaning, phonetic_triage, phonetics, pre_filter, promotion_gate,
     },
     store::{
-        corrections, history, pending_edits,
-        prefs::get_prefs, stt_replacements, vocab_embeddings, vocab_fts,
-        vocabulary,
+        corrections, history, pending_edits, prefs::get_prefs, stt_replacements, vocab_embeddings,
+        vocab_fts, vocabulary,
     },
-    AppState,
 };
 
 #[derive(Deserialize)]
 pub struct ClassifyBody {
-    pub recording_id:   String,
-    pub ai_output:      String,
-    pub user_kept:      String,
+    pub recording_id: String,
+    pub ai_output: String,
+    pub user_kept: String,
     /// How the desktop captured the edit text.  Drives auto-promotion gating:
     ///   "ax" | "keystroke_verified" → high confidence, may auto-promote
     ///   "clipboard"                 → medium, may auto-promote with strict gates
@@ -75,7 +75,9 @@ pub struct ClassifyBody {
     pub matches_clipboard: bool,
 }
 
-fn default_capture_method() -> String { "ax".to_string() }
+fn default_capture_method() -> String {
+    "ax".to_string()
+}
 
 /// Maximum elapsed-since-paste before we treat the edit as unrelated to
 /// our paste.  30 seconds is generous (covers slow human typing, longer
@@ -100,14 +102,14 @@ fn is_high_confidence_capture(capture_method: &str) -> bool {
 
 #[derive(Serialize)]
 pub struct ClassifyResponse {
-    pub class:          String,
-    pub reason:         String,
-    pub candidates:     Vec<LabelledHunk>,
-    pub learned:        bool,
-    pub notify:         bool,
-    pub pending_id:     Option<String>,
+    pub class: String,
+    pub reason: String,
+    pub candidates: Vec<LabelledHunk>,
+    pub learned: bool,
+    pub notify: bool,
+    pub pending_id: Option<String>,
     pub promoted_count: usize,
-    pub is_repeat:      bool,
+    pub is_repeat: bool,
     /// Flat list of correct_form values that survived all gates and were
     /// promoted to vocabulary.  The desktop uses this for the in-app toast
     /// so it doesn't have to deserialize the full LabelledHunk schema.
@@ -117,7 +119,7 @@ pub struct ClassifyResponse {
     /// (k-threshold not met).  Surface this to the user as a soft "noticed —
     /// once more and I'll remember" toast so the system never feels silent.
     #[serde(default)]
-    pub queued_terms:   Vec<String>,
+    pub queued_terms: Vec<String>,
 }
 
 pub async fn classify(
@@ -163,10 +165,16 @@ pub async fn classify(
     //      • too late          — > 30 s after paste.  Universal reject; a
     //                            very late edit is rarely tied to our paste.
     if body.matches_clipboard {
-        info!("[classify] capture_error: kept text matches clipboard for {}", body.recording_id);
+        info!(
+            "[classify] capture_error: kept text matches clipboard for {}",
+            body.recording_id
+        );
         return (
             StatusCode::OK,
-            Json(empty_response("USER_REPHRASE", "capture_error: kept matches clipboard (user pasted)")),
+            Json(empty_response(
+                "USER_REPHRASE",
+                "capture_error: kept matches clipboard (user pasted)",
+            )),
         );
     }
     if body.app_switched && !is_high_confidence_capture(&body.capture_method) {
@@ -176,7 +184,10 @@ pub async fn classify(
         );
         return (
             StatusCode::OK,
-            Json(empty_response("USER_REPHRASE", "capture_error: app changed during low-confidence capture")),
+            Json(empty_response(
+                "USER_REPHRASE",
+                "capture_error: app changed during low-confidence capture",
+            )),
         );
     }
     if body.time_since_paste_ms > CAPTURE_STALE_MS {
@@ -186,7 +197,10 @@ pub async fn classify(
         );
         return (
             StatusCode::OK,
-            Json(empty_response("USER_REPHRASE", "capture_error: edit arrived > 30 s after paste")),
+            Json(empty_response(
+                "USER_REPHRASE",
+                "capture_error: edit arrived > 30 s after paste",
+            )),
         );
     }
 
@@ -201,7 +215,10 @@ pub async fn classify(
     // 4. STAGE 1 — Pre-filter.
     match pre_filter::run(&body.ai_output, &body.user_kept, &output_language) {
         pre_filter::PreFilter::Drop => {
-            info!("[classify] pre-filter: drop (no real edit) for {}", body.recording_id);
+            info!(
+                "[classify] pre-filter: drop (no real edit) for {}",
+                body.recording_id
+            );
             return (
                 StatusCode::OK,
                 Json(empty_response("USER_REPHRASE", "no learnable change")),
@@ -212,10 +229,7 @@ pub async fn classify(
                 "[classify] pre-filter: early-class={} reason={:?} (skipping LLM)",
                 d.class, d.reason
             );
-            return (
-                StatusCode::OK,
-                Json(empty_response(d.class, d.reason)),
-            );
+            return (StatusCode::OK, Json(empty_response(d.class, d.reason)));
         }
         pre_filter::PreFilter::Pass => {} // continue
     }
@@ -224,13 +238,20 @@ pub async fn classify(
     let hunks = edit_diff::diff(&transcript, &body.ai_output, &body.user_kept);
     if hunks.is_empty() {
         // Pre-filter said pass but diff found no structural change — vacuous edit.
-        info!("[classify] diff produced no hunks for {}", body.recording_id);
+        info!(
+            "[classify] diff produced no hunks for {}",
+            body.recording_id
+        );
         return (
             StatusCode::OK,
             Json(empty_response("USER_REPHRASE", "no structural diff hunks")),
         );
     }
-    info!("[classify] diff produced {} hunk(s) for {}", hunks.len(), body.recording_id);
+    info!(
+        "[classify] diff produced {} hunk(s) for {}",
+        hunks.len(),
+        body.recording_id
+    );
 
     // 5. STAGE 2.5 — Phonetic triage.  For each hunk, decide cheaply whether
     //    its class is obvious (clear typo/case-fix → STT_ERROR; clear synonym
@@ -244,7 +265,8 @@ pub async fn classify(
     if resolved_count > 0 {
         info!(
             "[classify] triage resolved {}/{} hunk(s) without LLM",
-            resolved_count, triage.len(),
+            resolved_count,
+            triage.len(),
         );
     }
     let ambiguous_hunks: Vec<Hunk> = triage
@@ -267,15 +289,25 @@ pub async fn classify(
             .unwrap_or_default();
         let http = state.http_client.clone();
         match classifier::classify_edit(
-            &http, &groq_key, &transcript, &body.ai_output, &body.user_kept,
-            &ambiguous_hunks, &output_language,
-        ).await {
+            &http,
+            &groq_key,
+            &transcript,
+            &body.ai_output,
+            &body.user_kept,
+            &ambiguous_hunks,
+            &output_language,
+        )
+        .await
+        {
             Some(r) => Some(r),
-            None    => {
+            None => {
                 // LLM failed — but we may still have triage-resolved hunks to act on.
                 // If we have NOTHING actionable, return the unavailable signal.
                 if resolved_count == 0 {
-                    info!("[classify] classifier unavailable — skipping for {}", body.recording_id);
+                    info!(
+                        "[classify] classifier unavailable — skipping for {}",
+                        body.recording_id
+                    );
                     return (
                         StatusCode::OK,
                         Json(empty_response("USER_REPHRASE", "classifier unavailable")),
@@ -291,9 +323,9 @@ pub async fn classify(
 
     // 6. STAGE 4 — Promotion gates + write artifacts.
     let mut promoted_count = 0_usize;
-    let mut is_repeat      = false;
-    let mut pending_id     = None;
-    let mut learned        = false;
+    let mut is_repeat = false;
+    let mut pending_id = None;
+    let mut learned = false;
     let mut promoted_terms: Vec<String> = Vec::new();
 
     // Capture-confidence master switch.  When false, no auto-promotion regardless
@@ -313,11 +345,15 @@ pub async fn classify(
 
     for cand in &result.candidates {
         let correct = cand.correct_form().trim();
-        if correct.is_empty() { continue; }
+        if correct.is_empty() {
+            continue;
+        }
 
         match cand.class {
             EditClass::SttError => {
-                if !auto_promote_allowed { continue; }
+                if !auto_promote_allowed {
+                    continue;
+                }
                 if !stt_promotion_allowed(cand, correct, &body.user_kept, &output_language) {
                     continue;
                 }
@@ -338,7 +374,12 @@ pub async fn classify(
                 // short message in nearly all cases).
                 let example_ctx = surrounding_sentence(&body.user_kept, correct);
                 if vocabulary::upsert_for_language_with_context(
-                    &state.pool, &state.default_user_id, correct, 1.0, "auto", &output_language,
+                    &state.pool,
+                    &state.default_user_id,
+                    correct,
+                    1.0,
+                    "auto",
+                    &output_language,
                     example_ctx.as_deref(),
                 ) {
                     learned = true;
@@ -348,7 +389,10 @@ pub async fn classify(
                     // Sync FTS index so BM25 retrieval (the keyword half of
                     // hybrid retrieval) can find this term. Cheap, sync.
                     vocab_fts::upsert(
-                        &state.pool, &state.default_user_id, correct, example_ctx.as_deref(),
+                        &state.pool,
+                        &state.default_user_id,
+                        correct,
+                        example_ctx.as_deref(),
                     );
 
                     // Fire-and-forget: embed the new sighting and recompute
@@ -356,11 +400,7 @@ pub async fn classify(
                     // embeddings). Failure here is non-fatal — the term
                     // still works via weight-based selection, just not via
                     // vector relevance until it's embedded.
-                    spawn_vocab_embedding(
-                        state.clone(),
-                        correct.to_string(),
-                        example_ctx.clone(),
-                    );
+                    spawn_vocab_embedding(state.clone(), correct.to_string(), example_ctx.clone());
                     // Foundational decoupling: meaning generation must run
                     // independently of the embedder. Previously it was fired
                     // *inside* spawn_vocab_embedding's success path, which
@@ -384,9 +424,10 @@ pub async fn classify(
                 // the bug we hit when MACOBS learned but next recording's
                 // raw STT ("मैं corps") didn't match the polish-side rule.
                 let aliases_written = stt_replacements::upsert_aliases(
-                    &state.pool, &state.default_user_id,
-                    cand.hunk.transcript_window.as_str(),  // raw STT span
-                    from,                                   // polish span
+                    &state.pool,
+                    &state.default_user_id,
+                    cand.hunk.transcript_window.as_str(), // raw STT span
+                    from,                                 // polish span
                     correct,
                     1.0,
                 );
@@ -399,7 +440,9 @@ pub async fn classify(
                 }
             }
             EditClass::PolishError => {
-                if !auto_promote_allowed { continue; }
+                if !auto_promote_allowed {
+                    continue;
+                }
                 if !polish_promotion_allowed(cand, correct, &body.user_kept, &output_language) {
                     continue;
                 }
@@ -419,7 +462,8 @@ pub async fn classify(
                     is_repeat = true;
                 }
                 corrections::upsert(
-                    &state.pool, &state.default_user_id,
+                    &state.pool,
+                    &state.default_user_id,
                     &[(wrong, correct.to_ascii_lowercase())],
                 );
                 learned = true;
@@ -447,29 +491,38 @@ pub async fn classify(
         || (learnable && !auto_promote_allowed);
     if needs_pending {
         pending_id = pending_edits::insert(
-            &state.pool, &state.default_user_id,
-            Some(&body.recording_id), &body.ai_output, &body.user_kept,
+            &state.pool,
+            &state.default_user_id,
+            Some(&body.recording_id),
+            &body.ai_output,
+            &body.user_kept,
         );
     }
 
     let notify = match result.class {
-        EditClass::SttError    => promoted_count > 0,
+        EditClass::SttError => promoted_count > 0,
         EditClass::PolishError => learned && is_repeat,
-        _                      => false,
+        _ => false,
     };
 
     info!(
         "[classify] {} overall={} hunks={} promoted={} repeat={} notify={} learned={} pending={:?}",
-        body.recording_id, result.class.as_str(), result.candidates.len(),
-        promoted_count, is_repeat, notify, learned, pending_id,
+        body.recording_id,
+        result.class.as_str(),
+        result.candidates.len(),
+        promoted_count,
+        is_repeat,
+        notify,
+        learned,
+        pending_id,
     );
 
     (
         StatusCode::OK,
         Json(ClassifyResponse {
-            class:          result.class.as_str().to_string(),
-            reason:         result.reason,
-            candidates:     result.candidates,
+            class: result.class.as_str().to_string(),
+            reason: result.reason,
+            candidates: result.candidates,
             learned,
             notify,
             pending_id,
@@ -483,9 +536,9 @@ pub async fn classify(
 
 /// Defense-in-depth gate for STT_ERROR auto-promotion.
 fn stt_promotion_allowed(
-    cand:            &LabelledHunk,
-    correct:         &str,
-    user_kept:       &str,
+    cand: &LabelledHunk,
+    correct: &str,
+    user_kept: &str,
     output_language: &str,
 ) -> bool {
     if !promotion_gate::appears_in_user_kept(correct, user_kept) {
@@ -514,7 +567,8 @@ fn stt_promotion_allowed(
     {
         warn!(
             "[classify] STT_ERROR rejected — concatenation pattern: polish_form {:?} ⊂ correct_form {:?} (likely insertion-without-deletion)",
-            cand.polish_form(), correct,
+            cand.polish_form(),
+            correct,
         );
         return false;
     }
@@ -523,7 +577,7 @@ fn stt_promotion_allowed(
     // Either phonetic similarity to the wrong form, or independent jargon-ness.
     let phon_sim = phonetics::similarity(cand.transcript_form(), correct)
         .max(phonetics::similarity(cand.polish_form(), correct));
-    let jargon   = phonetics::jargon_score(correct);
+    let jargon = phonetics::jargon_score(correct);
     let confident = cand.confidence >= 0.7;
 
     if phon_sim < 0.5 && jargon < 0.4 && !confident {
@@ -538,9 +592,9 @@ fn stt_promotion_allowed(
 
 /// Gate for POLISH_ERROR auto-promotion.
 fn polish_promotion_allowed(
-    _cand:           &LabelledHunk,
-    correct:         &str,
-    user_kept:       &str,
+    _cand: &LabelledHunk,
+    correct: &str,
+    user_kept: &str,
     output_language: &str,
 ) -> bool {
     promotion_gate::appears_in_user_kept(correct, user_kept)
@@ -550,12 +604,14 @@ fn polish_promotion_allowed(
 /// Demote vocabulary terms that appear in polish but are removed in user_kept.
 fn run_demotion_pass(state: &AppState, polish: &str, user_kept: &str) -> usize {
     let polish_lower = polish.to_ascii_lowercase();
-    let kept_lower   = user_kept.to_ascii_lowercase();
-    let vocab        = vocabulary::top_terms(&state.pool, &state.default_user_id, 200);
+    let kept_lower = user_kept.to_ascii_lowercase();
+    let vocab = vocabulary::top_terms(&state.pool, &state.default_user_id, 200);
 
     let mut demoted = 0_usize;
     for v in vocab {
-        if v.source == "starred" { continue; }
+        if v.source == "starred" {
+            continue;
+        }
         let term_lower = v.term.to_ascii_lowercase();
         if polish_lower.contains(&term_lower)
             && !kept_lower.contains(&term_lower)
@@ -572,12 +628,14 @@ fn correction_exists(state: &AppState, wrong: &str) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM word_corrections
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM word_corrections
          WHERE user_id = ?1 AND wrong_text = ?2",
-        rusqlite::params![state.default_user_id.as_str(), wrong],
-        |row| row.get(0),
-    ).unwrap_or(0);
+            rusqlite::params![state.default_user_id.as_str(), wrong],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
     count > 0
 }
 
@@ -587,7 +645,7 @@ fn correction_exists(state: &AppState, wrong: &str) -> bool {
 /// `ClassifyResult` looks identical to one produced by the all-LLM path, so
 /// the rest of the route doesn't care which source labelled which hunk.
 fn merge_triage_with_llm(
-    triage:     Vec<phonetic_triage::TriageDecision>,
+    triage: Vec<phonetic_triage::TriageDecision>,
     llm_result: Option<classifier::ClassifyResult>,
 ) -> classifier::ClassifyResult {
     let mut llm_iter = llm_result
@@ -600,7 +658,7 @@ fn merge_triage_with_llm(
     for d in triage {
         match d {
             phonetic_triage::TriageDecision::Resolved(lh) => candidates.push(lh),
-            phonetic_triage::TriageDecision::Ambiguous     => {
+            phonetic_triage::TriageDecision::Ambiguous => {
                 if let Some(lh) = llm_iter.next() {
                     candidates.push(lh);
                 }
@@ -617,9 +675,9 @@ fn merge_triage_with_llm(
         .iter()
         .map(|c| c.class)
         .max_by_key(|c| match c {
-            EditClass::SttError     => 4,
-            EditClass::PolishError  => 3,
-            EditClass::UserRewrite  => 2,
+            EditClass::SttError => 4,
+            EditClass::PolishError => 3,
+            EditClass::UserRewrite => 2,
             EditClass::UserRephrase => 1,
         })
         .unwrap_or(EditClass::UserRephrase);
@@ -635,7 +693,12 @@ fn merge_triage_with_llm(
         _ => "phonetic triage labelled all hunks without LLM".to_string(),
     };
 
-    classifier::ClassifyResult { class: overall, reason, candidates, confidence }
+    classifier::ClassifyResult {
+        class: overall,
+        reason,
+        candidates,
+        confidence,
+    }
 }
 
 /// Fire-and-forget: embed a newly learned vocab term (with its context)
@@ -647,11 +710,7 @@ fn merge_triage_with_llm(
 /// API's availability. If the embedder is down, the term is still useful
 /// (fallback to starred + weight selection); it just won't get the
 /// relevance boost until a future re-embed.
-fn spawn_vocab_embedding(
-    state:           AppState,
-    term:            String,
-    example_context: Option<String>,
-) {
+fn spawn_vocab_embedding(state: AppState, term: String, example_context: Option<String>) {
     tokio::spawn(async move {
         // Resolve Gemini key from prefs, fall back to env var.
         let key = get_prefs(&state.pool, &state.default_user_id)
@@ -674,11 +733,11 @@ fn spawn_vocab_embedding(
         else {
             return;
         };
-        let pool      = state.pool.clone();
-        let uid       = state.default_user_id.clone();
-        let term2     = term.clone();
-        let example   = text.clone();
-        let blocking  = tokio::task::spawn_blocking(move || {
+        let pool = state.pool.clone();
+        let uid = state.default_user_id.clone();
+        let term2 = term.clone();
+        let example = text.clone();
+        let blocking = tokio::task::spawn_blocking(move || {
             // Append this sighting to the per-term FIFO ring (cap N=10) and
             // recompute the centroid. The centroid replaces the legacy
             // single-embedding representation in vocab_embeddings.embedding
@@ -729,7 +788,7 @@ fn spawn_vocab_embedding(
 /// refresh tick will retry.
 fn spawn_meaning_refresh(state: AppState, term: String, latest_example: String) {
     tokio::spawn(async move {
-        let uid  = state.default_user_id.clone();
+        let uid = state.default_user_id.clone();
         let pool = state.pool.clone();
 
         // Cheap synchronous gate — most calls exit here without touching the LLM.
@@ -741,8 +800,9 @@ fn spawn_meaning_refresh(state: AppState, term: String, latest_example: String) 
         // Groq → OpenAI fallback internally; we just plumb the keys through
         // so a missing Groq key (or a Groq outage) still gets the meaning
         // generated via OpenAI.
-        let prefs    = get_prefs(&pool, &uid);
-        let groq_key = prefs.as_ref()
+        let prefs = get_prefs(&pool, &uid);
+        let groq_key = prefs
+            .as_ref()
             .and_then(|p| p.groq_api_key.clone())
             .or_else(|| std::env::var("GROQ_API_KEY").ok())
             .unwrap_or_default();
@@ -760,33 +820,45 @@ fn spawn_meaning_refresh(state: AppState, term: String, latest_example: String) 
             None => {
                 let example = if latest_example.trim().is_empty() {
                     term.clone()
-                } else { latest_example.clone() };
+                } else {
+                    latest_example.clone()
+                };
                 meaning::generate_initial(
-                    &state.http_client, &groq_key, &openai_key, &term, &example,
-                ).await
+                    &state.http_client,
+                    &groq_key,
+                    &openai_key,
+                    &term,
+                    &example,
+                )
+                .await
             }
             // Refinement: hand the LLM the prior description + recent ring.
             Some(prev) => {
-                let examples = vocab_embeddings::recent_example_texts(
-                    &pool, &uid, &term, 10,
-                );
+                let examples = vocab_embeddings::recent_example_texts(&pool, &uid, &term, 10);
                 if examples.is_empty() {
                     None
                 } else {
                     meaning::refine(
-                        &state.http_client, &groq_key, &openai_key, &term, prev, &examples,
-                    ).await
+                        &state.http_client,
+                        &groq_key,
+                        &openai_key,
+                        &term,
+                        prev,
+                        &examples,
+                    )
+                    .await
                 }
             }
         };
 
         if let Some(new_meaning) = result {
             let pool2 = pool.clone();
-            let uid2  = uid.clone();
+            let uid2 = uid.clone();
             let term2 = term.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 vocabulary::update_meaning(&pool2, &uid2, &term2, &new_meaning);
-            }).await;
+            })
+            .await;
         }
     });
 }
@@ -800,7 +872,9 @@ fn spawn_meaning_refresh(state: AppState, term: String, latest_example: String) 
 /// when no boundary brackets the term.
 fn surrounding_sentence(text: &str, term: &str) -> Option<String> {
     let term_l = term.to_ascii_lowercase();
-    if term_l.is_empty() { return None; }
+    if term_l.is_empty() {
+        return None;
+    }
     let text_l = text.to_ascii_lowercase();
     let pos = text_l.find(&term_l)?;
     // Walk backward to nearest sentence terminator (or start of text).
@@ -815,21 +889,25 @@ fn surrounding_sentence(text: &str, term: &str) -> Option<String> {
         .map(|i| after_term + i + 1)
         .unwrap_or(text.len());
     let snippet = text[start..end].trim();
-    if snippet.is_empty() { None } else { Some(snippet.to_string()) }
+    if snippet.is_empty() {
+        None
+    } else {
+        Some(snippet.to_string())
+    }
 }
 
 fn empty_response(class: &str, reason: &str) -> ClassifyResponse {
     ClassifyResponse {
-        class:          class.to_string(),
-        reason:         reason.to_string(),
-        candidates:     vec![],
-        learned:        false,
-        notify:         false,
-        pending_id:     None,
+        class: class.to_string(),
+        reason: reason.to_string(),
+        candidates: vec![],
+        learned: false,
+        notify: false,
+        pending_id: None,
         promoted_count: 0,
-        is_repeat:      false,
+        is_repeat: false,
         promoted_terms: vec![],
-        queued_terms:   vec![],
+        queued_terms: vec![],
     }
 }
 
@@ -840,21 +918,21 @@ mod tests {
     #[test]
     fn surrounding_sentence_returns_the_containing_clause() {
         let text = "Hello there. MACOBS ka IPO ka 12 hazaar batana. Then bye.";
-        let got  = surrounding_sentence(text, "MACOBS");
+        let got = surrounding_sentence(text, "MACOBS");
         assert_eq!(got.as_deref(), Some("MACOBS ka IPO ka 12 hazaar batana."));
     }
 
     #[test]
     fn surrounding_sentence_handles_no_terminator() {
-        let text = "MACOBS ka IPO ka 12 hazaar batana";  // no '.', '!', '?'
-        let got  = surrounding_sentence(text, "MACOBS");
+        let text = "MACOBS ka IPO ka 12 hazaar batana"; // no '.', '!', '?'
+        let got = surrounding_sentence(text, "MACOBS");
         assert_eq!(got.as_deref(), Some("MACOBS ka IPO ka 12 hazaar batana"));
     }
 
     #[test]
     fn surrounding_sentence_handles_term_at_start() {
         let text = "MACOBS! Then more text.";
-        let got  = surrounding_sentence(text, "MACOBS");
+        let got = surrounding_sentence(text, "MACOBS");
         assert_eq!(got.as_deref(), Some("MACOBS!"));
     }
 
@@ -867,7 +945,7 @@ mod tests {
     fn surrounding_sentence_is_case_insensitive() {
         // user_kept may have the term in any case; we still want to find it
         let text = "Hello. macobs ka IPO. Bye.";
-        let got  = surrounding_sentence(text, "MACOBS");
+        let got = surrounding_sentence(text, "MACOBS");
         assert_eq!(got.as_deref(), Some("macobs ka IPO."));
     }
 

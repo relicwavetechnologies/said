@@ -35,46 +35,47 @@ struct Golden {
 
 #[derive(Debug, Deserialize)]
 struct Case {
-    name:            String,
-    polish:          String,
-    user_kept:       String,
-    transcript:      String,
+    name: String,
+    polish: String,
+    user_kept: String,
+    transcript: String,
     output_language: String,
     #[serde(default = "default_capture_method")]
-    capture_method:  String,
-    expected:        Expected,
+    capture_method: String,
+    expected: Expected,
 }
 
-fn default_capture_method() -> String { "ax".to_string() }
+fn default_capture_method() -> String {
+    "ax".to_string()
+}
 
 #[derive(Debug, Deserialize)]
 struct Expected {
     /// "drop" | "early_user_rewrite" | "early_user_rephrase" | "pass"
-    pre_filter:            String,
+    pre_filter: String,
     /// "STT_ERROR" | "POLISH_ERROR" | "USER_REPHRASE" | "USER_REWRITE" | "DROP"
-    expected_class:        String,
+    expected_class: String,
     /// Term that promotion gates should accept (or null if none).
-    should_promote_term:   Option<String>,
+    should_promote_term: Option<String>,
     /// Whether the gate should accept the term assuming the LLM hands it over.
     promotion_should_pass: bool,
     #[serde(default)]
-    notes:                 String,
+    notes: String,
 }
 
 #[derive(Default, Debug)]
 struct Stats {
-    total:           usize,
-    pre_filter_ok:   usize,
-    promotion_ok:    usize,
-    failures:        Vec<String>,
+    total: usize,
+    pre_filter_ok: usize,
+    promotion_ok: usize,
+    failures: Vec<String>,
 }
 
 #[test]
 fn learning_pipeline_golden_eval() {
     let bytes = std::fs::read("tests/data/learning_golden.json")
         .expect("missing tests/data/learning_golden.json");
-    let golden: Golden = serde_json::from_slice(&bytes)
-        .expect("invalid learning_golden.json");
+    let golden: Golden = serde_json::from_slice(&bytes).expect("invalid learning_golden.json");
 
     let mut stats = Stats::default();
 
@@ -88,11 +89,15 @@ fn learning_pipeline_golden_eval() {
         // ── Stage 1: pre_filter ──────────────────────────────────────────
         let pf = pre_filter::run(&case.polish, &case.user_kept, &case.output_language);
         let pf_actual = match &pf {
-            pre_filter::PreFilter::Drop                                                  => "drop",
-            pre_filter::PreFilter::EarlyClass(d) if d.class == "USER_REWRITE"            => "early_user_rewrite",
-            pre_filter::PreFilter::EarlyClass(d) if d.class == "USER_REPHRASE"           => "early_user_rephrase",
-            pre_filter::PreFilter::EarlyClass(_)                                         => "early_other",
-            pre_filter::PreFilter::Pass                                                  => "pass",
+            pre_filter::PreFilter::Drop => "drop",
+            pre_filter::PreFilter::EarlyClass(d) if d.class == "USER_REWRITE" => {
+                "early_user_rewrite"
+            }
+            pre_filter::PreFilter::EarlyClass(d) if d.class == "USER_REPHRASE" => {
+                "early_user_rephrase"
+            }
+            pre_filter::PreFilter::EarlyClass(_) => "early_other",
+            pre_filter::PreFilter::Pass => "pass",
         };
         if pf_actual == case.expected.pre_filter {
             stats.pre_filter_ok += 1;
@@ -109,20 +114,22 @@ fn learning_pipeline_golden_eval() {
         // term to be evaluated. We synthesise a hunk that the LLM might
         // plausibly produce so we test the gate in isolation.
         if let Some(term) = &case.expected.should_promote_term {
-            let synthetic_hunk = synthesise_hunk_for(
-                &case.transcript, &case.polish, &case.user_kept, term,
-            );
+            let synthetic_hunk =
+                synthesise_hunk_for(&case.transcript, &case.polish, &case.user_kept, term);
             let synthetic_cand = LabelledHunk {
                 hunk: synthetic_hunk,
                 class: EditClass::SttError,
                 confidence: 0.9,
                 extracted_term: Some(ExtractedTerm {
                     transcript_form: nearest_polish_token(&case.polish, term),
-                    correct_form:    term.clone(),
+                    correct_form: term.clone(),
                 }),
             };
             let gate_passed = stt_promotion_gate(
-                &synthetic_cand, term, &case.user_kept, &case.output_language,
+                &synthetic_cand,
+                term,
+                &case.user_kept,
+                &case.output_language,
             );
             // Capture-confidence policy: keystroke_only never auto-promotes.
             let allowed_by_capture = matches!(
@@ -137,8 +144,11 @@ fn learning_pipeline_golden_eval() {
                 case_failed = true;
                 stats.failures.push(format!(
                     "  ✗ [{}] promotion: expected pass={}, got pass={} (gate={}, capture_ok={})",
-                    case.name, case.expected.promotion_should_pass, promotion_actual,
-                    gate_passed, allowed_by_capture,
+                    case.name,
+                    case.expected.promotion_should_pass,
+                    promotion_actual,
+                    gate_passed,
+                    allowed_by_capture,
                 ));
             }
         } else {
@@ -153,12 +163,18 @@ fn learning_pipeline_golden_eval() {
 
     // ── Summary ──────────────────────────────────────────────────────────
     println!("\n=== Results ===");
-    println!("Pre-filter:  {}/{}  ({:.1}%)",
-             stats.pre_filter_ok, stats.total,
-             100.0 * stats.pre_filter_ok as f64 / stats.total as f64);
-    println!("Promotion:   {}/{}  ({:.1}%)",
-             stats.promotion_ok, stats.total,
-             100.0 * stats.promotion_ok as f64 / stats.total as f64);
+    println!(
+        "Pre-filter:  {}/{}  ({:.1}%)",
+        stats.pre_filter_ok,
+        stats.total,
+        100.0 * stats.pre_filter_ok as f64 / stats.total as f64
+    );
+    println!(
+        "Promotion:   {}/{}  ({:.1}%)",
+        stats.promotion_ok,
+        stats.total,
+        100.0 * stats.promotion_ok as f64 / stats.total as f64
+    );
 
     if !stats.failures.is_empty() {
         println!("\nFailures:");
@@ -184,7 +200,9 @@ fn synthesise_hunk_for(transcript: &str, polish: &str, kept: &str, term: &str) -
     let hunks = edit_diff::diff(transcript, polish, kept);
     // Prefer a hunk whose kept_window contains the term (case-insensitive).
     let pick = hunks.iter().find(|h| {
-        h.kept_window.to_ascii_lowercase().contains(&term.to_ascii_lowercase())
+        h.kept_window
+            .to_ascii_lowercase()
+            .contains(&term.to_ascii_lowercase())
     });
     if let Some(h) = pick {
         return h.clone();
@@ -193,8 +211,8 @@ fn synthesise_hunk_for(transcript: &str, polish: &str, kept: &str, term: &str) -
     // short and the term IS the kept_window.
     Hunk {
         transcript_window: transcript.to_string(),
-        polish_window:     polish.to_string(),
-        kept_window:       kept.to_string(),
+        polish_window: polish.to_string(),
+        kept_window: kept.to_string(),
     }
 }
 
@@ -218,9 +236,9 @@ fn nearest_polish_token(polish: &str, target: &str) -> String {
 /// Kept here as a copy so the eval doesn't need to spin up AppState/SQLite.
 /// **Keep this in sync with the route** — drift here masks regressions.
 fn stt_promotion_gate(
-    cand:            &LabelledHunk,
-    correct:         &str,
-    user_kept:       &str,
+    cand: &LabelledHunk,
+    correct: &str,
+    user_kept: &str,
     output_language: &str,
 ) -> bool {
     if !promotion_gate::appears_in_user_kept(correct, user_kept) {
@@ -241,7 +259,11 @@ fn stt_promotion_gate(
         // pattern — *unless* the extracted form is itself the concatenation,
         // which is the EMIAC case. We need to detect that the extraction
         // didn't actually un-bundle the concatenation.
-        if cand.extracted_term.as_ref().map(|t| t.correct_form.as_str()) == Some(correct)
+        if cand
+            .extracted_term
+            .as_ref()
+            .map(|t| t.correct_form.as_str())
+            == Some(correct)
             && correct == cand.hunk.kept_window.trim()
         {
             return false;
@@ -249,7 +271,7 @@ fn stt_promotion_gate(
     }
     let phon_sim = phonetics::similarity(cand.transcript_form(), correct)
         .max(phonetics::similarity(cand.polish_form(), correct));
-    let jargon   = phonetics::jargon_score(correct);
+    let jargon = phonetics::jargon_score(correct);
     let confident = cand.confidence >= 0.7;
     if phon_sim < 0.5 && jargon < 0.4 && !confident {
         return false;
@@ -271,7 +293,11 @@ fn diff_isolates_single_token_swap() {
         "I use n8n for automation",
     );
     // At least one hunk where polish has "written" and kept has "n8n".
-    assert!(hunks.iter().any(|h|
-        h.polish_window.contains("written") && h.kept_window.contains("n8n")
-    ), "expected an n8n-for-written hunk, got {:#?}", hunks);
+    assert!(
+        hunks
+            .iter()
+            .any(|h| h.polish_window.contains("written") && h.kept_window.contains("n8n")),
+        "expected an n8n-for-written hunk, got {:#?}",
+        hunks
+    );
 }

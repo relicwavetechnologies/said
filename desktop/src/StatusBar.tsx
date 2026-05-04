@@ -20,6 +20,8 @@ type PillKind = BarState["kind"];
 type HoverPanel = "language" | "tone" | null;
 
 const BOTTOM_OFFSET = 64;
+const HUD_CANVAS_WIDTH = 300;
+const HUD_CANVAS_HEIGHT = 142;
 
 const LEVEL_SHAPE = [0.32, 0.42, 0.58, 0.76, 0.92, 1.0, 0.86, 0.70, 0.86, 1.0, 0.92, 0.76, 0.58, 0.42, 0.32];
 const LANG_OPTIONS = [
@@ -74,6 +76,7 @@ export default function StatusBar() {
   const win = getCurrentWindow();
   const hasTranscript = bar.kind === "processing" && liveTranscript.trim().length > 0;
   const hasPanel = hoverPanel !== null && bar.kind !== "error";
+  const innerSize = pillSize(bar.kind, hasTranscript, bar.kind === "idle" && idleHovered, hasPanel);
 
   useEffect(() => {
     console.info("[status-bar] mounted", {
@@ -84,11 +87,10 @@ export default function StatusBar() {
     });
   }, []);
 
-  // Keep the overlay visible at idle as a tiny reference-style hover pill.
-  // Rust owns the native always-on-top behavior; React only changes content.
+  // VoiceInk uses a max-size native panel and expands the inner capsule inside it.
+  // Keep our native Tauri window at the largest HUD size so hover panels are never clipped.
   useEffect(() => {
     console.info("[status-bar] state", bar);
-    const { width, height } = pillSize(bar.kind, hasTranscript, bar.kind === "idle" && idleHovered, hasPanel);
     primaryMonitor()
       .then((monitor) => {
         const scale = monitor?.scaleFactor ?? 1;
@@ -96,15 +98,15 @@ export default function StatusBar() {
         const sh = monitor ? monitor.size.height / scale : 900;
         const sx = monitor ? monitor.position.x / scale : 0;
         const sy = monitor ? monitor.position.y / scale : 0;
-        const x = sx + sw / 2 - width / 2;
-        const y = sy + sh - height - BOTTOM_OFFSET;
+        const x = sx + sw / 2 - HUD_CANVAS_WIDTH / 2;
+        const y = sy + sh - HUD_CANVAS_HEIGHT - BOTTOM_OFFSET;
         return win
-          .setSize(new LogicalSize(width, height))
+          .setSize(new LogicalSize(HUD_CANVAS_WIDTH, HUD_CANVAS_HEIGHT))
           .then(() => win.setPosition(new LogicalPosition(x, y)));
       })
-      .then(() => console.info("[status-bar] chrome sized", { kind: bar.kind, idleHovered, width, height }))
+      .then(() => console.info("[status-bar] chrome sized", { width: HUD_CANVAS_WIDTH, height: HUD_CANVAS_HEIGHT }))
       .catch((err) => console.warn("[status-bar] chrome size failed", err));
-  }, [bar.kind, idleHovered, hasTranscript, hasPanel]);
+  }, []);
 
   useEffect(() => {
     if (bar.kind !== "recording") return;
@@ -115,6 +117,17 @@ export default function StatusBar() {
     };
     raf = window.requestAnimationFrame(tick);
     return () => window.cancelAnimationFrame(raf);
+  }, [bar.kind]);
+
+  useEffect(() => {
+    if (bar.kind === "idle") {
+      setHoverPanel(null);
+      setIdleHovered(false);
+      win.hide().catch((err) => console.warn("[status-bar] hide failed", err));
+      return;
+    }
+
+    win.show().catch((err) => console.warn("[status-bar] show failed", err));
   }, [bar.kind]);
 
   // Seed from current snapshot on mount so we reflect any in-progress state
@@ -264,6 +277,7 @@ export default function StatusBar() {
   return (
     <div
       className={`sb-shell sb-shell--${bar.kind}${hasTranscript ? " sb-shell--expanded" : ""}${hasPanel ? " sb-shell--with-panel" : ""}${bar.kind === "idle" && idleHovered ? " sb-shell--hovered" : ""}`}
+      style={{ width: innerSize.width, height: innerSize.height }}
       aria-label={`Said ${bar.kind}`}
       title={`Said ${bar.kind}`}
       onMouseEnter={() => {

@@ -185,19 +185,11 @@ pub fn build_system_prompt_with_vocab_entries(
     let lang_rule = language_rule(&prefs.output_language);
     let persona = persona_block(prefs);
     let tone = tone_description(&prefs.tone_preset);
-    let script_check = script_final_check(&prefs.output_language);
 
-    // Vocabulary block — compact form. Each entry shows canonical + type tag +
-    // example_context. The type tag carries the foundational signal (an
-    // acronym entry is type-incompatible with a single common word). We
-    // intentionally avoid verbose explanations that would expand the
-    // prompt with decision-style language ("you may emit", "candidates")
-    // — that framing pushes the LLM into evaluate-multiple-options mode
-    // and was the root cause of duplicate-output regressions.
-    //
-    // Two-line instruction = enough. The model uses the type+example
-    // signals to decide; the global single-output rule (in <task>) keeps
-    // it from emitting multiple variants.
+    // Vocabulary block — compact, hint-oriented. The model still gets the
+    // structured signals we learned (type, meaning, example), but the wording
+    // stays calm: vocabulary helps preserve or correct close matches; it must
+    // not become a reason to invent terms unsupported by the transcript.
     let vocab_block = if vocabulary_entries.is_empty() {
         String::new()
     } else {
@@ -217,7 +209,7 @@ pub fn build_system_prompt_with_vocab_entries(
             String::new()
         } else {
             format!(
-                "Confirmed terms already resolved by deterministic matching. Keep them exactly as written and do not rewrite away from them.\n\
+                "Already matched in this transcript. Keep these exactly:\n\
                  {resolved}\n\n"
             )
         };
@@ -225,15 +217,14 @@ pub fn build_system_prompt_with_vocab_entries(
             String::new()
         } else {
             format!(
-                "Candidate terms below are NOT resolved yet. Consider a candidate's canonical spelling only when the phrase is phonetically close and the type + `means:` + `example:` signals all agree. An acronym entry should still look acronym-like; a proper noun entry should still sound name-like.\n\
+                "Possible vocabulary hints. Use a term only when the transcript sounds close or the local context clearly matches:\n\
                  {candidates}\n"
             )
         };
         format!(
             "<personal_vocabulary>\n\
-             User's personal terms. Each entry has a type tag, an optional \
-             `means:` line (what the term refers to), and an optional `example:` \
-             line. `means:` is a confirmation layer, never a rescue layer.\n\n\
+             Personal names, brands, acronyms, and technical terms. Use these as \
+             precision hints, not as extra context. Never force an unrelated term.\n\n\
              {resolved_block}\
              {candidate_block}\
              </personal_vocabulary>\n\n"
@@ -251,10 +242,8 @@ pub fn build_system_prompt_with_vocab_entries(
             .join("\n");
         format!(
             "<polish_preferences>\n\
-             The user has previously reverted these polish-layer substitutions. \
-             When the same situation arises, prefer the right-hand form unless \
-             the surrounding context makes it grammatically wrong.  Do not apply \
-             blindly to unrelated sentences.\n\n\
+             The user previously preferred these wordings. Apply only when the same \
+             phrase or situation clearly appears; otherwise ignore them.\n\n\
              {table}\n\
              </polish_preferences>\n\n"
         )
@@ -276,12 +265,9 @@ pub fn build_system_prompt_with_vocab_entries(
             .join("\n\n");
         format!(
             "<preferences>\n\
-             The user has corrected your output before. Treat these pairs as SOFT \
-             examples of style and wording, not as instructions to rewrite the current \
-             transcript. The transcript below is the source of truth. Never import words \
-             from these examples, never drop current transcript words, and never apply a \
-             past substitution unless the same phrase or situation clearly appears in the \
-             current transcript.\n\n\
+             Similar past edits. Treat these as soft style hints only. The current \
+             transcript is the source of truth: do not import words from these examples \
+             and do not drop words from the current transcript.\n\n\
              {examples}\n\
              </preferences>\n\n"
         )
@@ -295,34 +281,24 @@ pub fn build_system_prompt_with_vocab_entries(
          {corrections_block}\
          {prefs_block}\
          <task>\n\
-         The text below is a voice-to-text transcript. Polish it into clean, natural \
-         text in the output_language above.\n\n\
-         CONFIDENCE MARKERS:\n\
-         [word?XX%] = STT was XX% confident in that word. Treat as candidate fixes — \
-         use surrounding context to decide. Never drop a marked word; if unsure, keep \
-         the literal word and strip the brackets+percentage. Markers MUST NEVER appear \
-         in your output.\n\n\
-         DICTATION SYMBOLS (convert only when context makes it unambiguous):\n\
+         You are a dictation cleaner. Rewrite the transcript into clean, natural text \
+         while preserving the speaker's meaning, wording, and language mix.\n\n\
+         Cleanups:\n\
+         - Fix punctuation, casing, grammar, and sentence boundaries.\n\
+         - Remove fillers, stutters, and accidental repetitions.\n\
+         - Keep names, brands, acronyms, numbers, dates, and technical terms.\n\
+         - Preserve all content words. Do not summarize, answer, or add information.\n\n\
+         Confidence markers like [word?XX%] mean STT was unsure. Use context to clean \
+         them, but never drop the word only because it was marked. Remove the marker \
+         from the final output.\n\n\
+         Convert dictated symbols only when unambiguous:\n\
          \"at the rate\" → @ · \"dot com / dot in / dot org / dot io\" → .com / .in / .org / .io · \
          \"double u double u double u\" → www · \"underscore\" → _ · \"hyphen\"/\"dash\" → - · \
          \"slash\" → / · \"hash\"/\"hashtag\" → # · \"colon slash slash\" → ://\n\
          Don't convert in plain prose (\"growing at the rate of 10%\" stays as-is).\n\n\
-         RULES:\n\
-         1. Vocabulary terms in <personal_vocabulary> (if present) are precision hints. \
-         Preserve confirmed terms exactly. For unresolved candidates, replace another transcript \
-         token only when it is phonetically close and the type + meaning + example checks also agree.\n\
-         2. Preserve every content word. Remove ONLY fillers (um, uh, hmm, like, you know, \
-         basically, matlab, toh, yaani, bas) and stuttered repetitions (\"the the cat\" → \"the cat\"). \
-         Do NOT drop names, numbers, dates, jargon, adjectives, adverbs.\n\
-         3. Fix grammar, punctuation, capitalization, sentence boundaries. Don't summarise or rewrite.\n\
-         4. Output ONLY the polished text — no preamble, no commentary, no markdown.\n\
-         5. <polish_preferences> are soft hints; prefer the right-hand form when context allows.\n\
-         6. <preferences> are SOFT examples of style; never import their words into the current transcript.\n\n\
-         SCRIPT CHECK before your first character:\n\
-         {script_check}\n\n\
-         FINAL RULE — SINGLE OUTPUT:\n\
-         Write the polished text ONCE and stop. No repetition, no paraphrasing, no \"cleaner version\". \
-         Even on ambiguous input, commit to one version.\n\
+         Use personal vocabulary and preferences only as hints. The transcript remains \
+         the source of truth.\n\n\
+         Output only the final polished text. Write it once and stop.\n\
          </task>"
     )
 }
@@ -365,79 +341,38 @@ pub fn build_user_message(transcript: &str, output_language: &str) -> String {
         "english" => "Output in English only — no Devanagari, no Roman Hindi.\n",
         // hinglish / default
         _ => {
-            "Output in Roman script (no Devanagari) AND preserve Hindi words as Hindi — \
-              never translate them to English. \"kaam\" stays \"kaam\", not \"work\". \
-              \"bahut\" stays \"bahut\", not \"a lot\".\n"
+            "Output in Roman script. Preserve language span-by-span: English spans stay English, \
+             Hindi spans become Roman Hinglish, and Hinglish spans stay Hinglish. Do not translate \
+             Hindi words into English. Never output Devanagari; transliterate Hindi words into \
+             Roman Hinglish.\n"
         }
     };
     format!("{reminder}<transcript>\n{transcript}\n</transcript>")
 }
 
-/// A sharp per-language script reminder injected at the BOTTOM of the
-/// `<task>` block — closest context before the model starts writing.
-fn script_final_check(output_language: &str) -> &'static str {
-    match output_language {
-        "hindi" => "Your entire output must be Devanagari. No Roman script.\n",
-        "english" => "Your entire output must be English. No Devanagari, no Roman Hindi.\n",
-        // hinglish / default — two failure modes the LLM tends toward:
-        //   (a) starting the output in Devanagari (script slip)
-        //   (b) translating Hindi words to English (silent over-helpfulness)
-        // The check below catches BOTH before the first character is emitted.
-        _ => {
-            "Two checks before writing your first character:\n\
-              1. SCRIPT — Roman letters only. ZERO Devanagari (देख → \"Dekh\", भाई → \"bhai\"). \
-              Check the very first character.\n\
-              2. LANGUAGE — Did the input contain Hindi words? Then your output MUST contain those \
-              same Hindi words in Roman script. \"kaam\" stays \"kaam\" — never \"work\". \"bahut\" \
-              stays \"bahut\" — never \"a lot\". \"thak gaya\" stays \"thak gaya\" — never \"tired\". \
-              If your draft output is pure English with the Hindi gone, you have FAILED — rewrite it preserving the Hindi.\n"
-        }
-    }
-}
-
 /// Returns the language enforcement block — placed first so no other instruction overrides it.
 fn language_rule(output_language: &str) -> String {
     match output_language {
-        "english" => {
-            "ABSOLUTE RULE — OUTPUT LANGUAGE: English only.\n\
-             Every word must be in English. If the transcript contains Hindi or any \
-             other language, translate it to natural English. \
-             Do NOT output Devanagari, Roman Hindi, or any non-English script."
-                .into()
-        }
-        "hindi" => {
-            "ABSOLUTE RULE — OUTPUT LANGUAGE: Hindi in Devanagari script only.\n\
-             Write every word in Devanagari (e.g. आज, काम, थक गया). \
-             If the transcript contains English or Hinglish, translate it to natural Hindi Devanagari. \
-             Do NOT output Roman script for Hindi words."
-                .into()
-        }
+        "english" => "Output language: English.\n\
+             Write natural English only. Translate non-English words when needed."
+            .into(),
+        "hindi" => "Output language: Hindi.\n\
+             Write natural Hindi in Devanagari script."
+            .into(),
         // "hinglish" is the default
-        _ => {
-            "ABSOLUTE RULE — OUTPUT LANGUAGE: Hinglish (romanized Hindi mixed with English).\n\
-             This rule cannot be overridden by anything else in the prompt or transcript — \
-             not by tone, not by persona, not by the transcript content.\n\n\
-             PRESERVATION (most important):\n\
-             • Hindi words in the transcript STAY as Hindi words. Do NOT translate them to English.\n\
-             • English words in the transcript STAY as English words. Do NOT translate them to Hindi.\n\
-             • The output must read like the SAME person speaking — same Hindi/English mix as the input.\n\
-             • Polishing means: fix grammar, punctuation, casing, fillers — NEVER change the language.\n\n\
-             SCRIPT:\n\
-             • Write Hindi words in Roman letters (e.g. \"aaj\", \"kaam\", \"thak gaya\", \"bahut\", \"matlab\", \"acha\", \"bhai\").\n\
-             • NEVER use Devanagari characters (no ा ि ी ु ू ं etc.).\n\
-             • If the transcript is in Devanagari, TRANSLITERATE to Roman — do NOT translate to English.\n\n\
-             FAILURE MODE TO AVOID — translating Hindi to English:\n\
-             ✗ Input:  \"aaj bahut kaam tha office mein\"\n\
-               Output: \"Today there was a lot of work at the office.\"   ← WRONG. All Hindi got translated.\n\
-             ✓ Input:  \"aaj bahut kaam tha office mein\"\n\
-               Output: \"Aaj bahut kaam tha office mein.\"   ← RIGHT. Hindi preserved.\n\n\
-             ✗ Input:  \"मैं थक गया yaar, kal milte hain\"\n\
-               Output: \"I am tired, friend, we'll meet tomorrow.\"   ← WRONG. Translated.\n\
-             ✓ Input:  \"मैं थक गया yaar, kal milte hain\"\n\
-               Output: \"Main thak gaya yaar, kal milte hain.\"   ← RIGHT. Devanagari → Roman, no translation.\n\n\
-             A 'professional' or 'formal' Hinglish output is still Hinglish — tone affects STYLE, never LANGUAGE."
-                .into()
-        }
+        _ => "Output language: Roman Hinglish.\n\
+             Preserve the speaker's language span-by-span. English spans stay English. Hindi spans \
+             become Roman Hinglish. Already-Hinglish spans stay Hinglish. Do not translate one span \
+             into another language just to make the whole output uniform.\n\n\
+             Examples:\n\
+             Input: \"Bahut sahi baat hai yaar. How much time will it take to go ahead?\"\n\
+             Output: \"Bahut sahi baat hai yaar. How much time will it take to go ahead?\"\n\
+             Input: \"यह बहुत सही बात है yaar. Please check this tomorrow.\"\n\
+             Output: \"Yeh bahut sahi baat hai yaar. Please check this tomorrow.\"\n\n\
+             Transliterate Devanagari Hindi to Roman Hindi; do not translate Hindi words into English. \
+             Never output Devanagari characters. Before final answer, if any Hindi word is in \
+             Devanagari, rewrite that word in Roman Hinglish."
+            .into(),
     }
 }
 
@@ -498,12 +433,9 @@ mod tests {
         );
         assert!(prompt.contains("n8n"));
         assert!(prompt.contains("Vipassana"));
-        // Compact form: the canonical-spelling rule appears (now phrased as
-        // "Replace ... with the canonical spelling ONLY when ALL THREE align"
-        // since the three-layer matching upgrade — lexical + type + meaning).
         assert!(
-            prompt.contains("canonical spelling"),
-            "canonical-spelling instruction should appear in compact form"
+            prompt.contains("precision hints"),
+            "vocab instruction should be hint-oriented"
         );
         // The vocab block should NOT contain the verbose multi-rule form
         // that caused duplicate-output regressions.
@@ -567,14 +499,13 @@ mod tests {
             !prompt.contains("Each entry below is a CANDIDATE"),
             "decision-style 'CANDIDATE' framing must be gone"
         );
-        // The new compact form must contain the type-shape rule inline.
         assert!(
-            prompt.contains("acronym entry"),
-            "compact rule mentions acronym type as the canonical example"
+            prompt.contains("Possible vocabulary hints"),
+            "compact prompt should describe unresolved terms as hints"
         );
         assert!(
-            prompt.contains("never a rescue layer"),
-            "semantic meaning must be constrained as confirmation, not expansion"
+            prompt.contains("Never force an unrelated term"),
+            "vocabulary must not be forced into unrelated transcripts"
         );
     }
 
@@ -589,10 +520,10 @@ mod tests {
             meaning: Some("Indian SME stock acronym.".into()),
         }];
         let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
-        assert!(prompt.contains("Confirmed terms already resolved by deterministic matching"));
-        assert!(prompt.contains("Keep them exactly as written"));
+        assert!(prompt.contains("Already matched in this transcript"));
+        assert!(prompt.contains("Keep these exactly"));
         assert!(prompt.contains("MACOBS [acronym]"));
-        assert!(!prompt.contains("Candidate terms below are NOT resolved yet.\n  MACOBS"));
+        assert!(!prompt.contains("Possible vocabulary hints.\n  MACOBS"));
     }
 
     #[test]
@@ -606,8 +537,8 @@ mod tests {
             meaning: Some("Workflow automation tool.".into()),
         }];
         let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
-        assert!(prompt.contains("Candidate terms below are NOT resolved yet"));
-        assert!(prompt.contains("canonical spelling only when the phrase is phonetically close"));
+        assert!(prompt.contains("Possible vocabulary hints"));
+        assert!(prompt.contains("sounds close"));
         assert!(prompt.contains("n8n [code identifier]"));
     }
 
@@ -623,31 +554,25 @@ mod tests {
         let p = prefs();
         let prompt = build_system_prompt_with_vocab(&p, &[], &[], &[]);
 
-        // Must contain the final rule heading (compact form).
         assert!(
-            prompt.contains("FINAL RULE — SINGLE OUTPUT"),
-            "single-output rule must be present"
+            prompt.contains("Output only the final polished text"),
+            "output-only rule must be present"
         );
-        // Must explicitly forbid repetition (the failure mode).
         assert!(
-            prompt.contains("No repetition") || prompt.contains("no repetition"),
-            "single-output rule must explicitly forbid repetition"
+            prompt.contains("Write it once and stop"),
+            "single-output rule must explicitly forbid repeated output"
         );
-        // The FINAL rule must come AFTER all other task rules — verify by
-        // checking position relative to a known earlier rule.
-        let pos_output_only = prompt.find("Output ONLY the polished text").unwrap();
-        let pos_final = prompt.find("FINAL RULE").unwrap();
+        let pos_preserve = prompt.find("Preserve all content words").unwrap();
+        let pos_output_only = prompt.find("Output only the final polished text").unwrap();
         assert!(
-            pos_final > pos_output_only,
-            "FINAL RULE must come AFTER the output-only rule (be the LAST instruction)"
+            pos_output_only > pos_preserve,
+            "output-only rule must come after the cleanup/source-of-truth rules"
         );
-        // The final rule must be near the </task> closer for end-of-prompt
-        // attention to fire on it.
         let pos_close = prompt.find("</task>").unwrap();
         assert!(
-            pos_close - pos_final < 1500,
-            "FINAL RULE must be near </task> closer ({}+ chars away — should be < 1500)",
-            pos_close - pos_final
+            pos_close - pos_output_only < 500,
+            "output-only rule must be near </task> closer ({}+ chars away — should be < 500)",
+            pos_close - pos_output_only
         );
     }
 
@@ -825,38 +750,45 @@ mod tests {
         p.output_language = "hinglish".into();
 
         let sys = build_system_prompt_with_vocab(&p, &[], &[], &[]);
-        // language_rule must contain anti-translation language.
         assert!(
-            sys.contains("PRESERVATION"),
-            "Hinglish language_rule must have a PRESERVATION block"
+            sys.contains("Roman Hinglish"),
+            "Hinglish language_rule must name Roman Hinglish"
         );
         assert!(
-            sys.contains("Do NOT translate them to English")
-                || sys.contains("never translate Hindi"),
+            sys.contains("do not translate Hindi words into English"),
             "Hinglish language_rule must explicitly forbid Hindi→English translation"
         );
-        // Concrete failure-mode example must be present (the LLM learns from
-        // ✗/✓ pairs much more reliably than from abstract rules).
         assert!(
-            sys.contains("Today there was a lot of work"),
-            "Hinglish language_rule must include the canonical failure-mode example"
-        );
-
-        // script_final_check must call out language preservation, not just script.
-        assert!(
-            sys.contains("LANGUAGE —") || sys.contains("LANGUAGE BALANCE"),
-            "script_final_check must include a LANGUAGE/preservation check"
+            sys.contains("English spans stay English"),
+            "Hinglish language_rule must preserve English spans"
         );
         assert!(
-            sys.contains("kaam") && sys.contains("never \"work\""),
-            "script_final_check must show kaam→work as the canonical wrong move"
+            sys.contains("Hindi spans") && sys.contains("Roman Hinglish"),
+            "Hinglish language_rule must preserve Hindi spans as Roman Hinglish"
+        );
+        assert!(
+            sys.contains("How much time will it take to go ahead?"),
+            "Hinglish language_rule must include a mixed-language span example"
+        );
+        assert!(
+            sys.contains("Never output Devanagari"),
+            "Hinglish language_rule must explicitly block raw Hindi script"
         );
 
         // user_message reminder must mention preservation.
         let user = build_user_message("aaj bahut kaam tha", "hinglish");
         assert!(
-            user.contains("preserve Hindi") || user.contains("never translate"),
+            user.contains("Preserve language span-by-span")
+                || user.contains("do not translate Hindi"),
             "user_message reminder must mention Hindi preservation"
+        );
+        assert!(
+            user.contains("English spans stay English"),
+            "user_message reminder must preserve English spans closest to transcript"
+        );
+        assert!(
+            user.contains("Never output Devanagari"),
+            "user_message reminder must block Devanagari closest to transcript"
         );
     }
 
@@ -884,10 +816,10 @@ mod tests {
         }];
         let prompt = build_system_prompt_with_vocab(&p, &rag, &[], &[]);
         assert!(prompt.contains("<preferences>"));
-        assert!(prompt.contains("SOFT examples"));
-        assert!(prompt.contains("transcript below is the source of truth"));
-        assert!(prompt.contains("Never import words"));
-        assert!(prompt.contains("never drop current transcript words"));
+        assert!(prompt.contains("soft style hints"));
+        assert!(prompt.contains("current transcript is the source of truth"));
+        assert!(prompt.contains("do not import words"));
+        assert!(prompt.contains("do not drop words from the current transcript"));
         assert!(!prompt.contains("carry the same style and word choices"));
     }
 }

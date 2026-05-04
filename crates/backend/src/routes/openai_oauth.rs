@@ -9,37 +9,29 @@
 //! axum server spawned during initiate).  That server exchanges the code, saves
 //! tokens to SQLite, and returns a friendly HTML success page.
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::Json,
-};
+use axum::{extract::State, http::StatusCode, response::Json};
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tracing::{info, warn};
 
-use crate::{
-    llm::openai_codex,
-    store::openai_oauth,
-    AppState,
-};
+use crate::{AppState, llm::openai_codex, store::openai_oauth};
 
 // ── OAuth constants (same as the official Codex CLI) ─────────────────────────
 
-const CLIENT_ID:   &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const AUTH_URL:    &str = "https://auth.openai.com/oauth/authorize";
-const TOKEN_URL:   &str = "https://auth.openai.com/oauth/token";
-const REDIRECT_URI:&str = "http://localhost:1455/auth/callback";
-const SCOPE:       &str = "openid profile email offline_access";
+const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const AUTH_URL: &str = "https://auth.openai.com/oauth/authorize";
+const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+const SCOPE: &str = "openid profile email offline_access";
 
 // ── PKCE session (module-level singleton, single-user daemon) ─────────────────
 
 struct PkceSession {
     verifier: String,
-    state:    String,
+    state: String,
 }
 
 static PENDING: OnceLock<Mutex<Option<PkceSession>>> = OnceLock::new();
@@ -51,7 +43,7 @@ fn pending() -> &'static Mutex<Option<PkceSession>> {
 
 fn pkce() -> (String, String) {
     use sha2::{Digest, Sha256};
-    let verifier  = random_base64url(32);
+    let verifier = random_base64url(32);
     let challenge = base64url_encode(Sha256::digest(verifier.as_bytes()).as_slice());
     (verifier, challenge)
 }
@@ -81,8 +73,8 @@ fn base64url_encode(bytes: &[u8]) -> String {
     let mut i = 0;
     while i + 2 < bytes.len() {
         let b0 = bytes[i] as usize;
-        let b1 = bytes[i+1] as usize;
-        let b2 = bytes[i+2] as usize;
+        let b1 = bytes[i + 1] as usize;
+        let b2 = bytes[i + 2] as usize;
         out.push(CHARS[(b0 >> 2)] as char);
         out.push(CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char);
         out.push(CHARS[((b1 & 0xf) << 2) | (b2 >> 6)] as char);
@@ -97,7 +89,7 @@ fn base64url_encode(bytes: &[u8]) -> String {
         }
         2 => {
             let b0 = bytes[i] as usize;
-            let b1 = bytes[i+1] as usize;
+            let b1 = bytes[i + 1] as usize;
             out.push(CHARS[b0 >> 2] as char);
             out.push(CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char);
             out.push(CHARS[(b1 & 0xf) << 2] as char);
@@ -121,23 +113,29 @@ pub async fn initiate(State(state): State<AppState>) -> Result<Json<Value>, Stat
 
     // Store PKCE session
     {
-        let mut lock = pending().lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        *lock = Some(PkceSession { verifier: verifier.clone(), state: oauth_state.clone() });
+        let mut lock = pending()
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        *lock = Some(PkceSession {
+            verifier: verifier.clone(),
+            state: oauth_state.clone(),
+        });
     }
 
     // Build auth URL
     let params = [
-        ("client_id",                    CLIENT_ID),
-        ("redirect_uri",                 REDIRECT_URI),
-        ("response_type",                "code"),
-        ("scope",                        SCOPE),
-        ("code_challenge",               &challenge),
-        ("code_challenge_method",        "S256"),
-        ("state",                        &oauth_state),
-        ("id_token_add_organizations",   "true"),
-        ("codex_cli_simplified_flow",    "true"),
+        ("client_id", CLIENT_ID),
+        ("redirect_uri", REDIRECT_URI),
+        ("response_type", "code"),
+        ("scope", SCOPE),
+        ("code_challenge", &challenge),
+        ("code_challenge_method", "S256"),
+        ("state", &oauth_state),
+        ("id_token_add_organizations", "true"),
+        ("codex_cli_simplified_flow", "true"),
     ];
-    let query = params.iter()
+    let query = params
+        .iter()
         .map(|(k, v)| format!("{}={}", k, urlencoding_encode(v)))
         .collect::<Vec<_>>()
         .join("&");
@@ -146,7 +144,7 @@ pub async fn initiate(State(state): State<AppState>) -> Result<Json<Value>, Stat
     info!("[openai_oauth] initiate — spawning 1455 callback server");
 
     // Spawn one-shot callback server on 1455
-    let pool    = state.pool.clone();
+    let pool = state.pool.clone();
     let user_id = state.default_user_id.as_str().to_string();
     tokio::spawn(async move {
         if let Err(e) = run_callback_server(pool, user_id).await {
@@ -161,9 +159,13 @@ fn urlencoding_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
-            _ => { out.push('%'); out.push_str(&format!("{byte:02X}")); }
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => {
+                out.push('%');
+                out.push_str(&format!("{byte:02X}"));
+            }
         }
     }
     out
@@ -202,11 +204,8 @@ pub async fn disconnect(State(state): State<AppState>) -> StatusCode {
 
 // ── One-shot callback server on port 1455 ─────────────────────────────────────
 
-async fn run_callback_server(
-    pool:    crate::store::DbPool,
-    user_id: String,
-) -> anyhow::Result<()> {
-    use axum::{extract::Query, routing::get, Router};
+async fn run_callback_server(pool: crate::store::DbPool, user_id: String) -> anyhow::Result<()> {
+    use axum::{Router, extract::Query, routing::get};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
 
@@ -226,20 +225,21 @@ async fn run_callback_server(
 
     #[derive(Deserialize)]
     struct CallbackParams {
-        code:  Option<String>,
+        code: Option<String>,
         state: Option<String>,
         error: Option<String>,
     }
 
     let pool2 = pool.clone();
-    let uid2  = user_id.clone();
-    let stx   = shutdown_tx.clone();
+    let uid2 = user_id.clone();
+    let stx = shutdown_tx.clone();
 
-    let app = Router::new().route("/auth/callback", get(
-        move |Query(params): Query<CallbackParams>| {
+    let app = Router::new().route(
+        "/auth/callback",
+        get(move |Query(params): Query<CallbackParams>| {
             let pool3 = pool2.clone();
-            let uid3  = uid2.clone();
-            let stx2  = stx.clone();
+            let uid3 = uid2.clone();
+            let stx2 = stx.clone();
             async move {
                 // Consume shutdown sender after first request
                 let sender = { stx2.lock().await.take() };
@@ -278,7 +278,13 @@ async fn run_callback_server(
                 // Exchange code for tokens
                 match exchange_code(&code, &session.verifier).await {
                     Ok((access, refresh, expires_at)) => {
-                        openai_oauth::save_token(&pool3, &uid3, &access, Some(&refresh), expires_at);
+                        openai_oauth::save_token(
+                            &pool3,
+                            &uid3,
+                            &access,
+                            Some(&refresh),
+                            expires_at,
+                        );
                         info!("[openai_oauth] ✓ connected, expires_at={expires_at}");
                         let _ = sender.map(|s| s.send(()));
                         axum::response::Html(success_page())
@@ -290,8 +296,8 @@ async fn run_callback_server(
                     }
                 }
             }
-        }
-    ));
+        }),
+    );
 
     // Serve with 5-minute hard timeout
     tokio::select! {
@@ -307,10 +313,7 @@ async fn run_callback_server(
     Ok(())
 }
 
-async fn exchange_code(
-    code:     &str,
-    verifier: &str,
-) -> Result<(String, String, i64), String> {
+async fn exchange_code(code: &str, verifier: &str) -> Result<(String, String, i64), String> {
     let client = Client::new();
     let payload = json!({
         "client_id":     CLIENT_ID,
@@ -329,17 +332,22 @@ async fn exchange_code(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body   = resp.text().await.unwrap_or_default();
+        let body = resp.text().await.unwrap_or_default();
         return Err(format!("token error {status}: {body}"));
     }
 
-    let v: serde_json::Value = resp.json().await
+    let v: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| format!("token parse failed: {e}"))?;
 
-    let access_token  = v["access_token"].as_str().ok_or("missing access_token")?.to_string();
+    let access_token = v["access_token"]
+        .as_str()
+        .ok_or("missing access_token")?
+        .to_string();
     let refresh_token = v["refresh_token"].as_str().unwrap_or("").to_string();
-    let expires_in    = v["expires_in"].as_i64().unwrap_or(864_000);
-    let expires_at    = crate::store::now_ms() + expires_in * 1000;
+    let expires_in = v["expires_in"].as_i64().unwrap_or(864_000);
+    let expires_at = crate::store::now_ms() + expires_in * 1000;
 
     Ok((access_token, refresh_token, expires_at))
 }
@@ -369,11 +377,13 @@ fn success_page() -> String {
       <div class="badge">● gpt-5.4 &amp; gpt-5.4-mini ready</div>
     </div>
     <script>window.close();</script>
-    </body></html>"#.to_string()
+    </body></html>"#
+        .to_string()
 }
 
 fn error_page(msg: &str) -> String {
-    format!(r#"<!doctype html><html><head><meta charset="utf-8">
+    format!(
+        r#"<!doctype html><html><head><meta charset="utf-8">
     <style>
       body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
            display:flex;align-items:center;justify-content:center;
@@ -389,5 +399,6 @@ fn error_page(msg: &str) -> String {
       <h1>Connection Failed</h1>
       <p>{msg}</p>
     </div>
-    </body></html>"#)
+    </body></html>"#
+    )
 }

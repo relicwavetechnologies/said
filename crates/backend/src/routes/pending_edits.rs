@@ -5,9 +5,9 @@
 //! POST /v1/pending-edits/:id/resolve — approve (→ learning corpus) or skip
 
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
-    Json,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -15,9 +15,9 @@ use tracing::{info, warn};
 use reqwest::Client;
 
 use crate::{
+    AppState,
     embedder::gemini,
     store::{corrections, history, pending_edits, prefs::get_prefs, vectors},
-    AppState,
 };
 
 // ── Create ────────────────────────────────────────────────────────────────────
@@ -25,8 +25,8 @@ use crate::{
 #[derive(Deserialize)]
 pub struct CreateBody {
     pub recording_id: Option<String>,
-    pub ai_output:    String,
-    pub user_kept:    String,
+    pub ai_output: String,
+    pub user_kept: String,
 }
 
 pub async fn create(
@@ -107,11 +107,11 @@ pub async fn resolve(
 
                     // Fire-and-forget: embed transcript → upsert preference_vector
                     if let Some(ref eid) = event_id {
-                        let pool2       = state.pool.clone();
-                        let user_id2    = state.default_user_id.clone();
-                        let event_id2   = eid.clone();
+                        let pool2 = state.pool.clone();
+                        let user_id2 = state.default_user_id.clone();
+                        let event_id2 = eid.clone();
                         let transcript2 = rec.transcript.clone();
-                        let gemini_key  = get_prefs(&state.pool, &state.default_user_id)
+                        let gemini_key = get_prefs(&state.pool, &state.default_user_id)
                             .and_then(|p| p.gemini_api_key)
                             .or_else(|| std::env::var("GEMINI_API_KEY").ok())
                             .unwrap_or_default();

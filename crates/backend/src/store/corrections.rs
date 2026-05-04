@@ -7,7 +7,7 @@
 use rusqlite::params;
 use tracing::info;
 
-use super::{now_ms, DbPool};
+use super::{DbPool, now_ms};
 
 /// A single word substitution rule.
 #[derive(Debug, Clone)]
@@ -32,8 +32,12 @@ pub fn extract_diffs(ai_output: &str, user_kept: &str) -> Vec<(String, String)> 
 
     let mut diffs = Vec::new();
     for (a, k) in ai_words.iter().zip(kept_words.iter()) {
-        let a_clean = a.trim_matches(|c: char| c.is_ascii_punctuation()).to_lowercase();
-        let k_clean = k.trim_matches(|c: char| c.is_ascii_punctuation()).to_lowercase();
+        let a_clean = a
+            .trim_matches(|c: char| c.is_ascii_punctuation())
+            .to_lowercase();
+        let k_clean = k
+            .trim_matches(|c: char| c.is_ascii_punctuation())
+            .to_lowercase();
         if a_clean.is_empty() || k_clean.is_empty() {
             continue;
         }

@@ -13,10 +13,10 @@ use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{client::IntoClientRequest, Message},
+    tungstenite::{Message, client::IntoClientRequest},
 };
 use tracing::{debug, info, warn};
-use voice_polish_recorder::{resample_to_16k, ChunkReceiver, SAMPLE_RATE};
+use voice_polish_recorder::{ChunkReceiver, SAMPLE_RATE, resample_to_16k};
 
 /// Confidence threshold — words below this get [word?XX%] markers for the LLM.
 const LOW_CONFIDENCE_THRESHOLD: f64 = 0.85;
@@ -25,9 +25,11 @@ const LOW_CONFIDENCE_THRESHOLD: f64 = 0.85;
 /// Stored in `PrewarmedWsState` between recordings to eliminate the TLS handshake
 /// from the hot path (~150ms saved, up to 3s saved under rapid use).
 pub struct PrewarmedWs {
-    pub ws:         tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    pub language:   String,
-    pub keyterms:   Vec<String>,
+    pub ws: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    pub language: String,
+    pub keyterms: Vec<String>,
     pub created_at: std::time::Instant,
 }
 
@@ -53,7 +55,9 @@ fn build_ws_url(lang: &str, keyterms: &[String]) -> (String, usize) {
     let mut bias_count = 0usize;
     for term in keyterms.iter().take(100) {
         let cleaned = term.trim();
-        if cleaned.is_empty() { continue; }
+        if cleaned.is_empty() {
+            continue;
+        }
         url_str.push_str("&keyterm=");
         url_str.push_str(&urlencode(cleaned));
         bias_count += 1;
@@ -63,18 +67,34 @@ fn build_ws_url(lang: &str, keyterms: &[String]) -> (String, usize) {
 
 /// Open a fresh Deepgram WebSocket connection and return it ready for audio.
 /// Called both for cold-start and for pre-warming the next recording's connection.
-pub async fn connect_ws(deepgram_key: &str, language: &str, keyterms: &[String]) -> Option<PrewarmedWs> {
-    if deepgram_key.is_empty() { return None; }
-    let lang = if language.is_empty() || language == "auto" { "hi" } else { language };
+pub async fn connect_ws(
+    deepgram_key: &str,
+    language: &str,
+    keyterms: &[String],
+) -> Option<PrewarmedWs> {
+    if deepgram_key.is_empty() {
+        return None;
+    }
+    let lang = if language.is_empty() || language == "auto" {
+        "hi"
+    } else {
+        language
+    };
     let (url_str, bias_count) = build_ws_url(lang, keyterms);
 
     let mut req = match url_str.into_client_request() {
-        Ok(r)  => r,
-        Err(e) => { warn!("[dg_stream] bad WS URL: {e}"); return None; }
+        Ok(r) => r,
+        Err(e) => {
+            warn!("[dg_stream] bad WS URL: {e}");
+            return None;
+        }
     };
     let auth_value = match format!("Token {deepgram_key}").parse() {
-        Ok(v)  => v,
-        Err(e) => { warn!("[dg_stream] invalid auth header value: {e}"); return None; }
+        Ok(v) => v,
+        Err(e) => {
+            warn!("[dg_stream] invalid auth header value: {e}");
+            return None;
+        }
     };
     req.headers_mut().insert("Authorization", auth_value);
 
@@ -83,14 +103,20 @@ pub async fn connect_ws(deepgram_key: &str, language: &str, keyterms: &[String])
     let ms = start.elapsed().as_millis();
 
     match result {
-        Err(_) => { warn!("[dg_stream] WS connect timed out"); None }
-        Ok(Err(e)) => { warn!("[dg_stream] WS connect failed: {e}"); None }
+        Err(_) => {
+            warn!("[dg_stream] WS connect timed out");
+            None
+        }
+        Ok(Err(e)) => {
+            warn!("[dg_stream] WS connect failed: {e}");
+            None
+        }
         Ok(Ok((ws, _))) => {
             info!("[dg_stream] ✓ WS connected in {ms}ms (lang={lang} keyterms={bias_count})");
             Some(PrewarmedWs {
                 ws,
-                language:   lang.to_string(),
-                keyterms:   keyterms.to_vec(),
+                language: lang.to_string(),
+                keyterms: keyterms.to_vec(),
                 created_at: std::time::Instant::now(),
             })
         }
@@ -103,19 +129,23 @@ pub async fn connect_ws(deepgram_key: &str, language: &str, keyterms: &[String])
 /// (eliminates TLS handshake from hot path). Falls back to fresh connect if None
 /// or if language/keyterms changed.
 pub async fn stream_to_deepgram(
-    chunk_recv:   ChunkReceiver,
+    chunk_recv: ChunkReceiver,
     deepgram_key: &str,
-    language:     &str,
-    keyterms:     &[String],
-    pre_embed:    Option<(&str, &str)>,
-    prewarmed:    Option<PrewarmedWs>,
+    language: &str,
+    keyterms: &[String],
+    pre_embed: Option<(&str, &str)>,
+    prewarmed: Option<PrewarmedWs>,
 ) -> Option<String> {
     if deepgram_key.is_empty() {
         warn!("[dg_stream] no Deepgram API key — WS streaming disabled");
         return None;
     }
 
-    let lang = if language.is_empty() || language == "auto" { "hi" } else { language };
+    let lang = if language.is_empty() || language == "auto" {
+        "hi"
+    } else {
+        language
+    };
 
     // Use pre-warmed WS if params match AND it's still fresh enough.
     let ws = if let Some(pw) = prewarmed {
@@ -124,10 +154,16 @@ pub async fn stream_to_deepgram(
             info!("[dg_stream] pre-warm params mismatch — connecting fresh");
             connect_ws(deepgram_key, lang, keyterms).await?.ws
         } else if age > PREWARM_MAX_AGE {
-            info!("[dg_stream] pre-warm stale (age={}ms) — connecting fresh", age.as_millis());
+            info!(
+                "[dg_stream] pre-warm stale (age={}ms) — connecting fresh",
+                age.as_millis()
+            );
             connect_ws(deepgram_key, lang, keyterms).await?.ws
         } else {
-            info!("[dg_stream] ✓ using pre-warmed WS (0ms connect, age={}ms)", age.as_millis());
+            info!(
+                "[dg_stream] ✓ using pre-warmed WS (0ms connect, age={}ms)",
+                age.as_millis()
+            );
             pw.ws
         }
     } else {
@@ -139,12 +175,12 @@ pub async fn stream_to_deepgram(
 
     // ── Bridge: std::sync::mpsc (cpal audio thread) → tokio channel ──────────
     let (async_tx, mut async_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
-    let native_rate              = chunk_recv.native_rate;
+    let native_rate = chunk_recv.native_rate;
     let sync_rx: mpsc::Receiver<Vec<f32>> = chunk_recv.rx;
 
     std::thread::spawn(move || {
         while let Ok(chunk_f32) = sync_rx.recv() {
-            let resampled     = resample_to_16k(&chunk_f32, native_rate);
+            let resampled = resample_to_16k(&chunk_f32, native_rate);
             let pcm_bytes: Vec<u8> = resampled
                 .iter()
                 .flat_map(|&s| {
@@ -287,8 +323,8 @@ pub async fn stream_to_deepgram(
     // during drain (e.g. very short clip fully processed before CloseStream).
     // Previously this was `chunks_sent * 12` which scaled to 10s+ for long recordings
     // — a flat ceiling is sufficient since the speech_final+500ms logic handles timing.
-    let drain_ms       = 2500_u64;
-    let drain_start    = tokio::time::Instant::now();
+    let drain_ms = 2500_u64;
+    let drain_start = tokio::time::Instant::now();
     let drain_deadline = drain_start + Duration::from_millis(drain_ms);
 
     let mut last_speech_final: Option<tokio::time::Instant> = if got_speech_final_during_stream {
@@ -299,12 +335,16 @@ pub async fn stream_to_deepgram(
 
     loop {
         let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() { break; }
+        if remaining.is_zero() {
+            break;
+        }
 
         let effective_timeout = if let Some(sf_at) = last_speech_final {
             let since_sf = tokio::time::Instant::now().saturating_duration_since(sf_at);
             let sf_remaining = Duration::from_millis(500).saturating_sub(since_sf);
-            if sf_remaining.is_zero() { break; }
+            if sf_remaining.is_zero() {
+                break;
+            }
             remaining.min(sf_remaining)
         } else {
             remaining
@@ -318,19 +358,25 @@ pub async fn stream_to_deepgram(
                         let is_f = v["is_final"].as_bool().unwrap_or(false);
                         let sp_f = v["speech_final"].as_bool().unwrap_or(false);
                         if is_f {
-                            let enriched = enrich_from_words(&v["channel"]["alternatives"][0]["words"]);
+                            let enriched =
+                                enrich_from_words(&v["channel"]["alternatives"][0]["words"]);
                             if !enriched.is_empty() {
                                 transcript_parts.push(enriched);
                             }
                         }
-                        if sp_f { last_speech_final = Some(tokio::time::Instant::now()); }
+                        if sp_f {
+                            last_speech_final = Some(tokio::time::Instant::now());
+                        }
                     } else if msg_type == "UtteranceEnd" {
                         last_speech_final = Some(tokio::time::Instant::now());
                     }
                 }
             }
             Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
-            Ok(Some(Err(e))) => { warn!("[dg_stream] drain error: {e}"); break; }
+            Ok(Some(Err(e))) => {
+                warn!("[dg_stream] drain error: {e}");
+                break;
+            }
             Ok(Some(Ok(_))) => {}
             Err(_) => break,
         }
@@ -351,8 +397,12 @@ pub async fn stream_to_deepgram(
         warn!("[dg_stream] no transcript — chunks={chunks_sent} drain={drain_ms}ms");
         None
     } else {
-        info!("[dg_stream] ✓ transcript ready — drain={}ms chunks={} parts={} : {full:?}",
-            drain_ms, chunks_sent, transcript_parts.len());
+        info!(
+            "[dg_stream] ✓ transcript ready — drain={}ms chunks={} parts={} : {full:?}",
+            drain_ms,
+            chunks_sent,
+            transcript_parts.len()
+        );
         Some(full)
     }
 }
@@ -404,19 +454,22 @@ fn plain_for_embed(parts: &[String]) -> String {
 
     // Replace each [word?XX%] marker with just the word before the '?'
     let mut result = String::with_capacity(joined.len());
-    let mut chars  = joined.chars().peekable();
+    let mut chars = joined.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '[' {
             let mut inner = String::new();
             let mut closed = false;
             for ic in chars.by_ref() {
-                if ic == ']' { closed = true; break; }
+                if ic == ']' {
+                    closed = true;
+                    break;
+                }
                 inner.push(ic);
             }
             if closed {
                 if let Some(qpos) = inner.rfind('?') {
                     let after = &inner[qpos + 1..];
-                    if after.ends_with('%') && after[..after.len()-1].parse::<f64>().is_ok() {
+                    if after.ends_with('%') && after[..after.len() - 1].parse::<f64>().is_ok() {
                         result.push_str(&inner[..qpos]);
                         continue;
                     }
@@ -459,11 +512,10 @@ mod tests {
 
     #[test]
     fn urlencode_handles_jargon_and_special_chars() {
-        assert_eq!(urlencode("n8n"),       "n8n");
-        assert_eq!(urlencode("k8s"),       "k8s");
-        assert_eq!(urlencode("hello"),     "hello");
-        assert_eq!(urlencode("hi there"),  "hi%20there");
-        assert_eq!(urlencode("a&b=c"),     "a%26b%3Dc");
+        assert_eq!(urlencode("n8n"), "n8n");
+        assert_eq!(urlencode("k8s"), "k8s");
+        assert_eq!(urlencode("hello"), "hello");
+        assert_eq!(urlencode("hi there"), "hi%20there");
+        assert_eq!(urlencode("a&b=c"), "a%26b%3Dc");
     }
 }
-

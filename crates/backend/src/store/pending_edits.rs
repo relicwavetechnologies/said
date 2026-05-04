@@ -1,25 +1,25 @@
 use rusqlite::params;
 use serde::Serialize;
 
-use crate::store::{now_ms, DbPool};
+use crate::store::{DbPool, now_ms};
 
 #[derive(Debug, Serialize, Clone)]
 pub struct PendingEdit {
-    pub id:           String,
+    pub id: String,
     pub recording_id: Option<String>,
-    pub ai_output:    String,
-    pub user_kept:    String,
+    pub ai_output: String,
+    pub user_kept: String,
     pub timestamp_ms: i64,
 }
 
 pub fn insert(
-    pool:         &DbPool,
-    user_id:      &str,
+    pool: &DbPool,
+    user_id: &str,
     recording_id: Option<&str>,
-    ai_output:    &str,
-    user_kept:    &str,
+    ai_output: &str,
+    user_kept: &str,
 ) -> Option<String> {
-    let id   = uuid::Uuid::new_v4().to_string();
+    let id = uuid::Uuid::new_v4().to_string();
     let conn = pool.get().ok()?;
     conn.execute(
         "INSERT INTO pending_edits
@@ -37,13 +37,15 @@ pub fn get(pool: &DbPool, id: &str) -> Option<PendingEdit> {
         "SELECT id, recording_id, ai_output, user_kept, timestamp_ms
            FROM pending_edits WHERE id = ?1",
         params![id],
-        |row| Ok(PendingEdit {
-            id:           row.get(0)?,
-            recording_id: row.get(1)?,
-            ai_output:    row.get(2)?,
-            user_kept:    row.get(3)?,
-            timestamp_ms: row.get(4)?,
-        }),
+        |row| {
+            Ok(PendingEdit {
+                id: row.get(0)?,
+                recording_id: row.get(1)?,
+                ai_output: row.get(2)?,
+                user_kept: row.get(3)?,
+                timestamp_ms: row.get(4)?,
+            })
+        },
     )
     .ok()
 }
@@ -65,10 +67,10 @@ pub fn list_pending(pool: &DbPool, user_id: &str) -> Vec<PendingEdit> {
     };
     stmt.query_map(params![user_id], |row| {
         Ok(PendingEdit {
-            id:           row.get(0)?,
+            id: row.get(0)?,
             recording_id: row.get(1)?,
-            ai_output:    row.get(2)?,
-            user_kept:    row.get(3)?,
+            ai_output: row.get(2)?,
+            user_kept: row.get(3)?,
             timestamp_ms: row.get(4)?,
         })
     })

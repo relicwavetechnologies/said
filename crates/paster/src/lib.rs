@@ -78,6 +78,7 @@ mod imp {
 
             // ── Accessibility ─────────────────────────────────────────────────
             pub fn AXUIElementCreateSystemWide() -> *mut c_void;
+            pub fn AXUIElementCreateApplication(pid: i32) -> *mut c_void;
             pub fn AXUIElementCopyAttributeValue(
                 element:   *const c_void,
                 attribute: *const c_void,
@@ -173,6 +174,46 @@ mod imp {
         r1 == 0 || r2 == 0
     }
 
+    fn frontmost_pid() -> Option<i32> {
+        unsafe {
+            use objc::runtime::{Class, Object};
+            use objc::{msg_send, sel, sel_impl};
+
+            let cls = Class::get("NSWorkspace")?;
+            let workspace: *mut Object = msg_send![cls, sharedWorkspace];
+            if workspace.is_null() {
+                return None;
+            }
+
+            let app: *mut Object = msg_send![workspace, frontmostApplication];
+            if app.is_null() {
+                return None;
+            }
+
+            let pid: i32 = msg_send![app, processIdentifier];
+            if pid > 0 { Some(pid) } else { None }
+        }
+    }
+
+    fn unlock_app_by_pid(pid: i32) -> Option<i32> {
+        if pid <= 0 {
+            return None;
+        }
+        unsafe {
+            if !ffi::AXIsProcessTrusted() {
+                return None;
+            }
+            let app = ffi::AXUIElementCreateApplication(pid);
+            if app.is_null() {
+                return None;
+            }
+            ax_set_bool(app as *const _, "AXEnhancedUserInterface");
+            ax_set_bool(app as *const _, "AXManualAccessibility");
+            ffi::CFRelease(app);
+            Some(pid)
+        }
+    }
+
     // ── Public AX pre-unlock ──────────────────────────────────────────────────
 
     /// Pre-unlock the accessibility tree for whatever app is currently focused.
@@ -209,6 +250,17 @@ mod imp {
 
             if pid > 0 { Some(pid) } else { None }
         }
+    }
+
+    /// Capture the current frontmost app PID and unlock its AX tree.
+    ///
+    /// This is the OpenWhispr-style target lock. `NSWorkspace` tells us which
+    /// app is frontmost before our own UI can disturb focus; then AX is used
+    /// only to enable/read that specific process.
+    pub fn lock_frontmost_app_now() -> Option<i32> {
+        frontmost_pid()
+            .and_then(unlock_app_by_pid)
+            .or_else(unlock_focused_app_now)
     }
 
     // ── Public AX surface ─────────────────────────────────────────────────────
@@ -362,6 +414,116 @@ mod imp {
     /// Back-compat shim for one-shot callers that expect the full read path.
     pub fn read_focused_value() -> Option<String> {
         read_focused_value_first()
+    }
+
+    /// Fast path for a locked target app.
+    ///
+    /// Unlike `read_focused_value_fast`, this does not ask the system-wide AX
+    /// object for the current frontmost application. It reads the focused text
+    /// element inside the app identified by `pid`, matching OpenWhispr's
+    /// "capture target PID first, monitor that app later" model.
+    pub fn read_focused_value_fast_for_pid(pid: i32) -> Option<String> {
+        if pid <= 0 { return None; }
+        unsafe {
+            if !ffi::AXIsProcessTrusted() { return None; }
+
+            let app = ffi::AXUIElementCreateApplication(pid);
+            if app.is_null() { return None; }
+
+            let el = match ax_attr(app as *const _, "AXFocusedUIElement") {
+                Some(e) => e,
+                None => {
+                    ffi::CFRelease(app);
+                    return None;
+                }
+            };
+
+            if let Some(val_cf) = ax_attr(el as *const _, "AXValue") {
+                let result = cfstring_to_rust(val_cf as *const _);
+                ffi::CFRelease(val_cf);
+                ffi::CFRelease(el);
+                ffi::CFRelease(app);
+                if result.is_some() {
+                    return result;
+                }
+            }
+
+            ffi::CFRelease(el);
+            ffi::CFRelease(app);
+            None
+        }
+    }
+
+    /// Full read path for a locked target app.
+    ///
+    /// This mirrors `read_focused_value_first`, but starts from
+    /// `AXUIElementCreateApplication(pid)` instead of the current
+    /// `AXFocusedApplication`. That lets the edit watcher keep reading the
+    /// originally dictated-into app even if our HUD or another app changes
+    /// system focus.
+    pub fn read_focused_value_first_for_pid(pid: i32) -> Option<String> {
+        if pid <= 0 { return None; }
+        unsafe {
+            if !ffi::AXIsProcessTrusted() { return None; }
+
+            let app = ffi::AXUIElementCreateApplication(pid);
+            if app.is_null() { return None; }
+
+            let el = match ax_attr(app as *const _, "AXFocusedUIElement") {
+                Some(e) => e,
+                None => {
+                    ffi::CFRelease(app);
+                    return None;
+                }
+            };
+
+            if let Some(val_cf) = ax_attr(el as *const _, "AXValue") {
+                let result = cfstring_to_rust(val_cf as *const _);
+                ffi::CFRelease(val_cf);
+                ffi::CFRelease(el);
+                ffi::CFRelease(app);
+                if result.is_some() {
+                    return result;
+                }
+            }
+
+            let _unlocked = ax_enable_ui(app as *const _);
+            thread::sleep(Duration::from_millis(200));
+
+            ffi::CFRelease(el);
+            let el2 = match ax_attr(app as *const _, "AXFocusedUIElement") {
+                Some(e) => e,
+                None => {
+                    ffi::CFRelease(app);
+                    return None;
+                }
+            };
+
+            if let Some(val_cf) = ax_attr(el2 as *const _, "AXValue") {
+                let result = cfstring_to_rust(val_cf as *const _);
+                ffi::CFRelease(val_cf);
+                ffi::CFRelease(el2);
+                ffi::CFRelease(app);
+                if result.is_some() {
+                    return result;
+                }
+            }
+
+            if let Some(sel_cf) = ax_attr(el2 as *const _, "AXSelectedText") {
+                let result = cfstring_to_rust(sel_cf as *const _);
+                ffi::CFRelease(sel_cf);
+                if result.is_some() {
+                    ffi::CFRelease(el2);
+                    ffi::CFRelease(app);
+                    return result;
+                }
+            }
+
+            let deep = read_text_in_subtree(el2 as *const _, 64, 4);
+            ffi::CFRelease(el2);
+            ffi::CFRelease(app);
+            deep
+        }
     }
 
     /// BFS a UI element's descendants looking for a non-empty CFString-typed
@@ -1112,6 +1274,8 @@ mod imp {
     pub fn read_focused_value_fast() -> Option<String> { None }
     pub fn read_focused_value_first() -> Option<String> { None }
     pub fn read_focused_value() -> Option<String> { read_focused_value_first() }
+    pub fn read_focused_value_fast_for_pid(_pid: i32) -> Option<String> { None }
+    pub fn read_focused_value_first_for_pid(_pid: i32) -> Option<String> { None }
     pub fn capture_focused_text_via_selection() -> Option<String> { None }
     pub fn read_selected_text() -> Option<String> { None }
 
@@ -1136,6 +1300,7 @@ mod imp {
 
     pub fn focused_pid() -> Option<i32> { None }
     pub fn unlock_focused_app_now() -> Option<i32> { None }
+    pub fn lock_frontmost_app_now() -> Option<i32> { None }
 
     pub fn type_text(_text: &str) -> Result<bool, String> { Ok(false) }
 

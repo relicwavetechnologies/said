@@ -6,40 +6,40 @@ use super::{DbPool, now_ms};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Recording {
-    pub id:                String,
-    pub user_id:           String,
-    pub timestamp_ms:      i64,
-    pub transcript:        String,
-    pub polished:          String,
-    pub final_text:        Option<String>,
-    pub word_count:        i64,
+    pub id: String,
+    pub user_id: String,
+    pub timestamp_ms: i64,
+    pub transcript: String,
+    pub polished: String,
+    pub final_text: Option<String>,
+    pub word_count: i64,
     pub recording_seconds: f64,
-    pub model_used:        String,
-    pub confidence:        Option<f64>,
-    pub transcribe_ms:     Option<i64>,
-    pub embed_ms:          Option<i64>,
-    pub polish_ms:         Option<i64>,
-    pub target_app:        Option<String>,
-    pub edit_count:        i64,
-    pub source:            String,
-    pub audio_id:          Option<String>,
+    pub model_used: String,
+    pub confidence: Option<f64>,
+    pub transcribe_ms: Option<i64>,
+    pub embed_ms: Option<i64>,
+    pub polish_ms: Option<i64>,
+    pub target_app: Option<String>,
+    pub edit_count: i64,
+    pub source: String,
+    pub audio_id: Option<String>,
 }
 
 pub struct InsertRecording<'a> {
-    pub id:                &'a str,
-    pub user_id:           &'a str,
-    pub transcript:        &'a str,
-    pub polished:          &'a str,
-    pub word_count:        i64,
+    pub id: &'a str,
+    pub user_id: &'a str,
+    pub transcript: &'a str,
+    pub polished: &'a str,
+    pub word_count: i64,
     pub recording_seconds: f64,
-    pub model_used:        &'a str,
-    pub confidence:        Option<f64>,
-    pub transcribe_ms:     Option<i64>,
-    pub embed_ms:          Option<i64>,
-    pub polish_ms:         Option<i64>,
-    pub target_app:        Option<&'a str>,
-    pub source:            &'a str,
-    pub audio_id:          Option<&'a str>,
+    pub model_used: &'a str,
+    pub confidence: Option<f64>,
+    pub transcribe_ms: Option<i64>,
+    pub embed_ms: Option<i64>,
+    pub polish_ms: Option<i64>,
+    pub target_app: Option<&'a str>,
+    pub source: &'a str,
+    pub audio_id: Option<&'a str>,
 }
 
 pub fn insert_recording(pool: &DbPool, rec: InsertRecording<'_>) -> Option<()> {
@@ -50,12 +50,21 @@ pub fn insert_recording(pool: &DbPool, rec: InsertRecording<'_>) -> Option<()> {
           model_used, confidence, transcribe_ms, embed_ms, polish_ms, target_app, source, audio_id)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
         params![
-            rec.id, rec.user_id, now_ms(),
-            rec.transcript, rec.polished,
-            rec.word_count, rec.recording_seconds,
-            rec.model_used, rec.confidence,
-            rec.transcribe_ms, rec.embed_ms, rec.polish_ms,
-            rec.target_app, rec.source, rec.audio_id,
+            rec.id,
+            rec.user_id,
+            now_ms(),
+            rec.transcript,
+            rec.polished,
+            rec.word_count,
+            rec.recording_seconds,
+            rec.model_used,
+            rec.confidence,
+            rec.transcribe_ms,
+            rec.embed_ms,
+            rec.polish_ms,
+            rec.target_app,
+            rec.source,
+            rec.audio_id,
         ],
     )
     .ok()?;
@@ -64,32 +73,36 @@ pub fn insert_recording(pool: &DbPool, rec: InsertRecording<'_>) -> Option<()> {
 
 fn row_to_recording(row: &rusqlite::Row<'_>) -> rusqlite::Result<Recording> {
     Ok(Recording {
-        id:                row.get(0)?,
-        user_id:           row.get(1)?,
-        timestamp_ms:      row.get(2)?,
-        transcript:        row.get(3)?,
-        polished:          row.get(4)?,
-        final_text:        row.get(5)?,
-        word_count:        row.get(6)?,
+        id: row.get(0)?,
+        user_id: row.get(1)?,
+        timestamp_ms: row.get(2)?,
+        transcript: row.get(3)?,
+        polished: row.get(4)?,
+        final_text: row.get(5)?,
+        word_count: row.get(6)?,
         recording_seconds: row.get(7)?,
-        model_used:        row.get(8)?,
-        confidence:        row.get(9)?,
-        transcribe_ms:     row.get(10)?,
-        embed_ms:          row.get(11)?,
-        polish_ms:         row.get(12)?,
-        target_app:        row.get(13)?,
-        edit_count:        row.get(14)?,
-        source:            row.get(15)?,
-        audio_id:          row.get(16)?,
+        model_used: row.get(8)?,
+        confidence: row.get(9)?,
+        transcribe_ms: row.get(10)?,
+        embed_ms: row.get(11)?,
+        polish_ms: row.get(12)?,
+        target_app: row.get(13)?,
+        edit_count: row.get(14)?,
+        source: row.get(15)?,
+        audio_id: row.get(16)?,
     })
 }
 
-const SELECT_COLS: &str =
-    "id, user_id, timestamp_ms, transcript, polished, final_text,
+const SELECT_COLS: &str = "id, user_id, timestamp_ms, transcript, polished, final_text,
      word_count, recording_seconds, model_used, confidence,
      transcribe_ms, embed_ms, polish_ms, target_app, edit_count, source, audio_id";
 
-pub fn list_recordings(pool: &DbPool, user_id: &str, limit: i64, before_ms: Option<i64>) -> Vec<Recording> {
+pub fn list_recordings(
+    pool: &DbPool,
+    user_id: &str,
+    limit: i64,
+    before_ms: Option<i64>,
+) -> Vec<Recording> {
     let conn = match pool.get() {
         Ok(c) => c,
         Err(_) => return vec![],
@@ -143,11 +156,23 @@ pub fn delete_recording(pool: &DbPool, id: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub fn set_recording_audio_id(pool: &DbPool, id: &str, audio_id: &str) -> Option<()> {
+    let conn = pool.get().ok()?;
+    conn.execute(
+        "UPDATE recordings SET audio_id = ?1 WHERE id = ?2",
+        params![audio_id, id],
+    )
+    .ok()
+    .filter(|n| *n > 0)?;
+    Some(())
+}
+
 pub fn apply_edit_feedback(pool: &DbPool, recording_id: &str, user_kept: &str) -> Option<()> {
     let conn = pool.get().ok()?;
     conn.execute(
         "UPDATE recordings SET final_text = ?1, edit_count = edit_count + 1 WHERE id = ?2",
         params![user_kept, recording_id],
-    ).ok()?;
+    )
+    .ok()?;
     Some(())
 }
