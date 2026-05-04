@@ -17,7 +17,7 @@ use tracing::{info, warn};
 
 use crate::{store::{
     vocabulary, vocab_embeddings, vocab_fts,
-    pending_promotions, stt_replacements,
+    stt_replacements,
     prefs::get_prefs, now_ms,
 }, AppState};
 
@@ -144,17 +144,16 @@ pub async fn delete(
     //   • vocab_fts           — stale BM25 hit surfaces in lexical gate
     //   • vocab_embedding_examples — zombie ring resurfaces if term re-added
     //   • stt_replacements    — pre-polish layer keeps rewriting → canonical
-    //   • pending_promotions  — queued K-event resurrects the deleted term
+    // pending_promotions is no longer written by the live promotion path
+    // (promotion is now first-sighting; see classify.rs), so no cascade
+    // entry is needed here.
     vocab_embeddings::delete(&state.pool, &state.default_user_id, trimmed);
     vocab_fts::delete(&state.pool, &state.default_user_id, trimmed);
     let stt_n  = stt_replacements::delete_by_correct_form(
         &state.pool, &state.default_user_id, trimmed,
     );
-    let pend_n = pending_promotions::delete_all_for_term(
-        &state.pool, &state.default_user_id, trimmed,
-    );
     info!(
-        "[vocab] delete term={trimmed:?} vocab_rows={n} stt_aliases={stt_n} pending={pend_n}",
+        "[vocab] delete term={trimmed:?} vocab_rows={n} stt_aliases={stt_n}",
     );
     if n > 0 { StatusCode::NO_CONTENT } else { StatusCode::NOT_FOUND }
 }

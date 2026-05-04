@@ -38,7 +38,7 @@ use crate::{
         phonetic_triage, phonetics, pre_filter, promotion_gate,
     },
     store::{
-        corrections, history, pending_edits, pending_promotions,
+        corrections, history, pending_edits,
         prefs::get_prefs, stt_replacements, vocab_embeddings, vocab_fts,
         vocabulary,
     },
@@ -309,13 +309,6 @@ pub async fn classify(
         );
     }
 
-    // Best-effort housekeeping: drop pending-promotion rows older than 30 days
-    // so abandoned candidates don't sit forever waiting for a confirming sighting
-    // that will never come.
-    let _ = pending_promotions::prune_stale(
-        &state.pool, &state.default_user_id, 30 * 24 * 3600 * 1000,
-    );
-
     let mut queued_terms: Vec<String> = Vec::new();
 
     for cand in &result.candidates {
@@ -329,32 +322,15 @@ pub async fn classify(
                     continue;
                 }
 
-                // K-event promotion gate with adaptive threshold.  Strong
-                // signals (high-confidence capture + clear jargon + phonetic
-                // OR LLM-confidence) promote at k=1 so users don't have to
-                // confirm obvious corrections.  Weak signals (low jargon
-                // score, ambiguous LLM confidence) require k=2 to guard
-                // against single-event false promotions.
+                // Promote on the first sighting. The capture-confidence gate
+                // (auto_promote_allowed) and semantic safety gate
+                // (stt_promotion_allowed: appears-in-kept + script match +
+                // hallucination guard) already filter low-trust signals out;
+                // an additional sighting-count gate here was redundant defense
+                // and made the system feel slow. Bad promotions are
+                // recoverable via cascade-clean delete + the demotion pass on
+                // user_kept; good promotions should land immediately.
                 let from = cand.transcript_form().trim();
-                let k = pick_k_for_stt_error(
-                    cand, correct, &body.capture_method,
-                );
-                let decision = pending_promotions::record_sighting(
-                    &state.pool, &state.default_user_id,
-                    correct, from, &output_language,
-                    k,
-                );
-                let promote_now = matches!(
-                    decision, Some(pending_promotions::PromotionDecision::Promote { .. }),
-                );
-                if !promote_now {
-                    info!(
-                        "[classify] STT_ERROR queued — k={k} not met for {correct:?} (jargon={:.2})",
-                        phonetics::jargon_score(correct),
-                    );
-                    queued_terms.push(correct.to_string());
-                    continue;
-                }
 
                 // Capture the surrounding sentence as example_context.
                 // Find the sentence containing `correct` in user_kept; if no
@@ -402,9 +378,6 @@ pub async fn classify(
                     1.0,
                 );
                 promoted_count += aliases_written;
-                pending_promotions::delete(
-                    &state.pool, &state.default_user_id, correct, &output_language,
-                );
                 if vocabulary::top_terms(&state.pool, &state.default_user_id, 200)
                     .iter()
                     .any(|t| t.term.eq_ignore_ascii_case(correct) && t.use_count > 1)
@@ -421,16 +394,24 @@ pub async fn classify(
                 if wrong.is_empty() || wrong == correct.to_ascii_lowercase() {
                     continue;
                 }
-                if correction_exists(&state, &wrong) {
+                // Promote on the first sighting. polish_promotion_allowed
+                // already verified the correction appears in user_kept and
+                // the script matches; the previous correction_exists gate was
+                // an implicit k=2 (had to see the same wrong→right pair
+                // twice) layered on top, which made obvious LLM mistakes
+                // take two recordings to learn. correction_exists is now
+                // tracked only as the is_repeat signal returned to the UI.
+                let already_seen = correction_exists(&state, &wrong);
+                if already_seen {
                     is_repeat = true;
-                    corrections::upsert(
-                        &state.pool, &state.default_user_id,
-                        &[(wrong, correct.to_ascii_lowercase())],
-                    );
-                    learned = true;
-                    promoted_count += 1;
-                    promoted_terms.push(correct.to_string());
                 }
+                corrections::upsert(
+                    &state.pool, &state.default_user_id,
+                    &[(wrong, correct.to_ascii_lowercase())],
+                );
+                learned = true;
+                promoted_count += 1;
+                promoted_terms.push(correct.to_string());
             }
             EditClass::UserRephrase | EditClass::UserRewrite => {
                 // No-op; safe defaults already kept by the labeler when uncertain.
@@ -485,46 +466,6 @@ pub async fn classify(
             queued_terms,
         }),
     )
-}
-
-/// Adaptive k-event threshold for STT_ERROR promotions.
-///
-/// Returns 1 when the signal is strong enough that asking the user to
-/// confirm the correction would feel slow + dumb (clear jargon + reliable
-/// capture path + either phonetic agreement or high LLM confidence).
-/// Returns 2 otherwise — single-event promotion of weak signals is the
-/// documented cause of WisperFlow's dictionary-bloat problem.
-///
-/// The thresholds:
-///   • capture_method must be AX or keystroke_verified (atomic-element-bound
-///     reads that we can fully trust)
-///   • jargon_score(correct) ≥ 0.6 — clearly an acronym, code identifier,
-///     mixed-case, or digit-bearing term (n8n, k8s, MACOBS, iPhone)
-///   • EITHER phonetic similarity ≥ 0.65 (the user's correction sounds like
-///     what STT heard, so it's a plausible mishearing)
-///     OR LLM confidence ≥ 0.85 (the labeler is very sure)
-fn pick_k_for_stt_error(
-    cand:           &LabelledHunk,
-    correct:        &str,
-    capture_method: &str,
-) -> i64 {
-    let high_conf_capture = matches!(capture_method, "ax" | "keystroke_verified");
-    if !high_conf_capture {
-        return pending_promotions::DEFAULT_K;
-    }
-    let jargon = phonetics::jargon_score(correct);
-    if jargon < 0.6 {
-        return pending_promotions::DEFAULT_K;
-    }
-    let phon_sim = phonetics::similarity(cand.transcript_form(), correct)
-        .max(phonetics::similarity(cand.polish_form(), correct));
-    let strong_phonetic   = phon_sim >= 0.65;
-    let strong_llm_conf   = cand.confidence >= 0.85;
-    if strong_phonetic || strong_llm_conf {
-        1
-    } else {
-        pending_promotions::DEFAULT_K
-    }
 }
 
 /// Defense-in-depth gate for STT_ERROR auto-promotion.
