@@ -4,14 +4,16 @@ import { cn } from "@/lib/utils";
 import {
   Shield, Cpu, Key, Info, Wifi, Check, Bot, Sparkles, Zap,
   Languages, MessageSquareText, Loader2, Cloud, LogIn, LogOut, RefreshCw, UserPlus,
-  Eye, EyeOff, Bell,
+  Eye, EyeOff, Bell, Bug, Copy, FileText,
 } from "lucide-react";
 import type { AppSnapshot, CloudStatus, OpenAIStatus, Preferences } from "@/types";
 import {
   cloudLogin, cloudLogout, cloudSignup, getCloudStatus,
   getPreferences, patchPreferences,
   getOpenAIStatus, initiateOpenAIOAuth, disconnectOpenAI,
+  getDebugLogs,
   requestNotifications, checkNotificationPermission,
+  type DebugLogs,
   type NotifPermission,
 } from "@/lib/invoke";
 
@@ -95,6 +97,7 @@ export type SettingsSection =
   | "permissions"
   | "api-keys"
   | "account"
+  | "debug"
   | "about";
 
 export const SETTINGS_SECTIONS: { id: SettingsSection; label: string }[] = [
@@ -102,6 +105,7 @@ export const SETTINGS_SECTIONS: { id: SettingsSection; label: string }[] = [
   { id: "permissions", label: "Permissions"   },
   { id: "api-keys",    label: "API keys"      },
   { id: "account",     label: "Account"       },
+  { id: "debug",       label: "Debug"         },
   { id: "about",       label: "About"         },
 ];
 
@@ -175,6 +179,12 @@ export function SettingsView({
   const [cloudMode,    setCloudMode]    = useState<"login" | "signup">("login");
   const [cloudBusy,    setCloudBusy]    = useState(false);
   const [cloudError,   setCloudError]   = useState("");
+
+  // ── Debug logs state ───────────────────────────────────────────────────────
+  const [debugLogs,    setDebugLogs]    = useState<DebugLogs | null>(null);
+  const [debugBusy,    setDebugBusy]    = useState(false);
+  const [debugCopied,  setDebugCopied]  = useState<"combined" | "desktop" | "backend" | null>(null);
+  const [debugTab,     setDebugTab]     = useState<"combined" | "desktop" | "backend">("combined");
 
   useEffect(() => {
     let alive = true;
@@ -259,6 +269,23 @@ export function SettingsView({
     } finally {
       setCloudBusy(false);
     }
+  }
+
+  async function refreshDebugLogs() {
+    setDebugBusy(true);
+    try {
+      setDebugLogs(await getDebugLogs());
+    } finally {
+      setDebugBusy(false);
+    }
+  }
+
+  async function copyDebugLog(kind: "combined" | "desktop" | "backend") {
+    const text = debugLogs?.[kind] ?? "";
+    if (!text.trim()) return;
+    await navigator.clipboard.writeText(text);
+    setDebugCopied(kind);
+    setTimeout(() => setDebugCopied((prev) => prev === kind ? null : prev), 1800);
   }
 
   async function handleOpenAIConnect() {
@@ -358,6 +385,12 @@ export function SettingsView({
     await patch({ custom_prompt: customPrompt || null });
     setPromptDirty(false);
   }
+
+  useEffect(() => {
+    if (isOn("debug") && !debugLogs && !debugBusy) {
+      refreshDebugLogs();
+    }
+  }, [activeSection]);
 
   const tone = (prefs?.tone_preset ?? "neutral") as ToneKey;
 
@@ -1149,6 +1182,129 @@ export function SettingsView({
             </div>
           )}
         </Section>
+        </Show>
+
+        {/* ── Debug ───────────────────────────────────── */}
+        <Show when={isOn("debug")}>
+        <div className="mb-7">
+          <div className="flex items-center justify-between px-1 mb-2.5">
+            <p className="section-label flex items-center gap-2">
+              <span
+                className="inline-block w-1 h-1 rounded-full"
+                style={{ background: "hsl(var(--accent-violet))" }}
+              />
+              Runtime Logs
+            </p>
+            <div className="flex items-center gap-2">
+              {debugLogs?.truncated && (
+                <span className="text-[10px] px-2 py-1 rounded-md"
+                      style={{ background: "hsl(var(--surface-4))", color: "hsl(var(--muted-foreground))" }}>
+                  Tail
+                </span>
+              )}
+              <button
+                onClick={refreshDebugLogs}
+                disabled={debugBusy}
+                className="w-8 h-8 rounded-lg flex items-center justify-center transition-colors disabled:opacity-50"
+                style={{ background: "hsl(var(--surface-4))", color: "hsl(var(--muted-foreground))" }}
+                title="Refresh logs"
+              >
+                <RefreshCw size={13} className={debugBusy ? "animate-spin" : ""} />
+              </button>
+            </div>
+          </div>
+
+          <div className="panel overflow-hidden">
+            <div className="px-5 pt-4 pb-3 flex items-start gap-3">
+              <div
+                className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 text-muted-foreground"
+                style={{ background: "hsl(var(--surface-4))" }}
+              >
+                <Bug size={16} />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="text-[13px] font-medium text-foreground">Latest run</p>
+                <p className="text-[11px] text-muted-foreground mt-1 truncate">
+                  {debugTab === "backend"
+                    ? debugLogs?.backend_path ?? "backend.log"
+                    : debugTab === "desktop"
+                    ? debugLogs?.desktop_path ?? "said.log"
+                    : `${debugLogs?.desktop_path ?? "said.log"} + ${debugLogs?.backend_path ?? "backend.log"}`}
+                </p>
+              </div>
+            </div>
+
+            <div className="mx-5 border-t" style={{ borderColor: "hsl(var(--surface-3))" }} />
+
+            <div className="px-5 py-3 flex items-center justify-between gap-3">
+              <div
+                className="flex rounded-xl p-0.5 gap-0.5"
+                style={{ background: "hsl(var(--surface-4))" }}
+              >
+                {([
+                  ["combined", "Combined"],
+                  ["desktop",  "Said"],
+                  ["backend",  "Backend"],
+                ] as const).map(([id, label]) => {
+                  const active = debugTab === id;
+                  return (
+                    <button
+                      key={id}
+                      onClick={() => setDebugTab(id)}
+                      className="text-[12px] font-medium rounded-[10px] px-3 py-1.5 transition-all"
+                      style={{
+                        background: active ? "hsl(var(--surface-1))" : "transparent",
+                        color: active ? "hsl(var(--foreground))" : "hsl(var(--muted-foreground))",
+                      }}
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
+
+              <button
+                onClick={() => copyDebugLog(debugTab)}
+                disabled={!debugLogs || !(debugLogs[debugTab] ?? "").trim()}
+                className="text-[12px] font-semibold px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors disabled:opacity-50"
+                style={{ background: "hsl(var(--surface-4))", color: "hsl(var(--muted-foreground))" }}
+              >
+                {debugCopied === debugTab ? <Check size={12} /> : <Copy size={12} />}
+                {debugCopied === debugTab ? "Copied" : "Copy"}
+              </button>
+            </div>
+
+            <div className="px-5 pb-5">
+              <div
+                className="rounded-xl overflow-hidden border"
+                style={{ borderColor: "hsl(var(--surface-4))", background: "hsl(var(--surface-1))" }}
+              >
+                <div
+                  className="flex items-center gap-2 px-3 py-2 border-b"
+                  style={{ borderColor: "hsl(var(--surface-4))", color: "hsl(var(--muted-foreground))" }}
+                >
+                  <FileText size={12} />
+                  <span className="text-[11px] font-medium">
+                    {debugBusy ? "Loading" : debugTab === "combined" ? "Combined" : debugTab === "desktop" ? "Said desktop" : "polish-backend"}
+                  </span>
+                </div>
+                <textarea
+                  readOnly
+                  value={
+                    debugBusy
+                      ? "Loading logs..."
+                      : debugLogs
+                      ? debugLogs[debugTab] || "(empty)"
+                      : "(logs unavailable)"
+                  }
+                  spellCheck={false}
+                  className="w-full h-[340px] resize-none bg-transparent px-3 py-3 font-mono text-[11px] leading-relaxed outline-none"
+                  style={{ color: "hsl(var(--foreground))" }}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
         </Show>
 
         {/* ── About ────────────────────────────────────── */}

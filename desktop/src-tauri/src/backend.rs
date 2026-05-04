@@ -9,6 +9,8 @@ use std::time::Duration;
 
 #[cfg(unix)]
 extern crate libc;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use tracing::{info, warn};
 
@@ -41,15 +43,21 @@ impl BackendHandle {
     pub fn endpoint(&self) -> BackendEndpoint {
         self.endpoint.clone()
     }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
 }
 
 impl Drop for BackendHandle {
     fn drop(&mut self) {
         let pid = self.child.id();
         info!("[backend] shutting down daemon pid={pid}");
-        // SIGTERM → wait 3 s → SIGKILL
+        // SIGTERM → wait 3 s → SIGKILL. The child runs in its own session, so
+        // negative PID targets the whole backend process group when available.
         #[cfg(unix)]
         unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
             libc::kill(pid as libc::pid_t, libc::SIGTERM);
         }
         #[cfg(not(unix))]
@@ -63,6 +71,10 @@ impl Drop for BackendHandle {
             }
             if std::time::Instant::now() >= deadline {
                 warn!("[backend] graceful shutdown timed out — SIGKILL");
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                }
                 let _ = self.child.kill();
                 let _ = self.child.wait();
                 return;
@@ -87,7 +99,8 @@ pub fn spawn() -> Result<BackendHandle, String> {
 
     info!("[backend] spawning {bin:?} on port {port}");
 
-    let child = Command::new(&bin)
+    let mut command = Command::new(&bin);
+    command
         .arg("--port")
         .arg(port.to_string())
         .env("POLISH_SHARED_SECRET", &secret)
@@ -103,7 +116,19 @@ pub fn spawn() -> Result<BackendHandle, String> {
         .env(
             "GEMINI_API_KEY",
             std::env::var("GEMINI_API_KEY").unwrap_or_default(),
-        )
+        );
+
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let child = command
         .spawn()
         .map_err(|e| format!("failed to spawn polish-backend ({bin:?}): {e}"))?;
 

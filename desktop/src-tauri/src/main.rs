@@ -2,21 +2,27 @@
 
 mod api;
 mod backend;
+mod backend_guard;
 mod desktop;
 mod dg_stream; // P5: Deepgram WebSocket live streaming
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use std::io::{Read, Seek, SeekFrom};
 
 use tauri::{
     Emitter, Manager, State,
     menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::TrayIconBuilder,
 };
+use tokio_util::sync::CancellationToken;
 
 use backend::BackendEndpoint;
 use desktop::DesktopApp;
 use voice_polish_core::{AppSnapshot, ProcessSummary};
 use voice_polish_paster as paster;
+
+const DEBUG_LOG_MAX_BYTES: u64 = 240_000;
 
 #[cfg(target_os = "macos")]
 use voice_polish_hotkey as hotkey;
@@ -534,6 +540,10 @@ struct BackendState(Arc<Mutex<Option<BackendEndpoint>>>);
 /// When Tauri drops managed state on exit, Drop fires → SIGTERM → SIGKILL.
 struct BackendHandleState(Mutex<Option<backend::BackendHandle>>);
 
+/// Owns the currently running post-paste edit watcher. Starting a new watcher
+/// cancels the previous one so rapid recordings cannot stack poll loops.
+struct EditWatcherState(Mutex<Option<CancellationToken>>);
+
 /// P5: Holds the oneshot receiver that delivers the pre-transcript from the
 /// Deepgram WebSocket streaming task.  Replaced on every new recording.
 struct StreamingState(Mutex<Option<tokio::sync::oneshot::Receiver<String>>>);
@@ -561,6 +571,16 @@ struct HotPathCacheInner {
 /// Populated immediately after each recording session ends so the TLS handshake
 /// is never on the hot path (~150ms saved normally, up to 3s saved on rapid use).
 struct PrewarmedWsState(Arc<tokio::sync::Mutex<Option<dg_stream::PrewarmedWs>>>);
+
+#[derive(serde::Serialize)]
+struct DebugLogs {
+    desktop_path: String,
+    backend_path: String,
+    desktop:      String,
+    backend:      String,
+    combined:     String,
+    truncated:    bool,
+}
 
 /// Lightweight cache of tray-relevant prefs so `sync_tray` never needs async.
 struct TrayCache(Mutex<TrayCacheInner>);
@@ -1215,13 +1235,13 @@ fn toggle_recording(
                 let watch_start = std::time::Instant::now();
                 if let Ok(ref done) = result {
                     let back3 = Arc::clone(&back_arc2);
-                    tauri::async_runtime::spawn(watch_for_edit(
+                    start_edit_watcher(
                         back3,
                         app2.clone(),
                         done.recording_id.clone(),
                         done.polished.clone(),
                         watch_start,
-                    ));
+                    );
                 }
 
                 let mut d = match shared2.lock() {
@@ -1520,13 +1540,13 @@ fn do_finish_recording(
         let watch_start = std::time::Instant::now();
         if let Ok(ref done) = result {
             let back3 = Arc::clone(&back_arc2);
-            tauri::async_runtime::spawn(watch_for_edit(
+            start_edit_watcher(
                 back3,
                 app2.clone(),
                 done.recording_id.clone(),
                 done.polished.clone(),
                 watch_start,
-            ));
+            );
         }
 
         let mut d = match shared2.lock() {
@@ -1914,13 +1934,13 @@ fn retry_recording(
         let watch_start = std::time::Instant::now();
         if let Ok(ref done) = result {
             let back3 = Arc::clone(&back_arc2);
-            tauri::async_runtime::spawn(watch_for_edit(
+            start_edit_watcher(
                 back3,
                 app2.clone(),
                 done.recording_id.clone(),
                 done.polished.clone(),
                 watch_start,
-            ));
+            );
         }
 
         let mut d = match shared2.lock() {
@@ -2229,40 +2249,184 @@ fn get_endpoint(backend: &State<'_, BackendState>) -> Result<BackendEndpoint, St
     lock.clone().ok_or_else(|| "backend not started".into())
 }
 
+fn said_log_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(format!(
+        "{}/Library/Logs/Said",
+        std::env::var("HOME").unwrap_or_else(|_| ".".into())
+    ))
+}
+
+fn read_recent_log(path: &std::path::Path, marker: &str) -> (String, bool) {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return ("".into(), false),
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(DEBUG_LOG_MAX_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return ("".into(), false);
+    }
+
+    let mut bytes = Vec::with_capacity((len - start).min(DEBUG_LOG_MAX_BYTES) as usize);
+    if file.read_to_end(&mut bytes).is_err() {
+        return ("".into(), false);
+    }
+    let mut text = String::from_utf8_lossy(&bytes).to_string();
+    if let Some(idx) = text.rfind(marker) {
+        text = text[idx..].to_string();
+    }
+    (text, start > 0)
+}
+
+#[tauri::command]
+fn get_debug_logs() -> DebugLogs {
+    let dir = said_log_dir();
+    let desktop_path = dir.join("said.log");
+    let backend_path = dir.join("backend.log");
+    let (desktop, desktop_truncated) =
+        read_recent_log(&desktop_path, "[main] said desktop starting");
+    let (backend, backend_truncated) =
+        read_recent_log(&backend_path, "polish-backend build=");
+
+    let combined = format!(
+        "── Said desktop ({}) ──\n{}\n\n── polish-backend ({}) ──\n{}",
+        desktop_path.display(),
+        if desktop.trim().is_empty() { "(no desktop log found)" } else { desktop.trim_end() },
+        backend_path.display(),
+        if backend.trim().is_empty() { "(no backend log found)" } else { backend.trim_end() },
+    );
+
+    DebugLogs {
+        desktop_path: desktop_path.display().to_string(),
+        backend_path: backend_path.display().to_string(),
+        desktop,
+        backend,
+        combined,
+        truncated: desktop_truncated || backend_truncated,
+    }
+}
+
 // ── Edit watcher ──────────────────────────────────────────────────────────────
 
-/// After pasting, poll the focused text element for up to 2 minutes.
-/// When the user stops typing for 8 s (or switches apps), emit "edit-detected"
+const EDIT_WATCH_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const EDIT_WATCH_MAX_DURATION: Duration = Duration::from_secs(30);
+const EDIT_WATCH_FAST_INTERVAL: Duration = Duration::from_millis(30);
+const EDIT_WATCH_SLOW_INTERVAL: Duration = Duration::from_millis(200);
+const EDIT_WATCH_BLOCKING_TIMEOUT: Duration = Duration::from_millis(500);
+
+async fn blocking_ax_option<T, F>(label: &'static str, f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Option<T> + Send + 'static,
+{
+    match tokio::time::timeout(EDIT_WATCH_BLOCKING_TIMEOUT, tokio::task::spawn_blocking(f)).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(err)) => {
+            tracing::warn!("[edit-watch] blocking AX task {label} failed: {err}");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("[edit-watch] blocking AX task {label} timed out");
+            None
+        }
+    }
+}
+
+async fn cancellable_sleep(token: &CancellationToken, duration: Duration) -> bool {
+    tokio::select! {
+        _ = token.cancelled() => false,
+        _ = tokio::time::sleep(duration) => true,
+    }
+}
+
+fn start_edit_watcher(
+    back_arc: Arc<Mutex<Option<BackendEndpoint>>>,
+    app: tauri::AppHandle,
+    recording_id: String,
+    polished: String,
+    watch_start: std::time::Instant,
+) {
+    let token = {
+        let st = app.state::<EditWatcherState>();
+        let mut guard = match st.0.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                tracing::warn!("[edit-watch] watcher state lock poisoned; skipping watcher");
+                return;
+            }
+        };
+        if let Some(prev) = guard.take() {
+            tracing::info!("[edit-watch] cancelling previous watcher");
+            prev.cancel();
+        }
+        let token = CancellationToken::new();
+        *guard = Some(token.clone());
+        token
+    };
+
+    let app_for_task = app.clone();
+    tauri::async_runtime::spawn(async move {
+        watch_for_edit(token.clone(), back_arc, app_for_task.clone(), recording_id, polished, watch_start).await;
+
+        if !token.is_cancelled() {
+            if let Ok(mut guard) = app_for_task.state::<EditWatcherState>().0.lock() {
+                *guard = None;
+            }
+        }
+    });
+}
+
+/// After pasting, poll the focused text element for up to 30 seconds.
+/// When the user stops typing for 5 s (or switches apps), emit "edit-detected"
 /// so the frontend can ask "Save this preference?" before writing to SQLite.
 async fn watch_for_edit(
+    token: CancellationToken,
     back_arc: Arc<Mutex<Option<BackendEndpoint>>>,
     app: tauri::AppHandle,
     recording_id: String,
     polished: String,                // the AI-generated text we pasted
     watch_start: std::time::Instant, // captured at the call site, right after paste
 ) {
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     // Let the paste animation settle and focus move into the text field.
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    if !cancellable_sleep(&token, Duration::from_millis(700)).await {
+        tracing::info!("[edit-watch] watcher cancelled before start for {recording_id}");
+        return;
+    }
 
     // Snapshot the PID right after paste.
-    let initial_pid = paster::focused_pid();
+    let initial_pid = blocking_ax_option("focused_pid initial", paster::focused_pid).await;
 
     // Attempt to get the initial field value.  Chrome / Electron may still be
     // building their AX cache even after the pre-unlock at recording-start, so
     // we retry a few times with increasing delays before declaring "AX blind".
     let post_paste = {
-        let mut val = paster::read_focused_value().unwrap_or_default();
+        let mut val = blocking_ax_option(
+            "read_focused_value_first initial",
+            paster::read_focused_value_first,
+        ).await.unwrap_or_default();
         if val.is_empty() {
             // 2nd attempt after 300 ms
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            val = paster::read_focused_value().unwrap_or_default();
+            if !cancellable_sleep(&token, Duration::from_millis(300)).await {
+                tracing::info!("[edit-watch] watcher cancelled during initial retry for {recording_id}");
+                return;
+            }
+            val = blocking_ax_option(
+                "read_focused_value_first retry1",
+                paster::read_focused_value_first,
+            ).await.unwrap_or_default();
         }
         if val.is_empty() {
             // 3rd attempt after another 500 ms — AX tree should be ready by now
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            val = paster::read_focused_value().unwrap_or_default();
+            if !cancellable_sleep(&token, Duration::from_millis(500)).await {
+                tracing::info!("[edit-watch] watcher cancelled during initial retry for {recording_id}");
+                return;
+            }
+            val = blocking_ax_option(
+                "read_focused_value_first retry2",
+                paster::read_focused_value_first,
+            ).await.unwrap_or_default();
         }
         val
     };
@@ -2274,6 +2438,9 @@ async fn watch_for_edit(
     let mut best_candidate = post_paste.clone();
     let mut idle_at = Instant::now();
     let started     = Instant::now();
+    let mut last_change_at = Instant::now();
+    let mut current_interval = EDIT_WATCH_FAST_INTERVAL;
+    let mut last_pid = initial_pid;
     // Capture-error metadata, hoisted so we can ship it to the backend's
     // CAPTURE_ERROR pre-filter alongside the edit text.
     let mut app_switched_during_capture: bool = false;
@@ -2284,17 +2451,20 @@ async fn watch_for_edit(
         post_paste.len(),
     );
 
-    // Poll loop: 30 ms cadence.  No mid-loop side effects — we only read AX
+    // Poll loop: adaptive cadence.  No mid-loop side effects — we only read AX
     // and watch for app switches.  Clipboard verification (Cmd+A+C) is
     // strictly an end-of-loop, same-app operation; doing it during the loop
     // disrupts the user's typing in AX-blind apps like Claude input.
     loop {
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        if !cancellable_sleep(&token, current_interval).await {
+            tracing::info!("[edit-watch] watcher cancelled for {recording_id}");
+            return;
+        }
 
         // Check PID FIRST — if the user switched apps, break immediately WITHOUT
         // reading the new app's field value.  If we read first, last_val gets
         // overwritten with the new app's (empty) text, corrupting the diff.
-        let now_pid = paster::focused_pid();
+        let now_pid = blocking_ax_option("focused_pid poll", paster::focused_pid).await;
         let pid_switched = matches!(
             (initial_pid, now_pid),
             (Some(a), Some(b)) if a != b
@@ -2305,19 +2475,34 @@ async fn watch_for_edit(
         }
 
         // Still in the same app — read the current field value.
-        let now_val = paster::read_focused_value().unwrap_or_default();
+        let now_val = if now_pid != last_pid {
+            last_pid = now_pid;
+            blocking_ax_option(
+                "read_focused_value_first focus-change",
+                paster::read_focused_value_first,
+            ).await
+        } else {
+            blocking_ax_option(
+                "read_focused_value_fast poll",
+                paster::read_focused_value_fast,
+            ).await
+        }.unwrap_or_default();
         if now_val != last_val {
             idle_at = Instant::now();
+            last_change_at = Instant::now();
+            current_interval = EDIT_WATCH_FAST_INTERVAL;
             // Only promote to best_candidate if the value still shares words
             // with the polished text (guards against Send-cleared placeholders).
             if shares_word_overlap(&now_val, &polished) {
                 best_candidate = now_val.clone();
             }
             last_val = now_val;
+        } else if last_change_at.elapsed() > Duration::from_secs(2) {
+            current_interval = EDIT_WATCH_SLOW_INTERVAL;
         }
 
-        let done = idle_at.elapsed() > Duration::from_secs(8)  // 8s idle — user stopped typing
-            || started.elapsed() > Duration::from_secs(120); // 2-min cap
+        let done = idle_at.elapsed() > EDIT_WATCH_IDLE_TIMEOUT
+            || started.elapsed() > EDIT_WATCH_MAX_DURATION;
 
         if done {
             break;
@@ -2338,7 +2523,7 @@ async fn watch_for_edit(
         last_val.clone()
     };
 
-    let final_pid = paster::focused_pid();
+    let final_pid = blocking_ax_option("focused_pid final", paster::focused_pid).await;
     tracing::info!(
         "[edit-watch] done watching {recording_id} — field changed: {}, same app: {}",
         effective_val != post_paste,
@@ -2828,6 +3013,12 @@ fn main() {
     // 1. Load env vars from .env files
     voice_polish_core::load_env();
 
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        backend_guard::kill_from_pid_file();
+        default_panic_hook(info);
+    }));
+
     // 2. Tracing — write to ~/Library/Logs/Said/said.log so logs survive in bundled app
     let log_dir = format!(
         "{}/Library/Logs/Said",
@@ -2867,6 +3058,12 @@ fn main() {
     let backend_arc = Arc::new(Mutex::new(None::<BackendEndpoint>));
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .setup({
             let shared   = Arc::clone(&shared_app);
             let back_arc = Arc::clone(&backend_arc);
@@ -2893,11 +3090,13 @@ fn main() {
                     tracing::warn!("[perm] Input Monitoring NOT granted — hotkeys (Caps Lock, Option+1-5, Ctrl+Cmd+V) will not work. Grant in System Settings → Privacy → Input Monitoring");
                 }
 
+                backend_guard::reap_previous();
                 match backend::spawn() {
                     Ok(handle) => {
                         // Extract all endpoint clones BEFORE storing (move) the handle.
                         let ep  = handle.endpoint();
                         let ep2 = handle.endpoint();
+                        backend_guard::write_pid_file(handle.pid());
                         *back_arc.lock().unwrap() = Some(ep.clone());
                         // Store the full handle so Drop kills the child on app exit.
                         // Without this the child outlives the app (zombie leak).
@@ -2971,6 +3170,24 @@ fn main() {
                         tracing::error!("[main] failed to spawn backend: {e}");
                         // App continues without backend; commands return errors.
                     }
+                }
+
+                {
+                    let app_handle = app.handle().clone();
+                    std::thread::spawn(move || {
+                        let signals = signal_hook::iterator::Signals::new([
+                            signal_hook::consts::SIGINT,
+                            signal_hook::consts::SIGTERM,
+                        ]);
+                        let Ok(mut signals) = signals else {
+                            tracing::warn!("[main] failed to install signal hook");
+                            return;
+                        };
+                        if signals.forever().next().is_some() {
+                            backend_guard::kill_from_pid_file();
+                            app_handle.exit(0);
+                        }
+                    });
                 }
 
                 // ── System tray ───────────────────────────────────────────────
@@ -3112,6 +3329,7 @@ fn main() {
         .manage(SharedApp(shared_app))
         .manage(BackendState(backend_arc))
         .manage(BackendHandleState(Mutex::new(None)))
+        .manage(EditWatcherState(Mutex::new(None)))
         .manage(StreamingState(Mutex::new(None)))
         .manage(TrayCache(Mutex::new(TrayCacheInner::default())))
         .manage(LatestResult(std::sync::Arc::new(Mutex::new(None))))
@@ -3140,6 +3358,7 @@ fn main() {
             get_openai_status,
             initiate_openai_oauth,
             disconnect_openai,
+            get_debug_logs,
             // Paste latest
             paste_latest,
             // Retry
@@ -3164,17 +3383,18 @@ fn main() {
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Voice Polish desktop")
-        .run(|_handle, event| {
-            // Only prevent exit when the last window is closed (so closing the
-            // window hides it rather than quitting). An explicit app.exit(0)
-            // from the tray "Quit Said" item bypasses this and terminates.
-            if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
-                if code.is_none() {
-                    // Window closed — hide instead of quit
-                    api.prevent_exit();
-                }
-                // code.is_some() means app.exit(N) was called — let it through
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { code, api, .. } if code.is_none() => {
+                // Window closed / Cmd+Q — hide instead of quit for accessory-app UX.
+                api.prevent_exit();
             }
+            tauri::RunEvent::Exit => {
+                if let Ok(mut guard) = app.state::<BackendHandleState>().0.lock() {
+                    drop(guard.take());
+                }
+                backend_guard::clear_pid_file();
+            }
+            _ => {}
         });
 }
 

@@ -225,7 +225,53 @@ mod imp {
     ///     but is exposed by some Electron apps even without tree unlock.
     ///
     /// Returns None if accessibility is not granted or nothing readable is focused.
-    pub fn read_focused_value() -> Option<String> {
+    ///
+    /// Fast path only: reads the immediate `AXValue` from the focused element.
+    /// It intentionally does not unlock Chrome/Electron accessibility or sleep,
+    /// so hot polling loops can call it without blocking executor workers.
+    pub fn read_focused_value_fast() -> Option<String> {
+        unsafe {
+            if !ffi::AXIsProcessTrusted() { return None; }
+
+            let sys = ffi::AXUIElementCreateSystemWide();
+            if sys.is_null() { return None; }
+
+            // ── Get focused application element ───────────────────────────────
+            let app = ax_attr(sys as *const _, "AXFocusedApplication");
+            ffi::CFRelease(sys);
+            let app = app?;
+
+            // ── Get focused UI element ────────────────────────────────────────
+            let el = match ax_attr(app as *const _, "AXFocusedUIElement") {
+                Some(e) => e,
+                None => {
+                    ffi::CFRelease(app);
+                    return None;
+                }
+            };
+
+            if let Some(val_cf) = ax_attr(el as *const _, "AXValue") {
+                let result = cfstring_to_rust(val_cf as *const _);
+                ffi::CFRelease(val_cf);
+                ffi::CFRelease(el);
+                ffi::CFRelease(app);
+                if result.is_some() {
+                    return result;
+                }
+            }
+
+            ffi::CFRelease(el);
+            ffi::CFRelease(app);
+            None
+        }
+    }
+
+    /// Full focused value read used for first reads and one-shot callers.
+    ///
+    /// This preserves the old behavior: direct `AXValue`, Chrome/Electron AX
+    /// unlock plus 200 ms cache rebuild wait, `AXSelectedText`, then bounded
+    /// subtree BFS.
+    pub fn read_focused_value_first() -> Option<String> {
         unsafe {
             if !ffi::AXIsProcessTrusted() { return None; }
 
@@ -253,8 +299,6 @@ mod imp {
                 ffi::CFRelease(el);
                 ffi::CFRelease(app);
                 if result.is_some() {
-                    // Only log at trace level — this fires every 30 ms in the watcher
-                    // and would otherwise flood stderr.
                     return result;
                 }
             }
@@ -313,6 +357,11 @@ mod imp {
             ffi::CFRelease(app);
             deep
         }
+    }
+
+    /// Back-compat shim for one-shot callers that expect the full read path.
+    pub fn read_focused_value() -> Option<String> {
+        read_focused_value_first()
     }
 
     /// BFS a UI element's descendants looking for a non-empty CFString-typed
@@ -1060,7 +1109,9 @@ mod imp {
 
     pub fn is_accessibility_granted() -> bool { false }
 
-    pub fn read_focused_value() -> Option<String> { None }
+    pub fn read_focused_value_fast() -> Option<String> { None }
+    pub fn read_focused_value_first() -> Option<String> { None }
+    pub fn read_focused_value() -> Option<String> { read_focused_value_first() }
     pub fn capture_focused_text_via_selection() -> Option<String> { None }
     pub fn read_selected_text() -> Option<String> { None }
 

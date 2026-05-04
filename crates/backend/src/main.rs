@@ -38,6 +38,8 @@ async fn main() {
         .with_writer(std::sync::Mutex::new(log_file))
         .init();
 
+    start_parent_death_watch();
+
     // ── Load env vars ─────────────────────────────────────────────────────────
     voice_polish_core::load_env();
 
@@ -143,6 +145,59 @@ async fn main() {
 
     info!("polish-backend stopped");
 }
+
+#[cfg(target_os = "macos")]
+fn start_parent_death_watch() {
+    let parent_pid = unsafe { libc::getppid() };
+    if parent_pid <= 1 {
+        return;
+    }
+
+    std::thread::spawn(move || unsafe {
+        let kq = libc::kqueue();
+        if kq == -1 {
+            return;
+        }
+
+        let mut change = libc::kevent {
+            ident:  parent_pid as libc::uintptr_t,
+            filter: libc::EVFILT_PROC,
+            flags:  libc::EV_ADD | libc::EV_ENABLE,
+            fflags: libc::NOTE_EXIT,
+            data:   0,
+            udata:  std::ptr::null_mut(),
+        };
+        let mut event = std::mem::zeroed::<libc::kevent>();
+
+        let rc = libc::kevent(
+            kq,
+            &mut change,
+            1,
+            &mut event,
+            1,
+            std::ptr::null(),
+        );
+        let _ = libc::close(kq);
+
+        if rc > 0 {
+            info!("[parent-watch] parent pid={parent_pid} exited — shutting down backend");
+            std::process::exit(0);
+        }
+    });
+
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if unsafe { libc::getppid() } == 1 {
+                info!("[parent-watch] backend reparented to launchd — shutting down");
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn start_parent_death_watch() {}
 
 // ── Metering batch ────────────────────────────────────────────────────────────
 

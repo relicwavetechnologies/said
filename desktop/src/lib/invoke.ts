@@ -272,6 +272,35 @@ export interface AxDiagnostics {
   methods:      AxMethodResult[];
   clipboard:    string;
 }
+
+export interface DebugLogs {
+  desktop_path: string;
+  backend_path: string;
+  desktop:      string;
+  backend:      string;
+  combined:     string;
+  truncated:    boolean;
+}
+
+export async function getDebugLogs(): Promise<DebugLogs | null> {
+  if (!isTauriRuntime()) {
+    return {
+      desktop_path: "~/Library/Logs/Said/said.log",
+      backend_path: "~/Library/Logs/Said/backend.log",
+      desktop:      "[main] said desktop starting — preview log",
+      backend:      "polish-backend build=0.1.0 features=openai_oauth+codex_api",
+      combined:     "── Said desktop ──\n[main] said desktop starting — preview log\n\n── polish-backend ──\npolish-backend build=0.1.0 features=openai_oauth+codex_api",
+      truncated:    false,
+    };
+  }
+  try {
+    return await tauriInvoke<DebugLogs>("get_debug_logs");
+  } catch (e) {
+    console.error("get_debug_logs failed", e);
+    return null;
+  }
+}
+
 export async function diagnoseAx(delaySecs: number): Promise<AxDiagnostics | null> {
   if (!isTauriRuntime()) return null;
   try {
