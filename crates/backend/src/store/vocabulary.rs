@@ -17,15 +17,15 @@ use rusqlite::params;
 use serde::Serialize;
 use tracing::info;
 
-use super::{now_ms, DbPool};
+use super::{DbPool, now_ms};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VocabTerm {
-    pub term:      String,
-    pub weight:    f64,
+    pub term: String,
+    pub weight: f64,
     pub use_count: i64,
     pub last_used: i64,
-    pub source:    String,
+    pub source: String,
     /// Optional sentence-or-snippet the term was first observed in. Used by
     /// the polish LLM to do context-aware recognition of unseen STT
     /// mishearings ("main course ka IPO" → MACOBS, when MACOBS's example is
@@ -68,7 +68,9 @@ pub struct VocabTerm {
 ///   "other"           — none of the above (likely generic / common word)
 pub fn classify_term_type(term: &str) -> &'static str {
     let t = term.trim();
-    if t.is_empty() { return "other"; }
+    if t.is_empty() {
+        return "other";
+    }
 
     // Multi-word → phrase (highest priority — overrides single-word checks)
     if t.contains(char::is_whitespace) {
@@ -76,11 +78,13 @@ pub fn classify_term_type(term: &str) -> &'static str {
     }
 
     let alpha_only = t.chars().all(|c| c.is_ascii_alphabetic());
-    let has_lower  = t.chars().any(|c| c.is_ascii_lowercase());
-    let has_upper  = t.chars().any(|c| c.is_ascii_uppercase());
-    let has_digit  = t.chars().any(|c| c.is_ascii_digit());
-    let len        = t.chars().count();
-    let upper_after_first = t.chars().enumerate()
+    let has_lower = t.chars().any(|c| c.is_ascii_lowercase());
+    let has_upper = t.chars().any(|c| c.is_ascii_uppercase());
+    let has_digit = t.chars().any(|c| c.is_ascii_digit());
+    let len = t.chars().count();
+    let upper_after_first = t
+        .chars()
+        .enumerate()
         .any(|(i, c)| i > 0 && c.is_ascii_uppercase());
 
     // All-caps acronym: alphabetic, 2-8 chars, no lowercase
@@ -110,13 +114,7 @@ pub fn classify_term_type(term: &str) -> &'static str {
 /// backward compatibility with manual-add and starred paths that don't
 /// carry a language).  New code from the classifier should call
 /// `upsert_for_language` instead so the term is bucketed correctly.
-pub fn upsert(
-    pool:    &DbPool,
-    user_id: &str,
-    term:    &str,
-    bump:    f64,
-    source:  &str,
-) -> bool {
+pub fn upsert(pool: &DbPool, user_id: &str, term: &str, bump: f64, source: &str) -> bool {
     upsert_inner(pool, user_id, term, bump, source, None, None)
 }
 
@@ -126,11 +124,11 @@ pub fn upsert(
 /// language at recording time (no Devanagari leaking into English-mode
 /// Deepgram requests).
 pub fn upsert_for_language(
-    pool:    &DbPool,
+    pool: &DbPool,
     user_id: &str,
-    term:    &str,
-    bump:    f64,
-    source:  &str,
+    term: &str,
+    bump: f64,
+    source: &str,
     language: &str,
 ) -> bool {
     upsert_inner(pool, user_id, term, bump, source, Some(language), None)
@@ -148,26 +146,24 @@ pub fn upsert_for_language(
 ///     earliest example is usually the most representative).
 ///   • Empty / whitespace-only context is treated as None.
 pub fn upsert_for_language_with_context(
-    pool:    &DbPool,
+    pool: &DbPool,
     user_id: &str,
-    term:    &str,
-    bump:    f64,
-    source:  &str,
+    term: &str,
+    bump: f64,
+    source: &str,
     language: &str,
     example_context: Option<&str>,
 ) -> bool {
-    let ctx = example_context
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let ctx = example_context.map(str::trim).filter(|s| !s.is_empty());
     upsert_inner(pool, user_id, term, bump, source, Some(language), ctx)
 }
 
 fn upsert_inner(
-    pool:    &DbPool,
+    pool: &DbPool,
     user_id: &str,
-    term:    &str,
-    bump:    f64,
-    source:  &str,
+    term: &str,
+    bump: f64,
+    source: &str,
     language: Option<&str>,
     example_context: Option<&str>,
 ) -> bool {
@@ -263,21 +259,25 @@ pub fn demote(pool: &DbPool, user_id: &str, term: &str, penalty: f64) -> bool {
     if trimmed.is_empty() {
         return false;
     }
-    let updated = conn.execute(
-        "UPDATE vocabulary SET weight = weight - ?3
+    let updated = conn
+        .execute(
+            "UPDATE vocabulary SET weight = weight - ?3
            WHERE user_id = ?1 AND term = ?2",
-        params![user_id, trimmed, penalty],
-    ).unwrap_or(0);
+            params![user_id, trimmed, penalty],
+        )
+        .unwrap_or(0);
 
     if updated == 0 {
         return false;
     }
 
-    let removed = conn.execute(
-        "DELETE FROM vocabulary
+    let removed = conn
+        .execute(
+            "DELETE FROM vocabulary
            WHERE user_id = ?1 AND term = ?2 AND weight <= 0.0 AND source != 'starred'",
-        params![user_id, trimmed],
-    ).unwrap_or(0);
+            params![user_id, trimmed],
+        )
+        .unwrap_or(0);
 
     info!("[vocab] demote term={trimmed:?} penalty={penalty} removed={removed}");
     true
@@ -302,14 +302,14 @@ pub fn top_terms(pool: &DbPool, user_id: &str, limit: usize) -> Vec<VocabTerm> {
     };
     stmt.query_map(params![user_id, limit as i64], |row| {
         Ok(VocabTerm {
-            term:            row.get(0)?,
-            weight:          row.get(1)?,
-            use_count:       row.get(2)?,
-            last_used:       row.get(3)?,
-            source:          row.get(4)?,
+            term: row.get(0)?,
+            weight: row.get(1)?,
+            use_count: row.get(2)?,
+            last_used: row.get(3)?,
+            source: row.get(4)?,
             example_context: row.get(5).ok(),
-            term_type:       row.get(6).ok(),
-            meaning:         row.get(7).ok(),
+            term_type: row.get(6).ok(),
+            meaning: row.get(7).ok(),
         })
     })
     .ok()
@@ -330,10 +330,10 @@ pub fn top_term_strings(pool: &DbPool, user_id: &str, limit: usize) -> Vec<Strin
 /// the backfill from before migration 013 doesn't disappear from the
 /// keyterms slate overnight.
 pub fn top_term_strings_for_language(
-    pool:     &DbPool,
-    user_id:  &str,
+    pool: &DbPool,
+    user_id: &str,
     language: &str,
-    limit:    usize,
+    limit: usize,
 ) -> Vec<String> {
     let conn = match pool.get() {
         Ok(c) => c,
@@ -349,10 +349,12 @@ pub fn top_term_strings_for_language(
         Ok(s) => s,
         Err(_) => return vec![],
     };
-    stmt.query_map(params![user_id, language, limit as i64], |row| row.get::<_, String>(0))
-        .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
+    stmt.query_map(params![user_id, language, limit as i64], |row| {
+        row.get::<_, String>(0)
+    })
+    .ok()
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
 }
 
 /// Threshold: number of new examples before triggering a meaning regeneration.
@@ -365,18 +367,25 @@ pub const MEANING_REFRESH_THRESHOLD: i64 = 3;
 /// next refresh trigger fires after MEANING_REFRESH_THRESHOLD more examples.
 /// Called fire-and-forget after the LLM completes meaning generation.
 pub fn update_meaning(pool: &DbPool, user_id: &str, term: &str, meaning: &str) -> bool {
-    let Ok(conn) = pool.get() else { return false; };
+    let Ok(conn) = pool.get() else {
+        return false;
+    };
     let now = now_ms();
-    let n = conn.execute(
-        "UPDATE vocabulary
+    let n = conn
+        .execute(
+            "UPDATE vocabulary
             SET meaning = ?3,
                 meaning_updated_at = ?4,
                 examples_since_meaning = 0
           WHERE user_id = ?1 AND term = ?2",
-        params![user_id, term.trim(), meaning.trim(), now],
-    ).unwrap_or(0);
+            params![user_id, term.trim(), meaning.trim(), now],
+        )
+        .unwrap_or(0);
     if n > 0 {
-        info!("[vocab-meaning] updated for {term:?} ({} chars)", meaning.trim().len());
+        info!(
+            "[vocab-meaning] updated for {term:?} ({} chars)",
+            meaning.trim().len()
+        );
     }
     n > 0
 }
@@ -385,7 +394,9 @@ pub fn update_meaning(pool: &DbPool, user_id: &str, term: &str, meaning: &str) -
 /// path on every new observed example. Returns the new counter value so the
 /// caller can decide whether to trigger a meaning refresh.
 pub fn bump_examples_since_meaning(pool: &DbPool, user_id: &str, term: &str) -> i64 {
-    let Ok(conn) = pool.get() else { return 0; };
+    let Ok(conn) = pool.get() else {
+        return 0;
+    };
     let _ = conn.execute(
         "UPDATE vocabulary
             SET examples_since_meaning = examples_since_meaning + 1
@@ -397,7 +408,8 @@ pub fn bump_examples_since_meaning(pool: &DbPool, user_id: &str, term: &str) -> 
           WHERE user_id = ?1 AND term = ?2",
         params![user_id, term.trim()],
         |r| r.get::<_, i64>(0),
-    ).unwrap_or(0)
+    )
+    .unwrap_or(0)
 }
 
 /// Read the current stored meaning for a term, if any. Returns `None` when
@@ -424,17 +436,55 @@ pub fn get_meaning(pool: &DbPool, user_id: &str, term: &str) -> Option<String> {
 /// The caller spawns a Groq call only when this returns true, keeping the
 /// LLM-cost cadence under control.
 pub fn meaning_needs_refresh(pool: &DbPool, user_id: &str, term: &str) -> bool {
-    let Ok(conn) = pool.get() else { return false; };
+    let Ok(conn) = pool.get() else {
+        return false;
+    };
     conn.query_row(
         "SELECT meaning, examples_since_meaning FROM vocabulary
           WHERE user_id = ?1 AND term = ?2",
         params![user_id, term.trim()],
         |r| {
             let meaning: Option<String> = r.get(0)?;
-            let count:   i64            = r.get(1)?;
+            let count: i64 = r.get(1)?;
             Ok(meaning.is_none() || count >= MEANING_REFRESH_THRESHOLD)
         },
-    ).unwrap_or(false)
+    )
+    .unwrap_or(false)
+}
+
+/// Recompute missing `term_type` values for legacy rows that predate the
+/// structured-vocabulary prompt. Cheap local repair run at startup.
+pub fn backfill_missing_term_types(pool: &DbPool) -> usize {
+    let Ok(conn) = pool.get() else {
+        return 0;
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT user_id, term
+           FROM vocabulary
+          WHERE term_type IS NULL OR trim(term_type) = ''",
+    ) else {
+        return 0;
+    };
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .ok()
+        .map(|it| it.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+    drop(stmt);
+
+    let mut repaired = 0;
+    for (user_id, term) in rows {
+        let term_type = classify_term_type(&term);
+        repaired += conn
+            .execute(
+                "UPDATE vocabulary
+                SET term_type = ?3
+              WHERE user_id = ?1 AND term = ?2",
+                params![user_id, term, term_type],
+            )
+            .unwrap_or(0);
+    }
+    repaired
 }
 
 /// Total count of vocabulary entries for a user (UI badge).
@@ -447,7 +497,8 @@ pub fn count(pool: &DbPool, user_id: &str) -> i64 {
         "SELECT COUNT(*) FROM vocabulary WHERE user_id = ?1",
         params![user_id],
         |r| r.get(0),
-    ).unwrap_or(0)
+    )
+    .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -456,7 +507,7 @@ mod tests {
     use r2d2_sqlite::SqliteConnectionManager;
 
     fn mem_pool() -> DbPool {
-        let mgr  = SqliteConnectionManager::memory();
+        let mgr = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(mgr).unwrap();
         // Minimal schema needed by these tests.
         let conn = pool.get().unwrap();
@@ -477,8 +528,9 @@ mod tests {
                  meaning_updated_at      INTEGER,
                  examples_since_meaning  INTEGER NOT NULL DEFAULT 0,
                  UNIQUE(user_id, term)
-             );"
-        ).unwrap();
+             );",
+        )
+        .unwrap();
         pool
     }
 
@@ -518,7 +570,7 @@ mod tests {
         let pool = mem_pool();
         upsert(&pool, "u1", "noisy", 1.0, "auto");
         assert_eq!(count(&pool, "u1"), 1);
-        assert!(demote(&pool, "u1", "noisy", 1.5));   // weight goes negative
+        assert!(demote(&pool, "u1", "noisy", 1.5)); // weight goes negative
         assert_eq!(count(&pool, "u1"), 0);
     }
 
@@ -548,9 +600,18 @@ mod tests {
         upsert_for_language(&pool, "u1", "hinglish_term", 1.0, "auto", "hinglish");
 
         let english = top_term_strings_for_language(&pool, "u1", "english", 10);
-        assert!(english.contains(&"legacy_term".into()),    "legacy term must be returned");
-        assert!(english.contains(&"english_term".into()),   "english bucket must be returned");
-        assert!(!english.contains(&"hinglish_term".into()), "hinglish term must NOT leak into english");
+        assert!(
+            english.contains(&"legacy_term".into()),
+            "legacy term must be returned"
+        );
+        assert!(
+            english.contains(&"english_term".into()),
+            "english bucket must be returned"
+        );
+        assert!(
+            !english.contains(&"hinglish_term".into()),
+            "hinglish term must NOT leak into english"
+        );
 
         let hinglish = top_term_strings_for_language(&pool, "u1", "hinglish", 10);
         assert!(hinglish.contains(&"legacy_term".into()));
@@ -563,38 +624,38 @@ mod tests {
     #[test]
     fn classify_term_type_acronyms() {
         assert_eq!(classify_term_type("MACOBS"), "acronym");
-        assert_eq!(classify_term_type("NASA"),   "acronym");
-        assert_eq!(classify_term_type("IPO"),    "acronym");
-        assert_eq!(classify_term_type("FBI"),    "acronym");
-        assert_eq!(classify_term_type("EMIAC"),  "acronym");
+        assert_eq!(classify_term_type("NASA"), "acronym");
+        assert_eq!(classify_term_type("IPO"), "acronym");
+        assert_eq!(classify_term_type("FBI"), "acronym");
+        assert_eq!(classify_term_type("EMIAC"), "acronym");
     }
 
     #[test]
     fn classify_term_type_proper_nouns() {
-        assert_eq!(classify_term_type("Anish"),     "proper_noun");
+        assert_eq!(classify_term_type("Anish"), "proper_noun");
         assert_eq!(classify_term_type("Vipassana"), "proper_noun");
-        assert_eq!(classify_term_type("Cursor"),    "proper_noun");
-        assert_eq!(classify_term_type("Linear"),    "proper_noun");
+        assert_eq!(classify_term_type("Cursor"), "proper_noun");
+        assert_eq!(classify_term_type("Linear"), "proper_noun");
     }
 
     #[test]
     fn classify_term_type_brands_mixed_case() {
-        assert_eq!(classify_term_type("iPhone"),     "brand");
-        assert_eq!(classify_term_type("OpenAI"),     "brand");
+        assert_eq!(classify_term_type("iPhone"), "brand");
+        assert_eq!(classify_term_type("OpenAI"), "brand");
         assert_eq!(classify_term_type("ClaudeCode"), "brand");
     }
 
     #[test]
     fn classify_term_type_code_identifiers() {
-        assert_eq!(classify_term_type("n8n"),       "code_identifier");
-        assert_eq!(classify_term_type("k8s"),       "code_identifier");
-        assert_eq!(classify_term_type("snake_case"),"code_identifier");
-        assert_eq!(classify_term_type("kebab-case"),"code_identifier");
+        assert_eq!(classify_term_type("n8n"), "code_identifier");
+        assert_eq!(classify_term_type("k8s"), "code_identifier");
+        assert_eq!(classify_term_type("snake_case"), "code_identifier");
+        assert_eq!(classify_term_type("kebab-case"), "code_identifier");
     }
 
     #[test]
     fn classify_term_type_phrases() {
-        assert_eq!(classify_term_type("Cloud Code"),       "phrase");
+        assert_eq!(classify_term_type("Cloud Code"), "phrase");
         assert_eq!(classify_term_type("Hello World Inc."), "phrase");
     }
 
@@ -605,15 +666,15 @@ mod tests {
         // renders them without a type tag and the LLM treats them with extra
         // care. (In practice users shouldn't add these as vocab — but if they
         // do, we don't pretend they're jargon.)
-        assert_eq!(classify_term_type("hello"),  "other");
-        assert_eq!(classify_term_type("world"),  "other");
-        assert_eq!(classify_term_type("a"),      "other");  // too short for proper_noun
-        assert_eq!(classify_term_type("the"),    "other");  // sentence-case but only 3 chars
+        assert_eq!(classify_term_type("hello"), "other");
+        assert_eq!(classify_term_type("world"), "other");
+        assert_eq!(classify_term_type("a"), "other"); // too short for proper_noun
+        assert_eq!(classify_term_type("the"), "other"); // sentence-case but only 3 chars
     }
 
     #[test]
     fn classify_term_type_empty_safe() {
-        assert_eq!(classify_term_type(""),    "other");
+        assert_eq!(classify_term_type(""), "other");
         assert_eq!(classify_term_type("   "), "other");
     }
 
@@ -621,21 +682,28 @@ mod tests {
     fn upsert_writes_term_type_to_db() {
         let pool = mem_pool();
         upsert_for_language(&pool, "u1", "MACOBS", 1.0, "auto", "english");
-        upsert_for_language(&pool, "u1", "Anish",  1.0, "auto", "english");
-        upsert_for_language(&pool, "u1", "n8n",    1.0, "auto", "english");
+        upsert_for_language(&pool, "u1", "Anish", 1.0, "auto", "english");
+        upsert_for_language(&pool, "u1", "n8n", 1.0, "auto", "english");
         let terms = top_terms(&pool, "u1", 10);
-        let by_term: std::collections::HashMap<_, _> =
-            terms.iter().map(|t| (t.term.as_str(), t.term_type.as_deref())).collect();
+        let by_term: std::collections::HashMap<_, _> = terms
+            .iter()
+            .map(|t| (t.term.as_str(), t.term_type.as_deref()))
+            .collect();
         assert_eq!(by_term.get("MACOBS").and_then(|x| *x), Some("acronym"));
-        assert_eq!(by_term.get("Anish").and_then(|x| *x),  Some("proper_noun"));
-        assert_eq!(by_term.get("n8n").and_then(|x| *x),    Some("code_identifier"));
+        assert_eq!(by_term.get("Anish").and_then(|x| *x), Some("proper_noun"));
+        assert_eq!(by_term.get("n8n").and_then(|x| *x), Some("code_identifier"));
     }
 
     #[test]
     fn upsert_with_context_stores_example() {
         let pool = mem_pool();
         assert!(upsert_for_language_with_context(
-            &pool, "u1", "MACOBS", 1.0, "auto", "hinglish",
+            &pool,
+            "u1",
+            "MACOBS",
+            1.0,
+            "auto",
+            "hinglish",
             Some("MACOBS ka IPO ka 12 hazaar batana"),
         ));
         let terms = top_terms(&pool, "u1", 10);
@@ -654,12 +722,22 @@ mod tests {
         // may strip the term out of its meaningful surroundings.
         let pool = mem_pool();
         upsert_for_language_with_context(
-            &pool, "u1", "MACOBS", 1.0, "auto", "hinglish",
+            &pool,
+            "u1",
+            "MACOBS",
+            1.0,
+            "auto",
+            "hinglish",
             Some("MACOBS ka IPO ka 12 hazaar batana"),
         );
         upsert_for_language_with_context(
-            &pool, "u1", "MACOBS", 1.0, "auto", "hinglish",
-            Some("yes"),  // a stripped-down later example
+            &pool,
+            "u1",
+            "MACOBS",
+            1.0,
+            "auto",
+            "hinglish",
+            Some("yes"), // a stripped-down later example
         );
         let terms = top_terms(&pool, "u1", 10);
         assert_eq!(
@@ -673,8 +751,13 @@ mod tests {
     fn empty_context_treated_as_none() {
         let pool = mem_pool();
         upsert_for_language_with_context(
-            &pool, "u1", "n8n", 1.0, "auto", "english",
-            Some("   "),  // whitespace only
+            &pool,
+            "u1",
+            "n8n",
+            1.0,
+            "auto",
+            "english",
+            Some("   "), // whitespace only
         );
         assert!(top_terms(&pool, "u1", 10)[0].example_context.is_none());
     }
@@ -683,19 +766,24 @@ mod tests {
     fn long_context_is_capped() {
         let pool = mem_pool();
         let long = "x".repeat(500);
-        upsert_for_language_with_context(
-            &pool, "u1", "TERM", 1.0, "auto", "english", Some(&long),
-        );
-        let stored = top_terms(&pool, "u1", 10)[0].example_context.clone().unwrap();
+        upsert_for_language_with_context(&pool, "u1", "TERM", 1.0, "auto", "english", Some(&long));
+        let stored = top_terms(&pool, "u1", 10)[0]
+            .example_context
+            .clone()
+            .unwrap();
         // Capped at ~240 chars + ellipsis.
-        assert!(stored.chars().count() <= 241, "got {}", stored.chars().count());
+        assert!(
+            stored.chars().count() <= 241,
+            "got {}",
+            stored.chars().count()
+        );
         assert!(stored.ends_with('…'));
     }
 
     #[test]
     fn top_terms_orders_by_weight_desc() {
         let pool = mem_pool();
-        upsert(&pool, "u1", "low",  1.0, "auto");
+        upsert(&pool, "u1", "low", 1.0, "auto");
         upsert(&pool, "u1", "high", 1.0, "auto");
         upsert(&pool, "u1", "high", 1.0, "auto");
         let terms = top_term_strings(&pool, "u1", 10);
@@ -707,9 +795,16 @@ mod tests {
     fn meaning_round_trip_through_top_terms() {
         let pool = mem_pool();
         upsert(&pool, "u1", "MACOBS", 1.0, "auto");
-        assert!(get_meaning(&pool, "u1", "MACOBS").is_none(),
-                "meaning is None until generated");
-        assert!(update_meaning(&pool, "u1", "MACOBS", "An Indian SME stock acronym."));
+        assert!(
+            get_meaning(&pool, "u1", "MACOBS").is_none(),
+            "meaning is None until generated"
+        );
+        assert!(update_meaning(
+            &pool,
+            "u1",
+            "MACOBS",
+            "An Indian SME stock acronym."
+        ));
         assert_eq!(
             get_meaning(&pool, "u1", "MACOBS").as_deref(),
             Some("An Indian SME stock acronym.")
@@ -717,7 +812,10 @@ mod tests {
         // Round-trips through top_terms (the path the polish prompt uses).
         let terms = top_terms(&pool, "u1", 10);
         assert_eq!(terms.len(), 1);
-        assert_eq!(terms[0].meaning.as_deref(), Some("An Indian SME stock acronym."));
+        assert_eq!(
+            terms[0].meaning.as_deref(),
+            Some("An Indian SME stock acronym.")
+        );
     }
 
     #[test]
@@ -728,12 +826,16 @@ mod tests {
         bump_examples_since_meaning(&pool, "u1", "MACOBS");
         bump_examples_since_meaning(&pool, "u1", "MACOBS");
         bump_examples_since_meaning(&pool, "u1", "MACOBS");
-        assert!(meaning_needs_refresh(&pool, "u1", "MACOBS"),
-                "with no meaning + count above threshold, refresh is needed");
+        assert!(
+            meaning_needs_refresh(&pool, "u1", "MACOBS"),
+            "with no meaning + count above threshold, refresh is needed"
+        );
         // After persisting a meaning, counter resets and refresh quiets down.
         assert!(update_meaning(&pool, "u1", "MACOBS", "Meaning text"));
-        assert!(!meaning_needs_refresh(&pool, "u1", "MACOBS"),
-                "fresh meaning + reset counter ⇒ no refresh needed");
+        assert!(
+            !meaning_needs_refresh(&pool, "u1", "MACOBS"),
+            "fresh meaning + reset counter ⇒ no refresh needed"
+        );
     }
 
     #[test]
@@ -755,7 +857,9 @@ mod tests {
     fn meaning_needs_refresh_when_never_generated() {
         let pool = mem_pool();
         upsert(&pool, "u1", "FRESH", 1.0, "auto");
-        assert!(meaning_needs_refresh(&pool, "u1", "FRESH"),
-                "a brand-new term with no meaning always needs refresh");
+        assert!(
+            meaning_needs_refresh(&pool, "u1", "FRESH"),
+            "a brand-new term with no meaning always needs refresh"
+        );
     }
 }

@@ -42,19 +42,17 @@ const MIGRATION_018: &str = include_str!("migrations/018_vocab_meaning.sql");
 /// and return a connection pool.
 pub fn open(path: &PathBuf) -> DbPool {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .expect("failed to create database directory");
+        std::fs::create_dir_all(parent).expect("failed to create database directory");
     }
 
-    let manager = SqliteConnectionManager::file(path)
-        .with_init(|conn| {
-            // 5-second busy timeout so a stale WAL lock from a previous session
-            // doesn't block migration indefinitely.
-            conn.execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;"
-            )?;
-            Ok(())
-        });
+    let manager = SqliteConnectionManager::file(path).with_init(|conn| {
+        // 5-second busy timeout so a stale WAL lock from a previous session
+        // doesn't block migration indefinitely.
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+        )?;
+        Ok(())
+    });
 
     let pool = Pool::builder()
         .max_size(5)
@@ -65,6 +63,14 @@ pub fn open(path: &PathBuf) -> DbPool {
     run_migrations(&pool);
     purge_garbage_edits(&pool);
     corrections::backfill_from_edit_events(&pool);
+    let repaired_term_types = vocabulary::backfill_missing_term_types(&pool);
+    let rebuilt_fts_rows = vocab_fts::backfill_from_vocabulary(&pool);
+    if repaired_term_types > 0 || rebuilt_fts_rows > 0 {
+        info!(
+            "[vocab-repair] startup repaired term_types={} fts_rows={}",
+            repaired_term_types, rebuilt_fts_rows,
+        );
+    }
     pool
 }
 
@@ -157,7 +163,9 @@ fn run_migrations(pool: &DbPool) {
     }
 
     if version < 11 {
-        info!("running migration 011_embed_dims_256 — clearing 768-dim vectors for 256-dim rebuild");
+        info!(
+            "running migration 011_embed_dims_256 — clearing 768-dim vectors for 256-dim rebuild"
+        );
         conn.execute_batch(MIGRATION_011)
             .expect("migration 011 failed");
         conn.execute_batch("PRAGMA user_version = 11")
@@ -286,19 +294,24 @@ pub fn now_ms() -> i64 {
 fn purge_garbage_edits(pool: &DbPool) {
     let conn = match pool.get() {
         Ok(c) => c,
-        Err(e) => { warn!("[purge] pool error: {e}"); return; }
+        Err(e) => {
+            warn!("[purge] pool error: {e}");
+            return;
+        }
     };
 
     // Load all edit_events for inspection
     let rows: Vec<(String, String, String)> = {
-        let mut stmt = match conn.prepare(
-            "SELECT id, ai_output, user_kept FROM edit_events"
-        ) {
+        let mut stmt = match conn.prepare("SELECT id, ai_output, user_kept FROM edit_events") {
             Ok(s) => s,
             Err(_) => return,
         };
         stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })
         .ok()
         .map(|it| it.filter_map(|r| r.ok()).collect())
@@ -313,11 +326,10 @@ fn purge_garbage_edits(pool: &DbPool) {
                 "DELETE FROM preference_vectors WHERE edit_event_id = ?1",
                 params![id],
             );
-            if let Ok(n) = conn.execute(
-                "DELETE FROM edit_events WHERE id = ?1",
-                params![id],
-            ) {
-                if n > 0 { deleted += 1; }
+            if let Ok(n) = conn.execute("DELETE FROM edit_events WHERE id = ?1", params![id]) {
+                if n > 0 {
+                    deleted += 1;
+                }
             }
         }
     }
@@ -334,7 +346,9 @@ fn has_word_overlap(a: &str, b: &str) -> bool {
         .filter(|w| w.chars().count() > 3)
         .map(|w| w.to_lowercase())
         .collect();
-    if b_words.is_empty() { return !a.trim().is_empty(); }
+    if b_words.is_empty() {
+        return !a.trim().is_empty();
+    }
     a.split_whitespace()
         .any(|w| b_words.contains(&w.to_lowercase()))
 }

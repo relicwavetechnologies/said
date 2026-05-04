@@ -77,7 +77,11 @@ use crate::{
     embedder::gemini,
     llm::{
         gateway, gemini_direct, groq, openai_codex,
-        prompt::{build_system_prompt_with_vocab_entries, build_user_message, VocabEntry},
+        prompt::{
+            VocabEntry, build_system_prompt_with_vocab_entries, build_user_message,
+            resolved_vocab_terms_to_entries, vocab_terms_to_entries,
+        },
+        vocab_resolver,
     },
     store::{
         history::{InsertRecording, insert_recording},
@@ -87,6 +91,20 @@ use crate::{
     },
     stt::deepgram,
 };
+
+fn invalidate_openai_session_on_auth_error(
+    pool: &crate::store::DbPool,
+    user_id: &str,
+    llm_provider: &str,
+    err: &str,
+) -> bool {
+    if llm_provider != "openai_codex" || !openai_codex::is_auth_error(err) {
+        return false;
+    }
+    openai_oauth::delete_token(pool, user_id);
+    warn!("[voice] invalidated stored OpenAI OAuth token after auth failure");
+    true
+}
 
 pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> impl IntoResponse {
     // ── Extract multipart fields ───────────────────────────────────────────────
@@ -224,15 +242,26 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
             }
         };
 
-        let (stt_transcript, enriched_transcript) = if stt_replacement_rules.is_empty() {
-            (stt_transcript_raw, enriched_raw)
+        let (stt_transcript, _enriched_transcript, alias_result) = if stt_replacement_rules.is_empty() {
+            let text = stt_transcript_raw.clone();
+            let enriched = enriched_raw.clone();
+            (
+                text.clone(),
+                enriched,
+                stt_replacements::ApplyResult {
+                    text,
+                    matches: vec![],
+                },
+            )
         } else {
-            let plain_rewritten = stt_replacements::apply(&stt_transcript_raw, &stt_replacement_rules);
+            let alias_result =
+                stt_replacements::apply_with_matches(&stt_transcript_raw, &stt_replacement_rules);
+            let plain_rewritten = alias_result.text.clone();
             let enriched_rewritten = stt_replacements::apply(&enriched_raw, &stt_replacement_rules);
             if plain_rewritten != stt_transcript_raw {
                 info!("[voice] lexicon replacement: {:?} → {:?}", stt_transcript_raw, plain_rewritten);
             }
-            (plain_rewritten, enriched_rewritten)
+            (plain_rewritten, enriched_rewritten, alias_result)
         };
 
         let status_payload = json!({"phase": "polishing", "transcript": &stt_transcript}).to_string();
@@ -253,8 +282,7 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
         let embed_ms = embed_t0.elapsed().as_millis() as i64;
         info!("[timing] embed={}ms ({})", embed_ms, if embedding.is_some() { "ok" } else { "skip/no-key" });
 
-        let model        = voice_polish_core::resolve_model(&prefs.selected_model).to_string();
-        let user_message = build_user_message(&enriched_transcript, &prefs.output_language);
+        let model = voice_polish_core::resolve_model(&prefs.selected_model).to_string();
 
         // ── STEP 3: RAG retrieval — k-NN over preference_vectors ──────────────────
         let rag_examples = match &embedding {
@@ -277,27 +305,15 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
         // what the user actually said. Skip flooding the prompt with all 200
         // vocab rows — pick starred + top-weight + top-relevance (deduped,
         // capped at 25). Falls back to starred + top-weight when no embedding.
-        let vocab_entries: Vec<VocabEntry> = {
+        let (resolved_transcript, vocab_entries): (String, Vec<VocabEntry>) = {
             let pool_v   = pool.clone();
             let uid_v    = user_id.clone();
             let lang_v   = prefs.output_language.clone();
             let emb_v    = embedding.clone();
-            const N_TOP_WEIGHT: usize = 8;
-            const K_RELEVANT:   usize = 12;
-            const MAX_TOTAL:    usize = 25;
-            const MIN_SIM:      f32   = 0.55;
-            let txt_v = stt_transcript.clone();
+            let txt_v = alias_result.text.clone();
             let chosen = tokio::task::spawn_blocking(move || {
-                // Hybrid selector: dense (cosine on time-decayed centroids)
-                // ⊕ sparse (BM25 on term + example_context) fused via RRF.
-                // Dense alone misses exact-match jargon (acronyms, IDs);
-                // BM25 alone misses semantic neighbours. Together they
-                // catch ~15-30% more relevant entries (Weaviate / OpenSearch
-                // hybrid-search docs).
-                vocab_embeddings::select_for_polish_hybrid(
-                    &pool_v, &uid_v, &lang_v,
-                    emb_v.as_deref(), Some(&txt_v),
-                    N_TOP_WEIGHT, K_RELEVANT, MAX_TOTAL, MIN_SIM,
+                vocab_embeddings::select_for_prompt(
+                    &pool_v, &uid_v, &lang_v, emb_v.as_deref(), Some(&txt_v),
                 )
             }).await.unwrap_or_default();
             if chosen.is_empty() {
@@ -309,25 +325,38 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
                     "[voice] vocab selector picked 0/{} entries — no transcript evidence",
                     vocab_full.len(),
                 );
-                vec![]
+                (alias_result.text.clone(), vec![])
             } else {
-                info!("[voice] vocab selector picked {}/{} entries (relevance-aware)",
-                      chosen.len(), vocab_full.len());
-                chosen.into_iter().map(|v| VocabEntry {
-                    term:      v.term,
-                    context:   v.example_context,
-                    term_type: v.term_type,
-                    meaning:   v.meaning,
-                }).collect()
+                let resolve_t0 = Instant::now();
+                let resolved = vocab_resolver::resolve_for_prompt(
+                    &alias_result.text,
+                    &chosen,
+                    &vocab_full,
+                    &alias_result,
+                );
+                let resolve_ms = resolve_t0.elapsed().as_millis() as i64;
+                info!(
+                    "[voice] vocab resolver={}ms alias_matches={} context_matches={} resolved={} candidates={}",
+                    resolve_ms,
+                    resolved.alias_match_count,
+                    resolved.context_match_count,
+                    resolved.resolved_terms.len(),
+                    resolved.candidate_terms.len(),
+                );
+                let mut entries = resolved_vocab_terms_to_entries(resolved.resolved_terms);
+                entries.extend(vocab_terms_to_entries(resolved.candidate_terms));
+                (resolved.transcript, entries)
             }
         };
+        let user_message = build_user_message(&resolved_transcript, &prefs.output_language);
 
         let system_prompt = build_system_prompt_with_vocab_entries(
             &prefs, &rag_examples, &word_corrections, &vocab_entries,
         );
 
         // ── STEP 5: LLM stream ────────────────────────────────────────────────────
-        let llm_provider  = prefs.llm_provider.clone();
+        let llm_provider = prefs.llm_provider.clone();
+        let llm_provider_for_task = llm_provider.clone();
         let (token_tx, mut token_rx) = mpsc::channel::<String>(64);
         let sys_p       = system_prompt.clone();
         let usr_m       = user_message.clone();
@@ -357,7 +386,7 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
         info!("[timing] LLM start — provider={llm_provider:?} model={model_for_llm:?}");
 
         let llm_task = tokio::spawn(async move {
-            if llm_provider == "openai_codex" {
+            if llm_provider_for_task == "openai_codex" {
                 let access_token = openai_token_opt.as_deref().unwrap_or("");
                 if access_token.is_empty() {
                     return Err("OpenAI not connected — go to Settings to connect your account".to_string());
@@ -365,11 +394,11 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
                 openai_codex::stream_polish(
                     &client_c, access_token, &model_for_llm, &sys_p, &usr_m, token_tx,
                 ).await
-            } else if llm_provider == "gemini_direct" {
+            } else if llm_provider_for_task == "gemini_direct" {
                 gemini_direct::stream_polish(
                     &client_c, &gk_gemini, &model_for_llm, &sys_p, &usr_m, token_tx,
                 ).await
-            } else if llm_provider == "groq" {
+            } else if llm_provider_for_task == "groq" {
                 groq::stream_polish(
                     &client_c, &gk_groq, &model_for_llm, &sys_p, &usr_m, token_tx,
                 ).await
@@ -387,9 +416,14 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
         let mut llm_result = match llm_task.await {
             Ok(Ok(r))   => r,
             Ok(Err(e))  => {
+                let message = if invalidate_openai_session_on_auth_error(&pool, &user_id, &llm_provider, &e) {
+                    "OpenAI not connected — go to Settings to connect your account".to_string()
+                } else {
+                    e.clone()
+                };
                 warn!("[voice] LLM error: {e}");
                 yield Ok(Event::default().event("error").data(
-                    json!({"message": e, "audio_id": aid}).to_string()
+                    json!({"message": message, "audio_id": aid}).to_string()
                 ));
                 return;
             }
@@ -429,7 +463,7 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
             let pool2   = pool.clone();
             let id2     = recording_id.clone();
             let uid2    = user_id.clone();
-            let t2      = stt_transcript.clone();
+            let t2      = resolved_transcript.clone();
             let p2      = llm_result.polished.clone();
             let ta2     = target_app.clone();
             let model2  = model.clone();
@@ -576,8 +610,8 @@ fn parse_confidence_marker(inner: &str) -> Option<String> {
     }
     // Word part = everything before the percentage, with any '?' and
     // surrounding whitespace stripped.
-    let word_part = without_pct[..split_at]
-        .trim_end_matches(|c: char| c == '?' || c.is_whitespace());
+    let word_part =
+        without_pct[..split_at].trim_end_matches(|c: char| c == '?' || c.is_whitespace());
     if word_part.is_empty() {
         return None;
     }
@@ -591,14 +625,23 @@ mod scrub_tests {
     #[test]
     fn canonical_form_strips_cleanly() {
         // Form we emit ourselves from STT.
-        assert_eq!(strip_confidence_markers("aaj [kaam?60%] tha"), "aaj kaam tha");
-        assert_eq!(strip_confidence_markers("[main?47%] meeting"), "main meeting");
+        assert_eq!(
+            strip_confidence_markers("aaj [kaam?60%] tha"),
+            "aaj kaam tha"
+        );
+        assert_eq!(
+            strip_confidence_markers("[main?47%] meeting"),
+            "main meeting"
+        );
     }
 
     #[test]
     fn malformed_llm_leaks_get_scrubbed() {
         // The actual user-reported failure: [main60%] with NO question mark.
-        assert_eq!(strip_confidence_markers("hello [main60%] there"), "hello main there");
+        assert_eq!(
+            strip_confidence_markers("hello [main60%] there"),
+            "hello main there"
+        );
         // Space instead of '?'
         assert_eq!(strip_confidence_markers("[main 60%] hai"), "main hai");
         // Both space and '?'
@@ -615,20 +658,25 @@ mod scrub_tests {
     #[test]
     fn non_marker_brackets_preserved() {
         // Plain footnote-style — must NOT be scrubbed.
-        assert_eq!(strip_confidence_markers("see [1] for context"), "see [1] for context");
-        assert_eq!(strip_confidence_markers("[note]"),               "[note]");
+        assert_eq!(
+            strip_confidence_markers("see [1] for context"),
+            "see [1] for context"
+        );
+        assert_eq!(strip_confidence_markers("[note]"), "[note]");
         // Bracketed text with no trailing percentage stays.
-        assert_eq!(strip_confidence_markers("[hello world]"),        "[hello world]");
+        assert_eq!(strip_confidence_markers("[hello world]"), "[hello world]");
         // Just a percentage with no word part — keep brackets, not a marker.
-        assert_eq!(strip_confidence_markers("[60%]"),                "[60%]");
-        assert_eq!(strip_confidence_markers("[%60]"),                "[%60]");
+        assert_eq!(strip_confidence_markers("[60%]"), "[60%]");
+        assert_eq!(strip_confidence_markers("[%60]"), "[%60]");
     }
 
     #[test]
     fn unclosed_bracket_doesnt_eat_rest_of_string() {
         // If the bracket never closes, emit it as-is — don't gobble the tail.
-        assert_eq!(strip_confidence_markers("hello [main60% rest"),
-                   "hello [main60% rest");
+        assert_eq!(
+            strip_confidence_markers("hello [main60% rest"),
+            "hello [main60% rest"
+        );
     }
 
     #[test]

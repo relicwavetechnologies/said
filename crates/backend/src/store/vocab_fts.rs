@@ -22,9 +22,13 @@ use super::DbPool;
 /// call after every `vocabulary::upsert`. Replaces any prior FTS row for
 /// the same (user_id, term) so example_context updates are reflected.
 pub fn upsert(pool: &DbPool, user_id: &str, term: &str, example_context: Option<&str>) {
-    let Ok(conn) = pool.get() else { return; };
+    let Ok(conn) = pool.get() else {
+        return;
+    };
     let term_trim = term.trim();
-    if term_trim.is_empty() { return; }
+    if term_trim.is_empty() {
+        return;
+    }
     let ctx = example_context.unwrap_or("").trim();
 
     // FTS5 contentless tables don't support ON CONFLICT; do delete + insert.
@@ -43,7 +47,9 @@ pub fn upsert(pool: &DbPool, user_id: &str, term: &str, example_context: Option<
 
 /// Delete the FTS row when a vocab term is removed. Cascade-safe.
 pub fn delete(pool: &DbPool, user_id: &str, term: &str) {
-    let Ok(conn) = pool.get() else { return; };
+    let Ok(conn) = pool.get() else {
+        return;
+    };
     let _ = conn.execute(
         "DELETE FROM vocab_fts WHERE user_id = ?1 AND term = ?2",
         params![user_id, term.trim()],
@@ -57,9 +63,13 @@ pub fn delete(pool: &DbPool, user_id: &str, term: &str) {
 /// `query` is treated as a free-text search — caller should not pre-quote
 /// or pre-escape (we do safe quoting here). Empty queries return empty.
 pub fn search(pool: &DbPool, user_id: &str, query: &str, k: usize) -> Vec<String> {
-    let Ok(conn) = pool.get() else { return vec![]; };
+    let Ok(conn) = pool.get() else {
+        return vec![];
+    };
     let q = query.trim();
-    if q.is_empty() { return vec![]; }
+    if q.is_empty() {
+        return vec![];
+    }
     // FTS5 MATCH needs a token-style query. We escape by wrapping in double
     // quotes (FTS5 phrase syntax) and stripping any inner double-quotes —
     // this turns the entire query into one phrase, which is correct for
@@ -75,21 +85,51 @@ pub fn search(pool: &DbPool, user_id: &str, query: &str, k: usize) -> Vec<String
         .map(|s| s.replace('"', ""))
         .map(|s| format!("\"{s}\""))
         .collect();
-    if tokens.is_empty() { return vec![]; }
+    if tokens.is_empty() {
+        return vec![];
+    }
     let match_clause = tokens.join(" OR ");
 
     let sql = "SELECT term FROM vocab_fts
                 WHERE user_id = ?1 AND vocab_fts MATCH ?2
                 ORDER BY bm25(vocab_fts)
                 LIMIT ?3";
-    let Ok(mut stmt) = conn.prepare(sql) else { return vec![]; };
-    stmt.query_map(
-        params![user_id, match_clause, k as i64],
-        |row| row.get::<_, String>(0),
-    )
+    let Ok(mut stmt) = conn.prepare(sql) else {
+        return vec![];
+    };
+    stmt.query_map(params![user_id, match_clause, k as i64], |row| {
+        row.get::<_, String>(0)
+    })
     .ok()
     .map(|iter| iter.filter_map(|r| r.ok()).collect())
     .unwrap_or_default()
+}
+
+/// Rebuild FTS rows from the current vocabulary table. Safe to call at
+/// startup: we delete+insert each term row so older users gain BM25 support
+/// even if their vocabulary predates the FTS migration or missed a write.
+pub fn backfill_from_vocabulary(pool: &DbPool) -> usize {
+    let Ok(conn) = pool.get() else {
+        return 0;
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT user_id, term, COALESCE(example_context, '')
+           FROM vocabulary",
+    ) else {
+        return 0;
+    };
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .ok()
+        .map(|it| it.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+    drop(stmt);
+    drop(conn);
+
+    for (user_id, term, context) in &rows {
+        upsert(pool, user_id, term, Some(context.as_str()));
+    }
+    rows.len()
 }
 
 /// Reciprocal Rank Fusion — combine multiple ranked lists into one score
@@ -108,7 +148,7 @@ pub fn rrf_fuse(rankings: &[&[String]], k: f32) -> Vec<String> {
     let mut score: HashMap<&String, f32> = HashMap::new();
     for list in rankings {
         for (rank, item) in list.iter().enumerate() {
-            let r = (rank + 1) as f32;        // 1-indexed
+            let r = (rank + 1) as f32; // 1-indexed
             *score.entry(item).or_insert(0.0) += 1.0 / (k + r);
         }
     }
@@ -123,23 +163,31 @@ mod tests {
     use r2d2_sqlite::SqliteConnectionManager;
 
     fn mem_pool() -> DbPool {
-        let mgr  = SqliteConnectionManager::memory();
+        let mgr = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(mgr).unwrap();
-        pool.get().unwrap().execute_batch(
-            "CREATE TABLE local_user (id TEXT PRIMARY KEY);
+        pool.get()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE local_user (id TEXT PRIMARY KEY);
              INSERT INTO local_user(id) VALUES ('u1');
              CREATE VIRTUAL TABLE vocab_fts USING fts5(
                  user_id UNINDEXED, term, example_context,
                  tokenize = 'unicode61 remove_diacritics 2'
-             );"
-        ).unwrap();
+             );",
+            )
+            .unwrap();
         pool
     }
 
     #[test]
     fn upsert_and_exact_term_search() {
         let pool = mem_pool();
-        upsert(&pool, "u1", "MACOBS", Some("MACOBS ka IPO ka 12 hazaar batana"));
+        upsert(
+            &pool,
+            "u1",
+            "MACOBS",
+            Some("MACOBS ka IPO ka 12 hazaar batana"),
+        );
         let hits = search(&pool, "u1", "MACOBS update", 5);
         assert!(hits.contains(&"MACOBS".to_string()));
     }
@@ -150,8 +198,10 @@ mod tests {
         upsert(&pool, "u1", "MACOBS", Some("MACOBS ka IPO ka 12 hazaar"));
         // Query mentions IPO (in the example context, not the term).
         let hits = search(&pool, "u1", "what is the IPO date?", 5);
-        assert!(hits.contains(&"MACOBS".to_string()),
-                "BM25 should find MACOBS via example_context match");
+        assert!(
+            hits.contains(&"MACOBS".to_string()),
+            "BM25 should find MACOBS via example_context match"
+        );
     }
 
     #[test]
@@ -160,11 +210,17 @@ mod tests {
         upsert(&pool, "u1", "FROM_U1", Some("u1's secret"));
         upsert(&pool, "u2", "FROM_U2", Some("u2's secret"));
         // Need to add u2 to local_user — extend the in-memory schema.
-        let _ = pool.get().unwrap().execute("INSERT INTO local_user VALUES ('u2')", []);
+        let _ = pool
+            .get()
+            .unwrap()
+            .execute("INSERT INTO local_user VALUES ('u2')", []);
         let u1_hits = search(&pool, "u1", "secret", 5);
         let u2_hits = search(&pool, "u2", "secret", 5);
         assert!(u1_hits.contains(&"FROM_U1".to_string()));
-        assert!(!u1_hits.contains(&"FROM_U2".to_string()), "no cross-user leak");
+        assert!(
+            !u1_hits.contains(&"FROM_U2".to_string()),
+            "no cross-user leak"
+        );
         assert!(u2_hits.contains(&"FROM_U2".to_string()));
     }
 
@@ -200,7 +256,7 @@ mod tests {
 
     #[test]
     fn rrf_fuse_combines_two_lists() {
-        let dense:  Vec<String> = vec!["A".into(), "B".into(), "C".into()];
+        let dense: Vec<String> = vec!["A".into(), "B".into(), "C".into()];
         let sparse: Vec<String> = vec!["B".into(), "D".into(), "A".into()];
         let fused = rrf_fuse(&[&dense, &sparse], 60.0);
         // B appears at rank 2 + 1 = best combined → top

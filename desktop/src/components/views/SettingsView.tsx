@@ -300,6 +300,7 @@ export function SettingsView({
         const s = await getOpenAIStatus();
         if (s?.connected) {
           setOpenAIStatus(s);
+          setPrefs((prev) => prev ? { ...prev, llm_provider: "openai_codex" } : prev);
           setOpenAIBusy(false);
           clearInterval(poll);
         } else if (attempts > 150) {
@@ -319,6 +320,7 @@ export function SettingsView({
     try {
       await disconnectOpenAI();
       setOpenAIStatus((prev) => prev ? { ...prev, connected: false } : null);
+      setPrefs((prev) => prev ? { ...prev, llm_provider: "gateway" } : prev);
     } catch (err) {
       setOpenAIError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -954,7 +956,9 @@ export function SettingsView({
               needsKey: !openAIStatus?.connected,
             },
           ] as const).map((opt, idx, arr) => {
-            const isActive = prefs?.llm_provider === opt.id;
+            const isOpenAIDisconnected = opt.id === "openai_codex" && !openAIStatus?.connected;
+            const isActive = prefs?.llm_provider === opt.id && !isOpenAIDisconnected;
+            const showReconnect = opt.id === "openai_codex" && isOpenAIDisconnected;
             return (
               <Row
                 key={opt.id}
@@ -974,7 +978,13 @@ export function SettingsView({
                       <span className="badge-model">{opt.badge}</span>
                     )}
                     <button
-                      onClick={() => patch({ llm_provider: opt.id })}
+                      onClick={() => {
+                        if (showReconnect) {
+                          void handleOpenAIConnect();
+                          return;
+                        }
+                        void patch({ llm_provider: opt.id });
+                      }}
                       className={`px-3 py-1 rounded-md text-[11px] font-medium transition-all border ${
                         isActive
                           ? "border-transparent text-background"
@@ -982,7 +992,7 @@ export function SettingsView({
                       }`}
                       style={isActive ? { background: "hsl(var(--muted-foreground))" } : {}}
                     >
-                      {isActive ? "✓ Active" : "Use"}
+                      {showReconnect ? "Reconnect" : isActive ? "✓ Active" : "Use"}
                     </button>
                   </div>
                 }

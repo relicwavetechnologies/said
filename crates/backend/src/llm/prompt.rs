@@ -13,7 +13,7 @@
 //! <transcript> {transcript} </transcript>
 //! ```
 
-use crate::store::{corrections::Correction, prefs::Preferences};
+use crate::store::{corrections::Correction, prefs::Preferences, vocabulary::VocabTerm};
 
 /// Render a single vocab entry for the polish prompt. Output shape:
 ///   `  MACOBS [acronym]`
@@ -33,13 +33,13 @@ use crate::store::{corrections::Correction, prefs::Preferences};
 /// degrade gracefully (just the term, just the type, etc.).
 fn format_vocab_entry(e: &VocabEntry) -> String {
     let type_label: String = match e.term_type.as_deref() {
-        Some("acronym")          => " [acronym]".into(),
-        Some("proper_noun")      => " [proper noun]".into(),
-        Some("brand")            => " [brand]".into(),
-        Some("code_identifier")  => " [code identifier]".into(),
-        Some("phrase")           => " [phrase]".into(),
-        Some("other") | None     => String::new(), // no signal — render bare
-        Some(other)              => format!(" [{other}]"),
+        Some("acronym") => " [acronym]".into(),
+        Some("proper_noun") => " [proper noun]".into(),
+        Some("brand") => " [brand]".into(),
+        Some("code_identifier") => " [code identifier]".into(),
+        Some("phrase") => " [phrase]".into(),
+        Some("other") | None => String::new(), // no signal — render bare
+        Some(other) => format!(" [{other}]"),
     };
     let mut out = format!("  {}{type_label}", e.term);
     if let Some(m) = &e.meaning {
@@ -62,6 +62,12 @@ pub struct RagExample {
     pub user_kept: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VocabResolution {
+    Candidate,
+    Resolved,
+}
+
 /// One vocabulary entry as fed to the polish prompt. Carries the canonical
 /// term and (optionally) an example sentence the term was first observed
 /// in. The example is what enables context-aware recognition of unseen STT
@@ -71,8 +77,9 @@ pub struct RagExample {
 /// the literal "main course" isn't a stored alias.
 #[derive(Clone)]
 pub struct VocabEntry {
-    pub term:      String,
-    pub context:   Option<String>,
+    pub term: String,
+    pub context: Option<String>,
+    pub resolution: VocabResolution,
     /// Lexical-shape classification ("acronym" / "proper_noun" / "brand" /
     /// "code_identifier" / "phrase" / "other"). Used by the polish prompt
     /// to render structured, type-aware entries so the LLM can reason from
@@ -86,18 +93,45 @@ pub struct VocabEntry {
     /// term's meaning?) instead of inferring from a single example. None
     /// when meaning hasn't been generated yet — entry still renders, just
     /// without the meaning line.
-    pub meaning:   Option<String>,
+    pub meaning: Option<String>,
 }
 
 impl VocabEntry {
     pub fn from_term(term: impl Into<String>) -> Self {
         Self {
-            term:      term.into(),
-            context:   None,
+            term: term.into(),
+            context: None,
+            resolution: VocabResolution::Candidate,
             term_type: None,
-            meaning:   None,
+            meaning: None,
         }
     }
+}
+
+pub fn vocab_terms_to_entries(terms: Vec<VocabTerm>) -> Vec<VocabEntry> {
+    terms
+        .into_iter()
+        .map(|v| VocabEntry {
+            term: v.term,
+            context: v.example_context,
+            resolution: VocabResolution::Candidate,
+            term_type: v.term_type,
+            meaning: v.meaning,
+        })
+        .collect()
+}
+
+pub fn resolved_vocab_terms_to_entries(terms: Vec<VocabTerm>) -> Vec<VocabEntry> {
+    terms
+        .into_iter()
+        .map(|v| VocabEntry {
+            term: v.term,
+            context: v.example_context,
+            resolution: VocabResolution::Resolved,
+            term_type: v.term_type,
+            meaning: v.meaning,
+        })
+        .collect()
 }
 
 /// Build the full system-prompt string.
@@ -148,9 +182,9 @@ pub fn build_system_prompt_with_vocab_entries(
     corrections: &[Correction],
     vocabulary_entries: &[VocabEntry],
 ) -> String {
-    let lang_rule    = language_rule(&prefs.output_language);
-    let persona      = persona_block(prefs);
-    let tone         = tone_description(&prefs.tone_preset);
+    let lang_rule = language_rule(&prefs.output_language);
+    let persona = persona_block(prefs);
+    let tone = tone_description(&prefs.tone_preset);
     let script_check = script_final_check(&prefs.output_language);
 
     // Vocabulary block — compact form. Each entry shows canonical + type tag +
@@ -167,21 +201,41 @@ pub fn build_system_prompt_with_vocab_entries(
     let vocab_block = if vocabulary_entries.is_empty() {
         String::new()
     } else {
-        let table = vocabulary_entries
+        let resolved = vocabulary_entries
             .iter()
+            .filter(|e| e.resolution == VocabResolution::Resolved)
             .map(format_vocab_entry)
             .collect::<Vec<_>>()
             .join("\n");
+        let candidates = vocabulary_entries
+            .iter()
+            .filter(|e| e.resolution == VocabResolution::Candidate)
+            .map(format_vocab_entry)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let resolved_block = if resolved.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Confirmed terms already resolved by deterministic matching. Keep them exactly as written and do not rewrite away from them.\n\
+                 {resolved}\n\n"
+            )
+        };
+        let candidate_block = if candidates.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Candidate terms below are NOT resolved yet. Consider a candidate's canonical spelling only when the phrase is phonetically close and the type + `means:` + `example:` signals all agree. An acronym entry should still look acronym-like; a proper noun entry should still sound name-like.\n\
+                 {candidates}\n"
+            )
+        };
         format!(
             "<personal_vocabulary>\n\
              User's personal terms. Each entry has a type tag, an optional \
              `means:` line (what the term refers to), and an optional `example:` \
-             line. Replace a transcript phrase with the canonical spelling ONLY \
-             when ALL THREE align: type fits (an acronym entry is incompatible \
-             with a single common word), the surrounding transcript topic matches \
-             the `means:` description, and the phrase is verbatim or phonetically \
-             close. When any layer disagrees, leave the transcript unchanged.\n\n\
-             {table}\n\
+             line. `means:` is a confirmation layer, never a rescue layer.\n\n\
+             {resolved_block}\
+             {candidate_block}\
              </personal_vocabulary>\n\n"
         )
     };
@@ -254,8 +308,9 @@ pub fn build_system_prompt_with_vocab_entries(
          \"slash\" → / · \"hash\"/\"hashtag\" → # · \"colon slash slash\" → ://\n\
          Don't convert in plain prose (\"growing at the rate of 10%\" stays as-is).\n\n\
          RULES:\n\
-         1. Vocabulary terms in <personal_vocabulary> (if present) must be kept verbatim. \
-         Prefer them when a transcript token is phonetically close.\n\
+         1. Vocabulary terms in <personal_vocabulary> (if present) are precision hints. \
+         Preserve confirmed terms exactly. For unresolved candidates, replace another transcript \
+         token only when it is phonetically close and the type + meaning + example checks also agree.\n\
          2. Preserve every content word. Remove ONLY fillers (um, uh, hmm, like, you know, \
          basically, matlab, toh, yaani, bas) and stuttered repetitions (\"the the cat\" → \"the cat\"). \
          Do NOT drop names, numbers, dates, jargon, adjectives, adverbs.\n\
@@ -309,9 +364,11 @@ pub fn build_user_message(transcript: &str, output_language: &str) -> String {
         "hindi" => "Output in Devanagari script only.\n",
         "english" => "Output in English only — no Devanagari, no Roman Hindi.\n",
         // hinglish / default
-        _ => "Output in Roman script (no Devanagari) AND preserve Hindi words as Hindi — \
+        _ => {
+            "Output in Roman script (no Devanagari) AND preserve Hindi words as Hindi — \
               never translate them to English. \"kaam\" stays \"kaam\", not \"work\". \
-              \"bahut\" stays \"bahut\", not \"a lot\".\n",
+              \"bahut\" stays \"bahut\", not \"a lot\".\n"
+        }
     };
     format!("{reminder}<transcript>\n{transcript}\n</transcript>")
 }
@@ -320,19 +377,21 @@ pub fn build_user_message(transcript: &str, output_language: &str) -> String {
 /// `<task>` block — closest context before the model starts writing.
 fn script_final_check(output_language: &str) -> &'static str {
     match output_language {
-        "hindi"   => "Your entire output must be Devanagari. No Roman script.\n",
+        "hindi" => "Your entire output must be Devanagari. No Roman script.\n",
         "english" => "Your entire output must be English. No Devanagari, no Roman Hindi.\n",
         // hinglish / default — two failure modes the LLM tends toward:
         //   (a) starting the output in Devanagari (script slip)
         //   (b) translating Hindi words to English (silent over-helpfulness)
         // The check below catches BOTH before the first character is emitted.
-        _ => "Two checks before writing your first character:\n\
+        _ => {
+            "Two checks before writing your first character:\n\
               1. SCRIPT — Roman letters only. ZERO Devanagari (देख → \"Dekh\", भाई → \"bhai\"). \
               Check the very first character.\n\
               2. LANGUAGE — Did the input contain Hindi words? Then your output MUST contain those \
               same Hindi words in Roman script. \"kaam\" stays \"kaam\" — never \"work\". \"bahut\" \
               stays \"bahut\" — never \"a lot\". \"thak gaya\" stays \"thak gaya\" — never \"tired\". \
-              If your draft output is pure English with the Hindi gone, you have FAILED — rewrite it preserving the Hindi.\n",
+              If your draft output is pure English with the Hindi gone, you have FAILED — rewrite it preserving the Hindi.\n"
+        }
     }
 }
 
@@ -394,11 +453,11 @@ fn persona_block(prefs: &Preferences) -> String {
 fn tone_description(tone_preset: &str) -> String {
     match tone_preset {
         "professional" => "Tone: formal and professional. Suitable for work emails and reports.",
-        "casual"       => "Tone: friendly and conversational. Light and easy to read.",
-        "assertive"    => "Tone: direct and confident. Clear calls-to-action.",
-        "concise"      => "Tone: minimal words. Remove every unnecessary word.",
-        "neutral"      => "Tone: neutral and clear. No strong stylistic lean.",
-        _              => "Tone: neutral and clear.",
+        "casual" => "Tone: friendly and conversational. Light and easy to read.",
+        "assertive" => "Tone: direct and confident. Clear calls-to-action.",
+        "concise" => "Tone: minimal words. Remove every unnecessary word.",
+        "neutral" => "Tone: neutral and clear. No strong stylistic lean.",
+        _ => "Tone: neutral and clear.",
     }
     .to_string()
 }
@@ -410,54 +469,66 @@ mod tests {
 
     fn prefs() -> Preferences {
         Preferences {
-            user_id:           "u1".into(),
-            selected_model:    "smart".into(),
-            tone_preset:       "neutral".into(),
-            custom_prompt:     None,
-            language:          "auto".into(),
-            output_language:   "english".into(),
-            auto_paste:        true,
-            edit_capture:      true,
-            polish_text_hotkey:"cmd+shift+p".into(),
-            deepgram_api_key:  None,
-            gemini_api_key:    None,
-            gateway_api_key:   None,
-            groq_api_key:      None,
-            llm_provider:      "gateway".into(),
-            updated_at:        0,
+            user_id: "u1".into(),
+            selected_model: "smart".into(),
+            tone_preset: "neutral".into(),
+            custom_prompt: None,
+            language: "auto".into(),
+            output_language: "english".into(),
+            auto_paste: true,
+            edit_capture: true,
+            polish_text_hotkey: "cmd+shift+p".into(),
+            deepgram_api_key: None,
+            gemini_api_key: None,
+            gateway_api_key: None,
+            groq_api_key: None,
+            llm_provider: "gateway".into(),
+            updated_at: 0,
         }
     }
 
     #[test]
     fn vocab_block_appears_when_terms_present() {
         let p = prefs();
-        let prompt = build_system_prompt_with_vocab(
-            &p, &[], &[], &["n8n".into(), "Vipassana".into()],
+        let prompt =
+            build_system_prompt_with_vocab(&p, &[], &[], &["n8n".into(), "Vipassana".into()]);
+        assert!(
+            prompt.contains("<personal_vocabulary>"),
+            "vocab block should be emitted"
         );
-        assert!(prompt.contains("<personal_vocabulary>"), "vocab block should be emitted");
         assert!(prompt.contains("n8n"));
         assert!(prompt.contains("Vipassana"));
         // Compact form: the canonical-spelling rule appears (now phrased as
         // "Replace ... with the canonical spelling ONLY when ALL THREE align"
         // since the three-layer matching upgrade — lexical + type + meaning).
-        assert!(prompt.contains("canonical spelling"),
-                "canonical-spelling instruction should appear in compact form");
+        assert!(
+            prompt.contains("canonical spelling"),
+            "canonical-spelling instruction should appear in compact form"
+        );
         // The vocab block should NOT contain the verbose multi-rule form
         // that caused duplicate-output regressions.
-        assert!(!prompt.contains("**Verbatim match**"),
-                "verbose numbered-rule form must be removed");
-        assert!(!prompt.contains("**Mishearing recognition**"),
-                "verbose numbered-rule form must be removed");
+        assert!(
+            !prompt.contains("**Verbatim match**"),
+            "verbose numbered-rule form must be removed"
+        );
+        assert!(
+            !prompt.contains("**Mishearing recognition**"),
+            "verbose numbered-rule form must be removed"
+        );
     }
 
     #[test]
     fn vocab_block_absent_when_no_terms() {
         let p = prefs();
         let prompt = build_system_prompt_with_vocab(&p, &[], &[], &[]);
-        assert!(!prompt.contains("<personal_vocabulary>\n"),
-                "expected no vocabulary block when terms are empty");
-        assert!(!prompt.contains("KEEP the canonical"),
-                "vocab instructions should be gated on having terms");
+        assert!(
+            !prompt.contains("<personal_vocabulary>\n"),
+            "expected no vocabulary block when terms are empty"
+        );
+        assert!(
+            !prompt.contains("KEEP the canonical"),
+            "vocab instructions should be gated on having terms"
+        );
     }
 
     #[test]
@@ -471,25 +542,73 @@ mod tests {
         // rule — no Q&A examples, no decision-style language.
         let p = prefs();
         let entries = vec![VocabEntry {
-            term:      "MACOBS".into(),
-            context:   Some("MACOBS ka IPO".into()),
+            term: "MACOBS".into(),
+            context: Some("MACOBS ka IPO".into()),
+            resolution: VocabResolution::Candidate,
             term_type: Some("acronym".into()),
-            meaning:   None,
+            meaning: None,
         }];
         let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
 
         // Old verbose markers must all be GONE.
-        assert!(!prompt.contains("COMMON-WORD SAFEGUARD"),
-                "stopword safeguard heading must be removed");
-        assert!(!prompt.contains("\"the\", \"a\", \"is\""),
-                "enumerated stopword list must be removed");
-        assert!(!prompt.contains("type-compatible"),
-                "verbose 'type-compatible' explainer is gone (kept implicit in 1-line rule)");
-        assert!(!prompt.contains("Each entry below is a CANDIDATE"),
-                "decision-style 'CANDIDATE' framing must be gone");
+        assert!(
+            !prompt.contains("COMMON-WORD SAFEGUARD"),
+            "stopword safeguard heading must be removed"
+        );
+        assert!(
+            !prompt.contains("\"the\", \"a\", \"is\""),
+            "enumerated stopword list must be removed"
+        );
+        assert!(
+            !prompt.contains("type-compatible"),
+            "verbose 'type-compatible' explainer is gone (kept implicit in 1-line rule)"
+        );
+        assert!(
+            !prompt.contains("Each entry below is a CANDIDATE"),
+            "decision-style 'CANDIDATE' framing must be gone"
+        );
         // The new compact form must contain the type-shape rule inline.
-        assert!(prompt.contains("acronym entry"),
-                "compact rule mentions acronym type as the canonical example");
+        assert!(
+            prompt.contains("acronym entry"),
+            "compact rule mentions acronym type as the canonical example"
+        );
+        assert!(
+            prompt.contains("never a rescue layer"),
+            "semantic meaning must be constrained as confirmation, not expansion"
+        );
+    }
+
+    #[test]
+    fn resolved_terms_render_in_preserve_only_section() {
+        let p = prefs();
+        let entries = vec![VocabEntry {
+            term: "MACOBS".into(),
+            context: Some("MACOBS ka IPO".into()),
+            resolution: VocabResolution::Resolved,
+            term_type: Some("acronym".into()),
+            meaning: Some("Indian SME stock acronym.".into()),
+        }];
+        let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
+        assert!(prompt.contains("Confirmed terms already resolved by deterministic matching"));
+        assert!(prompt.contains("Keep them exactly as written"));
+        assert!(prompt.contains("MACOBS [acronym]"));
+        assert!(!prompt.contains("Candidate terms below are NOT resolved yet.\n  MACOBS"));
+    }
+
+    #[test]
+    fn candidate_terms_render_in_confirm_only_section() {
+        let p = prefs();
+        let entries = vec![VocabEntry {
+            term: "n8n".into(),
+            context: Some("I run n8n for automations".into()),
+            resolution: VocabResolution::Candidate,
+            term_type: Some("code_identifier".into()),
+            meaning: Some("Workflow automation tool.".into()),
+        }];
+        let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
+        assert!(prompt.contains("Candidate terms below are NOT resolved yet"));
+        assert!(prompt.contains("canonical spelling only when the phrase is phonetically close"));
+        assert!(prompt.contains("n8n [code identifier]"));
     }
 
     #[test]
@@ -505,35 +624,79 @@ mod tests {
         let prompt = build_system_prompt_with_vocab(&p, &[], &[], &[]);
 
         // Must contain the final rule heading (compact form).
-        assert!(prompt.contains("FINAL RULE — SINGLE OUTPUT"),
-                "single-output rule must be present");
+        assert!(
+            prompt.contains("FINAL RULE — SINGLE OUTPUT"),
+            "single-output rule must be present"
+        );
         // Must explicitly forbid repetition (the failure mode).
-        assert!(prompt.contains("No repetition") || prompt.contains("no repetition"),
-                "single-output rule must explicitly forbid repetition");
+        assert!(
+            prompt.contains("No repetition") || prompt.contains("no repetition"),
+            "single-output rule must explicitly forbid repetition"
+        );
         // The FINAL rule must come AFTER all other task rules — verify by
         // checking position relative to a known earlier rule.
         let pos_output_only = prompt.find("Output ONLY the polished text").unwrap();
-        let pos_final       = prompt.find("FINAL RULE").unwrap();
-        assert!(pos_final > pos_output_only,
-                "FINAL RULE must come AFTER the output-only rule (be the LAST instruction)");
+        let pos_final = prompt.find("FINAL RULE").unwrap();
+        assert!(
+            pos_final > pos_output_only,
+            "FINAL RULE must come AFTER the output-only rule (be the LAST instruction)"
+        );
         // The final rule must be near the </task> closer for end-of-prompt
         // attention to fire on it.
         let pos_close = prompt.find("</task>").unwrap();
-        assert!(pos_close - pos_final < 1500,
-                "FINAL RULE must be near </task> closer ({}+ chars away — should be < 1500)",
-                pos_close - pos_final);
+        assert!(
+            pos_close - pos_final < 1500,
+            "FINAL RULE must be near </task> closer ({}+ chars away — should be < 1500)",
+            pos_close - pos_final
+        );
     }
 
     #[test]
     fn vocab_block_renders_type_tag_per_entry() {
         let p = prefs();
         let entries = vec![
-            VocabEntry { term: "MACOBS".into(),     context: Some("MACOBS ka IPO".into()),     term_type: Some("acronym".into()),         meaning: None },
-            VocabEntry { term: "Anish".into(),      context: None,                              term_type: Some("proper_noun".into()),     meaning: None },
-            VocabEntry { term: "n8n".into(),        context: Some("I run n8n".into()),         term_type: Some("code_identifier".into()), meaning: None },
-            VocabEntry { term: "ClaudeCode".into(), context: None,                              term_type: Some("brand".into()),           meaning: None },
-            VocabEntry { term: "Cloud Code".into(), context: None,                              term_type: Some("phrase".into()),          meaning: None },
-            VocabEntry { term: "weird".into(),      context: None,                              term_type: Some("other".into()),           meaning: None },
+            VocabEntry {
+                term: "MACOBS".into(),
+                context: Some("MACOBS ka IPO".into()),
+                resolution: VocabResolution::Candidate,
+                term_type: Some("acronym".into()),
+                meaning: None,
+            },
+            VocabEntry {
+                term: "Anish".into(),
+                context: None,
+                resolution: VocabResolution::Candidate,
+                term_type: Some("proper_noun".into()),
+                meaning: None,
+            },
+            VocabEntry {
+                term: "n8n".into(),
+                context: Some("I run n8n".into()),
+                resolution: VocabResolution::Candidate,
+                term_type: Some("code_identifier".into()),
+                meaning: None,
+            },
+            VocabEntry {
+                term: "ClaudeCode".into(),
+                context: None,
+                resolution: VocabResolution::Candidate,
+                term_type: Some("brand".into()),
+                meaning: None,
+            },
+            VocabEntry {
+                term: "Cloud Code".into(),
+                context: None,
+                resolution: VocabResolution::Candidate,
+                term_type: Some("phrase".into()),
+                meaning: None,
+            },
+            VocabEntry {
+                term: "weird".into(),
+                context: None,
+                resolution: VocabResolution::Candidate,
+                term_type: Some("other".into()),
+                meaning: None,
+            },
         ];
         let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
         // Multi-line entry shape: "  TERM [type]\n    example: \"...\""
@@ -557,24 +720,30 @@ mod tests {
         let p = prefs();
         let entries = vec![
             VocabEntry {
-                term:      "MACOBS".into(),
-                context:   Some("MACOBS ka IPO ka 12 hazaar batana".into()),
+                term: "MACOBS".into(),
+                context: Some("MACOBS ka IPO ka 12 hazaar batana".into()),
+                resolution: VocabResolution::Candidate,
                 term_type: None,
-                meaning:   None,
+                meaning: None,
             },
             VocabEntry {
-                term:      "n8n".into(),
-                context:   None,
+                term: "n8n".into(),
+                context: None,
+                resolution: VocabResolution::Candidate,
                 term_type: None,
-                meaning:   None,
+                meaning: None,
             },
         ];
         let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
         // No type tag, with context — `  TERM\n    example: "..."`
-        assert!(prompt.contains("  MACOBS\n    example: \"MACOBS ka IPO ka 12 hazaar batana\""),
-                "entry without type tag should still render context on its own line");
-        assert!(prompt.contains("  n8n\n"),
-                "bare entry should render just the term");
+        assert!(
+            prompt.contains("  MACOBS\n    example: \"MACOBS ka IPO ka 12 hazaar batana\""),
+            "entry without type tag should still render context on its own line"
+        );
+        assert!(
+            prompt.contains("  n8n\n"),
+            "bare entry should render just the term"
+        );
     }
 
     #[test]
@@ -587,26 +756,31 @@ mod tests {
         // from one example each call.
         let p = prefs();
         let entries = vec![VocabEntry {
-            term:      "MACOBS".into(),
-            context:   Some("MACOBS ka IPO".into()),
+            term: "MACOBS".into(),
+            context: Some("MACOBS ka IPO".into()),
+            resolution: VocabResolution::Candidate,
             term_type: Some("acronym".into()),
-            meaning:   Some(
-                "Indian SME stock acronym used in market-cap discussions.".into(),
-            ),
+            meaning: Some("Indian SME stock acronym used in market-cap discussions.".into()),
         }];
         let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
-        assert!(prompt.contains("MACOBS [acronym]"),
-                "term + type tag still render");
+        assert!(
+            prompt.contains("MACOBS [acronym]"),
+            "term + type tag still render"
+        );
         assert!(
             prompt.contains("means: Indian SME stock acronym used in market-cap discussions."),
             "meaning surfaces as a `means:` line",
         );
-        assert!(prompt.contains("example: \"MACOBS ka IPO\""),
-                "example still renders alongside meaning");
+        assert!(
+            prompt.contains("example: \"MACOBS ka IPO\""),
+            "example still renders alongside meaning"
+        );
         // The block-level instruction must mention semantic alignment, not
         // just type compatibility — that's the upgrade.
-        assert!(prompt.contains("means:"),
-                "vocab block instructions reference the means: layer");
+        assert!(
+            prompt.contains("means:"),
+            "vocab block instructions reference the means: layer"
+        );
     }
 
     #[test]
@@ -616,10 +790,11 @@ mod tests {
         // empty content) and the rest of the entry is unchanged.
         let p = prefs();
         let entries = vec![VocabEntry {
-            term:      "Anish".into(),
-            context:   None,
+            term: "Anish".into(),
+            context: None,
+            resolution: VocabResolution::Candidate,
             term_type: Some("proper_noun".into()),
-            meaning:   None,
+            meaning: None,
         }];
         let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
         assert!(prompt.contains("Anish [proper noun]"));
@@ -627,8 +802,10 @@ mod tests {
         let count_means = prompt.matches("means:").count();
         // The block-level instructions reference `means:` exactly twice (the
         // structural rule) — but no per-entry rendering.
-        assert!(count_means <= 2,
-                "no per-entry `means:` line should be emitted when meaning is None ({count_means} found)");
+        assert!(
+            count_means <= 3,
+            "no per-entry `means:` line should be emitted when meaning is None ({count_means} found)"
+        );
     }
 
     #[test]
@@ -649,32 +826,48 @@ mod tests {
 
         let sys = build_system_prompt_with_vocab(&p, &[], &[], &[]);
         // language_rule must contain anti-translation language.
-        assert!(sys.contains("PRESERVATION"),
-                "Hinglish language_rule must have a PRESERVATION block");
-        assert!(sys.contains("Do NOT translate them to English") ||
-                sys.contains("never translate Hindi"),
-                "Hinglish language_rule must explicitly forbid Hindi→English translation");
+        assert!(
+            sys.contains("PRESERVATION"),
+            "Hinglish language_rule must have a PRESERVATION block"
+        );
+        assert!(
+            sys.contains("Do NOT translate them to English")
+                || sys.contains("never translate Hindi"),
+            "Hinglish language_rule must explicitly forbid Hindi→English translation"
+        );
         // Concrete failure-mode example must be present (the LLM learns from
         // ✗/✓ pairs much more reliably than from abstract rules).
-        assert!(sys.contains("Today there was a lot of work"),
-                "Hinglish language_rule must include the canonical failure-mode example");
+        assert!(
+            sys.contains("Today there was a lot of work"),
+            "Hinglish language_rule must include the canonical failure-mode example"
+        );
 
         // script_final_check must call out language preservation, not just script.
-        assert!(sys.contains("LANGUAGE —") || sys.contains("LANGUAGE BALANCE"),
-                "script_final_check must include a LANGUAGE/preservation check");
-        assert!(sys.contains("kaam") && sys.contains("never \"work\""),
-                "script_final_check must show kaam→work as the canonical wrong move");
+        assert!(
+            sys.contains("LANGUAGE —") || sys.contains("LANGUAGE BALANCE"),
+            "script_final_check must include a LANGUAGE/preservation check"
+        );
+        assert!(
+            sys.contains("kaam") && sys.contains("never \"work\""),
+            "script_final_check must show kaam→work as the canonical wrong move"
+        );
 
         // user_message reminder must mention preservation.
         let user = build_user_message("aaj bahut kaam tha", "hinglish");
-        assert!(user.contains("preserve Hindi") || user.contains("never translate"),
-                "user_message reminder must mention Hindi preservation");
+        assert!(
+            user.contains("preserve Hindi") || user.contains("never translate"),
+            "user_message reminder must mention Hindi preservation"
+        );
     }
 
     #[test]
     fn polish_corrections_block_is_soft_not_mandatory() {
         let p = prefs();
-        let corr = vec![Correction { wrong: "kindly".into(), right: "please".into(), count: 1 }];
+        let corr = vec![Correction {
+            wrong: "kindly".into(),
+            right: "please".into(),
+            count: 1,
+        }];
         let prompt = build_system_prompt_with_vocab(&p, &[], &corr, &[]);
         assert!(prompt.contains("<polish_preferences>"));
         // The old MANDATORY language must be gone — that was the semantic bug.

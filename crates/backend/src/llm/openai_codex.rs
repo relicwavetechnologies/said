@@ -166,7 +166,19 @@ pub async fn stream_polish(
         );
     }
     info!("[codex] done in {polish_ms}ms, {} chars", polished.len());
-    Ok(PolishResult { polished, polish_ms })
+    Ok(PolishResult {
+        polished,
+        polish_ms,
+    })
+}
+
+pub fn is_auth_error(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("unauthorized")
+        || lower.contains("invalid_token")
+        || lower.contains("invalid token")
 }
 
 // ── Token refresh ─────────────────────────────────────────────────────────────
