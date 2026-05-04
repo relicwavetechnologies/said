@@ -15,6 +15,32 @@
 
 use crate::store::{corrections::Correction, prefs::Preferences};
 
+/// Render a single vocab entry for the polish prompt. Output shape:
+///   `  MACOBS [acronym] — example: "MACOBS ka IPO ka 12 hazaar batana"`
+///   `  Anish [proper noun] — example: "Anish ne mail bhejna hai"`
+///   `  n8n [code identifier] — example: "I run n8n for automation"`
+///   `  Cloud Code [phrase] — example: "Cloud Code is faster"`
+///   `  TermWithoutContext [other]`
+///
+/// The bracketed type tag is what enables type-aware reasoning in the LLM —
+/// e.g. an acronym entry must not match a single common English word.
+fn format_vocab_entry(e: &VocabEntry) -> String {
+    let type_label = match e.term_type.as_deref() {
+        Some("acronym")          => " [acronym]",
+        Some("proper_noun")      => " [proper noun]",
+        Some("brand")            => " [brand]",
+        Some("code_identifier")  => " [code identifier]",
+        Some("phrase")           => " [phrase]",
+        Some("other") | None     => "",            // no signal — render bare
+        Some(other)              => return format!("  {} [{other}]", e.term),
+    };
+    match &e.context {
+        Some(ctx) if !ctx.trim().is_empty() =>
+            format!("  {}{type_label} — example: \"{}\"", e.term, ctx.trim()),
+        _ => format!("  {}{type_label}", e.term),
+    }
+}
+
 pub struct RagExample {
     pub ai_output: String,
     pub user_kept: String,
@@ -29,13 +55,13 @@ pub struct RagExample {
 /// the literal "main course" isn't a stored alias.
 #[derive(Clone)]
 pub struct VocabEntry {
-    pub term:    String,
-    pub context: Option<String>,
-    /// Lexical-shape tag (acronym / proper_noun / brand / code_identifier /
-    /// phrase / other). Carried through from the storage layer so callers
-    /// that build VocabEntry from VocabTerm don't need to drop the field.
-    /// The current prompt formatter ignores it — kept for binary compat
-    /// with callers and reservation for future prompt iterations.
+    pub term:      String,
+    pub context:   Option<String>,
+    /// Lexical-shape classification ("acronym" / "proper_noun" / "brand" /
+    /// "code_identifier" / "phrase" / "other"). Used by the polish prompt
+    /// to render structured, type-aware entries so the LLM can reason from
+    /// signals (an acronym entry should not match a common single word)
+    /// instead of needing hardcoded exception lists.
     pub term_type: Option<String>,
 }
 
@@ -98,45 +124,33 @@ pub fn build_system_prompt_with_vocab_entries(
     let tone         = tone_description(&prefs.tone_preset);
     let script_check = script_final_check(&prefs.output_language);
 
-    // Vocabulary preservation block — instructs the LLM to (a) keep known
-    // terms verbatim, (b) RECOGNISE phonetically-similar mishearings of
-    // them. Each entry may carry an example sentence the term was observed
-    // in — that's the foundational signal for context-aware recognition of
-    // unseen mishearings ("main course ka IPO" → MACOBS, when MACOBS's
-    // example is "MACOBS ka IPO ka 12 hazaar").
+    // Vocabulary block — compact form. Each entry shows canonical + type tag +
+    // example_context. The type tag carries the foundational signal (an
+    // acronym entry is type-incompatible with a single common word). We
+    // intentionally avoid verbose explanations that would expand the
+    // prompt with decision-style language ("you may emit", "candidates")
+    // — that framing pushes the LLM into evaluate-multiple-options mode
+    // and was the root cause of duplicate-output regressions.
+    //
+    // Two-line instruction = enough. The model uses the type+example
+    // signals to decide; the global single-output rule (in <task>) keeps
+    // it from emitting multiple variants.
     let vocab_block = if vocabulary_entries.is_empty() {
         String::new()
     } else {
         let table = vocabulary_entries
             .iter()
-            .map(|e| match &e.context {
-                Some(ctx) if !ctx.trim().is_empty() => format!("  {} — example: \"{}\"", e.term, ctx.trim()),
-                _ => format!("  {}", e.term),
-            })
+            .map(format_vocab_entry)
             .collect::<Vec<_>>()
             .join("\n");
         format!(
             "<personal_vocabulary>\n\
-             The following are the user's personal vocabulary terms — names, \
-             brands, code identifiers, acronyms, technical terms — together \
-             with the example sentence each was first observed in. The example \
-             tells you the CONTEXT in which the user uses the term.\n\n\
-             RULES:\n\
-             1. If a term appears verbatim in the transcript, KEEP IT — same \
-             spelling, same case.\n\
-             2. Do NOT translate, expand, or substitute these terms.\n\
-             3. RECOGNISE MISHEARINGS: if the transcript contains a word or \
-             short phrase that is phonetically similar to a vocabulary term \
-             AND appears in a context that resembles the term's example, \
-             REPLACE it with the canonical term.\n\
-                Example: vocab has `MACOBS — example: \"MACOBS ka IPO ka 12 \
-             hazaar batana\"`. Transcript says \"main course ka IPO ka 12 \
-             hazaar batana\" — context matches → output MACOBS, not \"main course\".\n\
-                Counter-example: vocab has `MACOBS — example: \"MACOBS ka IPO\"`. \
-             Transcript says \"the main course at dinner was great\" — context \
-             does NOT match (no IPO/finance signal) → leave \"main course\" alone.\n\
-             4. When in doubt (similar sound but unrelated context), keep the \
-             transcript as-is. Don't over-replace.\n\n\
+             User's personal terms. If a transcript phrase matches a term \
+             verbatim, KEEP the canonical spelling. If a phrase is phonetically \
+             similar to a term AND the surrounding context resembles the term's \
+             example, replace it with the canonical. If type doesn't fit (e.g. \
+             a single common word is never compatible with an acronym entry), \
+             leave the transcript unchanged.\n\n\
              {table}\n\
              </personal_vocabulary>\n\n"
         )
@@ -238,7 +252,25 @@ pub fn build_system_prompt_with_vocab_entries(
          IMPORTANT: Think about what the speaker INTENDED to say based on the overall \
          topic and sentence meaning. Low-confidence words are hints, not gospel.\n\n\
          SCRIPT FINAL CHECK (read before writing your first character):\n\
-         {script_check}\
+         {script_check}\n\n\
+         ════════════════════════════════════════════════════════════════════════\n\
+         FINAL CRITICAL RULE — SINGLE OUTPUT ENFORCEMENT (read this last):\n\
+         ════════════════════════════════════════════════════════════════════════\n\
+         Your entire response is the polished text, ONCE. Stop immediately after \
+         writing it. Never repeat. Never paraphrase your own output. Never offer \
+         alternatives or 'cleaner versions'. Even if the input was uncertain or \
+         had multiple plausible interpretations, you commit to ONE polished \
+         version and stop.\n\n\
+         BAD example (do NOT do this):\n\
+           Input: \"hello kya chal raha hai\"\n\
+           ✗ Output: \"Hello, kya chal raha hai? Hello, kaisa chal raha hai?\"\n\
+           ↑ The model paraphrased itself — two versions concatenated.\n\n\
+         GOOD example (do this):\n\
+           Input: \"hello kya chal raha hai\"\n\
+           ✓ Output: \"Hello, kya chal raha hai?\"\n\
+           ↑ One polished version. End of response.\n\n\
+         When you have written the polished text once, your response is COMPLETE. \
+         Do not continue. Do not 'try again with a cleaner version'. Stop.\
          </task>"
     )
 }
@@ -388,28 +420,117 @@ mod tests {
         assert!(prompt.contains("<personal_vocabulary>"), "vocab block should be emitted");
         assert!(prompt.contains("n8n"));
         assert!(prompt.contains("Vipassana"));
-        assert!(prompt.contains("KEEP IT"), "verbatim-keep instruction should appear");
-        assert!(prompt.contains("RECOGNISE MISHEARINGS"),
-                "context-aware mishearing instruction should appear");
+        // Compact form: the "KEEP the canonical spelling" rule appears.
+        assert!(prompt.contains("KEEP the canonical"),
+                "verbatim-keep instruction should appear in compact form");
+        // The vocab block should NOT contain the verbose multi-rule form
+        // that caused duplicate-output regressions.
+        assert!(!prompt.contains("**Verbatim match**"),
+                "verbose numbered-rule form must be removed");
+        assert!(!prompt.contains("**Mishearing recognition**"),
+                "verbose numbered-rule form must be removed");
     }
 
     #[test]
     fn vocab_block_absent_when_no_terms() {
         let p = prefs();
         let prompt = build_system_prompt_with_vocab(&p, &[], &[], &[]);
-        // The opening tag (which only appears in the actual block, not the
-        // conditional reference in <task>) must not be present.
         assert!(!prompt.contains("<personal_vocabulary>\n"),
                 "expected no vocabulary block when terms are empty");
-        assert!(!prompt.contains("RECOGNISE MISHEARINGS"),
+        assert!(!prompt.contains("KEEP the canonical"),
                 "vocab instructions should be gated on having terms");
     }
 
     #[test]
+    fn vocab_block_compact_form_no_verbose_rules() {
+        // FOUNDATIONAL: the previous prompt had a 40+ line verbose vocab
+        // block with numbered rules + sub-bullets + Q&A-style examples.
+        // That framing pushed the LLM into "evaluate multiple candidates"
+        // mode and caused duplicate-output regressions (LLM would emit
+        // its first version, then a paraphrased "alternative").
+        // The compact form keeps the type+example signals and a 1-line
+        // rule — no Q&A examples, no decision-style language.
+        let p = prefs();
+        let entries = vec![VocabEntry {
+            term:      "MACOBS".into(),
+            context:   Some("MACOBS ka IPO".into()),
+            term_type: Some("acronym".into()),
+        }];
+        let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
+
+        // Old verbose markers must all be GONE.
+        assert!(!prompt.contains("COMMON-WORD SAFEGUARD"),
+                "stopword safeguard heading must be removed");
+        assert!(!prompt.contains("\"the\", \"a\", \"is\""),
+                "enumerated stopword list must be removed");
+        assert!(!prompt.contains("type-compatible"),
+                "verbose 'type-compatible' explainer is gone (kept implicit in 1-line rule)");
+        assert!(!prompt.contains("Each entry below is a CANDIDATE"),
+                "decision-style 'CANDIDATE' framing must be gone");
+        // The new compact form must contain the type-shape rule inline.
+        assert!(prompt.contains("acronym entry"),
+                "compact rule mentions acronym type as the canonical example");
+    }
+
+    #[test]
+    fn task_block_ends_with_single_output_enforcement() {
+        // FOUNDATIONAL: the very last instruction the LLM sees before
+        // generation must be the single-output enforcement. End-of-prompt
+        // attention is strongest; placing the rule earlier (as a bullet
+        // in the middle of a numbered list) wasn't holding up against
+        // verbose vocab-block changes that pushed the LLM into
+        // multiple-output mode. Locking placement here is the regression
+        // test for the duplicate-polish bug.
+        let p = prefs();
+        let prompt = build_system_prompt_with_vocab(&p, &[], &[], &[]);
+
+        // Must contain the FINAL rule heading.
+        assert!(prompt.contains("FINAL CRITICAL RULE"),
+                "single-output rule must be present");
+        // Must contain the bad-example pattern that shows the failure mode.
+        assert!(prompt.contains("paraphrased itself"),
+                "bad-example explanation must be present");
+        // The FINAL rule must come AFTER all other task rules — verify by
+        // checking position relative to a known earlier rule.
+        let pos_rule_7   = prompt.find("Output ONLY the polished text").unwrap();
+        let pos_final    = prompt.find("FINAL CRITICAL RULE").unwrap();
+        assert!(pos_final > pos_rule_7,
+                "FINAL CRITICAL RULE must come AFTER rule 7 (be the LAST instruction)");
+        // The final rule must be near the </task> closer for end-of-prompt
+        // attention to fire on it.
+        let pos_close = prompt.find("</task>").unwrap();
+        assert!(pos_close - pos_final < 1500,
+                "FINAL CRITICAL RULE must be near </task> closer ({}+ chars away — should be < 1500)",
+                pos_close - pos_final);
+    }
+
+    #[test]
+    fn vocab_block_renders_type_tag_per_entry() {
+        let p = prefs();
+        let entries = vec![
+            VocabEntry { term: "MACOBS".into(),     context: Some("MACOBS ka IPO".into()),     term_type: Some("acronym".into()) },
+            VocabEntry { term: "Anish".into(),      context: None,                              term_type: Some("proper_noun".into()) },
+            VocabEntry { term: "n8n".into(),        context: Some("I run n8n".into()),         term_type: Some("code_identifier".into()) },
+            VocabEntry { term: "ClaudeCode".into(), context: None,                              term_type: Some("brand".into()) },
+            VocabEntry { term: "Cloud Code".into(), context: None,                              term_type: Some("phrase".into()) },
+            VocabEntry { term: "weird".into(),      context: None,                              term_type: Some("other".into()) },
+        ];
+        let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
+        assert!(prompt.contains("MACOBS [acronym] — example: \"MACOBS ka IPO\""));
+        assert!(prompt.contains("Anish [proper noun]"));
+        assert!(prompt.contains("n8n [code identifier] — example: \"I run n8n\""));
+        assert!(prompt.contains("ClaudeCode [brand]"));
+        assert!(prompt.contains("Cloud Code [phrase]"));
+        // "other" type means no signal — render bare without a tag.
+        assert!(prompt.contains("  weird\n"));
+        assert!(!prompt.contains("weird [other]"));
+    }
+
+    #[test]
     fn vocab_entries_with_context_render_inline() {
-        // The foundational addition: contexts are inlined as `term — example: "..."`
-        // so the LLM has the situational signal it needs to disambiguate
-        // unseen STT mishearings.
+        // Backward-compat for the earlier context-only test. Type tag is
+        // omitted when entry.term_type is None — the LLM still has the
+        // example signal to work with.
         let p = prefs();
         let entries = vec![
             VocabEntry {
@@ -425,9 +546,9 @@ mod tests {
         ];
         let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
         assert!(prompt.contains("MACOBS — example: \"MACOBS ka IPO ka 12 hazaar batana\""),
-                "entry with context should render `term — example: \"...\"`");
+                "entry without type tag should still render context");
         assert!(prompt.contains("  n8n\n"),
-                "entry without context should render bare term");
+                "bare entry should render just the term");
     }
 
     #[test]
