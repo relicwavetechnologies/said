@@ -21,6 +21,52 @@ use voice_polish_recorder::{resample_to_16k, ChunkReceiver, SAMPLE_RATE};
 /// Confidence threshold — words below this get [word?XX%] markers for the LLM.
 const LOW_CONFIDENCE_THRESHOLD: f64 = 0.85;
 
+/// One transcription update from Deepgram during a streaming session.
+/// Emitted for both interim (in-progress) and final (committed) results so
+/// the UI can show live text as the user speaks.
+///
+/// While `is_final` is false the `text` may be revised by subsequent updates
+/// for the same segment. Once `is_final` is true the segment is committed
+/// and a new segment may begin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterimUpdate {
+    /// Recognized text for this segment, with `[word?XX%]` markers for
+    /// low-confidence words. Plain text — no JSON wrapping.
+    pub text: String,
+    /// True once Deepgram has committed this segment (text won't revise).
+    pub is_final: bool,
+    /// True when Deepgram detected an utterance-final pause. Implies
+    /// `is_final`; useful as an early "user paused" signal for downstream
+    /// work (e.g. starting polish before drain finishes).
+    pub speech_final: bool,
+}
+
+/// Sender half of an interim-update channel. Pass `Some(tx)` to
+/// `stream_to_deepgram` to receive live transcription updates while audio
+/// streams. Use an unbounded channel so the WS task never blocks on a slow
+/// consumer.
+pub type InterimSender = tokio::sync::mpsc::UnboundedSender<InterimUpdate>;
+
+/// Parse a Deepgram WS Results message into an [`InterimUpdate`].
+///
+/// Returns `None` for any non-Results message (`KeepAlive`, `Metadata`,
+/// `UtteranceEnd`, etc) and for Results messages with empty alternatives.
+/// This is a pure function so it can be unit-tested without a live WS.
+fn parse_results_message(v: &Value) -> Option<InterimUpdate> {
+    if v["type"].as_str() != Some("Results") {
+        return None;
+    }
+    let text = enrich_from_words(&v["channel"]["alternatives"][0]["words"]);
+    if text.is_empty() {
+        return None;
+    }
+    Some(InterimUpdate {
+        text,
+        is_final:     v["is_final"].as_bool().unwrap_or(false),
+        speech_final: v["speech_final"].as_bool().unwrap_or(false),
+    })
+}
+
 /// A pre-warmed Deepgram WebSocket connection ready to start receiving audio.
 /// Stored in `PrewarmedWsState` between recordings to eliminate the TLS handshake
 /// from the hot path (~150ms saved, up to 3s saved under rapid use).
@@ -102,6 +148,10 @@ pub async fn connect_ws(deepgram_key: &str, language: &str, keyterms: &[String])
 /// `prewarmed`: if Some and params match, uses the pre-established connection
 /// (eliminates TLS handshake from hot path). Falls back to fresh connect if None
 /// or if language/keyterms changed.
+///
+/// `interim_tx`: if Some, every Deepgram Results message (interim AND final)
+/// is forwarded to this channel as an [`InterimUpdate`]. Send failures (closed
+/// receiver) are ignored — the WS task never blocks on a slow consumer.
 pub async fn stream_to_deepgram(
     chunk_recv:   ChunkReceiver,
     deepgram_key: &str,
@@ -109,6 +159,7 @@ pub async fn stream_to_deepgram(
     keyterms:     &[String],
     pre_embed:    Option<(&str, &str)>,
     prewarmed:    Option<PrewarmedWs>,
+    interim_tx:   Option<InterimSender>,
 ) -> Option<String> {
     if deepgram_key.is_empty() {
         warn!("[dg_stream] no Deepgram API key — WS streaming disabled");
@@ -235,19 +286,20 @@ pub async fn stream_to_deepgram(
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                            let msg_type = v["type"].as_str().unwrap_or("?");
-                            if msg_type == "Results" {
-                                let is_f = v["is_final"].as_bool().unwrap_or(false);
-                                let sp_f = v["speech_final"].as_bool().unwrap_or(false);
-                                if is_f {
-                                    let enriched = enrich_from_words(&v["channel"]["alternatives"][0]["words"]);
-                                    if !enriched.is_empty() {
-                                        info!("[dg_stream] segment: {enriched:?} (speech_final={sp_f})");
-                                        transcript_parts.push(enriched);
-                                    }
+                            if let Some(update) = parse_results_message(&v) {
+                                // Forward to UI consumer (live preview) regardless
+                                // of is_final. Send failure = receiver dropped;
+                                // ignore so the WS task never blocks on the UI.
+                                if let Some(tx) = &interim_tx {
+                                    let _ = tx.send(update.clone());
                                 }
-                                if sp_f {
+                                if update.speech_final {
                                     got_speech_final_during_stream = true;
+                                }
+                                if update.is_final {
+                                    info!("[dg_stream] segment: {:?} (speech_final={})",
+                                        update.text, update.speech_final);
+                                    transcript_parts.push(update.text);
                                 }
                             }
                         }
@@ -313,19 +365,18 @@ pub async fn stream_to_deepgram(
         match tokio::time::timeout(effective_timeout, ws_rx.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => {
                 if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                    let msg_type = v["type"].as_str().unwrap_or("?");
-                    if msg_type == "Results" {
-                        let is_f = v["is_final"].as_bool().unwrap_or(false);
-                        let sp_f = v["speech_final"].as_bool().unwrap_or(false);
-                        if is_f {
-                            let enriched = enrich_from_words(&v["channel"]["alternatives"][0]["words"]);
-                            if !enriched.is_empty() {
-                                transcript_parts.push(enriched);
-                            }
-                        }
-                        if sp_f { last_speech_final = Some(tokio::time::Instant::now()); }
-                    } else if msg_type == "UtteranceEnd" {
+                    if v["type"].as_str() == Some("UtteranceEnd") {
                         last_speech_final = Some(tokio::time::Instant::now());
+                    } else if let Some(update) = parse_results_message(&v) {
+                        if let Some(tx) = &interim_tx {
+                            let _ = tx.send(update.clone());
+                        }
+                        if update.speech_final {
+                            last_speech_final = Some(tokio::time::Instant::now());
+                        }
+                        if update.is_final {
+                            transcript_parts.push(update.text);
+                        }
                     }
                 }
             }
@@ -455,7 +506,8 @@ fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::urlencode;
+    use super::*;
+    use serde_json::json;
 
     #[test]
     fn urlencode_handles_jargon_and_special_chars() {
@@ -464,6 +516,164 @@ mod tests {
         assert_eq!(urlencode("hello"),     "hello");
         assert_eq!(urlencode("hi there"),  "hi%20there");
         assert_eq!(urlencode("a&b=c"),     "a%26b%3Dc");
+    }
+
+    // ── parse_results_message ─────────────────────────────────────────────────
+    // These payloads mirror the exact shape Deepgram sends over the WS so the
+    // parser is exercised against the real protocol, not a stubbed
+    // approximation. Sample shapes pulled from Deepgram's WebSocket reference.
+
+    fn results(words: Vec<(&str, f64)>, is_final: bool, speech_final: bool) -> serde_json::Value {
+        let words_json: Vec<_> = words
+            .into_iter()
+            .map(|(w, c)| json!({"word": w, "punctuated_word": w, "confidence": c}))
+            .collect();
+        json!({
+            "type": "Results",
+            "channel": { "alternatives": [{ "words": words_json }] },
+            "is_final": is_final,
+            "speech_final": speech_final
+        })
+    }
+
+    #[test]
+    fn parses_interim_high_confidence() {
+        let p = results(vec![("hello", 0.95), ("world", 0.92)], false, false);
+        let r = parse_results_message(&p).expect("interim parses");
+        assert_eq!(r.text, "hello world");
+        assert!(!r.is_final);
+        assert!(!r.speech_final);
+    }
+
+    #[test]
+    fn parses_final_marks_low_confidence_words() {
+        // 0.50 < LOW_CONFIDENCE_THRESHOLD (0.85) so "the" gets a marker.
+        let p = results(vec![("send", 0.99), ("the", 0.50), ("report", 0.95)], true, true);
+        let r = parse_results_message(&p).unwrap();
+        assert_eq!(r.text, "send [the?50%] report");
+        assert!(r.is_final);
+        assert!(r.speech_final);
+    }
+
+    #[test]
+    fn returns_none_for_non_results_messages() {
+        // KeepAlive, Metadata, UtteranceEnd are all non-Results — the caller
+        // handles UtteranceEnd separately via msg_type, the others are no-ops.
+        assert!(parse_results_message(&json!({"type": "KeepAlive"})).is_none());
+        assert!(parse_results_message(&json!({"type": "Metadata", "request_id": "x"})).is_none());
+        assert!(parse_results_message(&json!({"type": "UtteranceEnd", "last_word_end": 1.2})).is_none());
+    }
+
+    #[test]
+    fn returns_none_for_empty_alternatives() {
+        // Deepgram sometimes ships Results with no words during silence —
+        // emitting an InterimUpdate with empty text would clobber UI state.
+        let p = json!({
+            "type": "Results",
+            "channel": { "alternatives": [{ "words": [] }] },
+            "is_final": false,
+            "speech_final": false
+        });
+        assert!(parse_results_message(&p).is_none());
+    }
+
+    #[test]
+    fn falls_back_to_word_when_punctuated_word_missing() {
+        // Some language models omit punctuated_word — must not crash and must
+        // recover the plain `word` field.
+        let p = json!({
+            "type": "Results",
+            "channel": { "alternatives": [{ "words": [
+                {"word": "test", "confidence": 0.99}
+            ] }] },
+            "is_final": false,
+            "speech_final": false
+        });
+        let r = parse_results_message(&p).unwrap();
+        assert_eq!(r.text, "test");
+    }
+
+    #[test]
+    fn typical_revising_interim_then_final_sequence() {
+        // Models the canonical revision flow:
+        //   "send the"      (interim)
+        //   "send a report" (interim, revised)
+        //   "send a report" (final, speech_final)
+        let i1 = results(vec![("send", 0.99), ("the", 0.99)], false, false);
+        let i2 = results(vec![("send", 0.99), ("a", 0.96), ("report", 0.99)], false, false);
+        let f  = results(vec![("send", 0.99), ("a", 0.96), ("report", 0.99)], true, true);
+
+        let r1 = parse_results_message(&i1).unwrap();
+        let r2 = parse_results_message(&i2).unwrap();
+        let r3 = parse_results_message(&f).unwrap();
+
+        assert_eq!(r1.text, "send the");
+        assert!(!r1.is_final);
+        assert_eq!(r2.text, "send a report");
+        assert!(!r2.is_final);
+        assert_eq!(r3.text, "send a report");
+        assert!(r3.is_final);
+        assert!(r3.speech_final);
+    }
+
+    #[test]
+    fn speech_final_can_arrive_on_interim_message() {
+        // Defensive: speech_final without is_final is unusual but possible —
+        // the caller uses speech_final to start the 500 ms drain timer, so we
+        // must surface it independently of is_final.
+        let p = results(vec![("hello", 0.99)], false, true);
+        let r = parse_results_message(&p).unwrap();
+        assert!(!r.is_final);
+        assert!(r.speech_final);
+    }
+
+    #[test]
+    fn missing_is_final_or_speech_final_defaults_to_false() {
+        // Deepgram should always include both fields, but a defensive parser
+        // must not panic on a malformed payload.
+        let p = json!({
+            "type": "Results",
+            "channel": { "alternatives": [{ "words": [
+                {"word": "ok", "confidence": 0.99}
+            ] }] }
+            // no is_final, no speech_final
+        });
+        let r = parse_results_message(&p).unwrap();
+        assert!(!r.is_final);
+        assert!(!r.speech_final);
+    }
+
+    // ── InterimSender wiring ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn interim_sender_receives_clones_in_order() {
+        // Simulates the WS task forwarding a sequence of updates: the
+        // consumer must see them in arrival order and identical to source.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<InterimUpdate>();
+        let updates = vec![
+            InterimUpdate { text: "send".into(),         is_final: false, speech_final: false },
+            InterimUpdate { text: "send the".into(),     is_final: false, speech_final: false },
+            InterimUpdate { text: "send a report".into(), is_final: false, speech_final: false },
+            InterimUpdate { text: "send a report".into(), is_final: true,  speech_final: true  },
+        ];
+        for u in &updates { tx.send(u.clone()).expect("send"); }
+        drop(tx);
+        let mut got = Vec::new();
+        while let Some(u) = rx.recv().await { got.push(u); }
+        assert_eq!(got, updates);
+    }
+
+    #[tokio::test]
+    async fn dropped_receiver_does_not_panic_sender() {
+        // The WS task's send-failure-ignored guarantee: if the consumer
+        // disappears mid-stream (e.g. recording cancelled), the next send
+        // returns Err but must not panic.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<InterimUpdate>();
+        drop(rx);
+        let result = tx.send(InterimUpdate {
+            text: "anything".into(), is_final: false, speech_final: false,
+        });
+        assert!(result.is_err());
     }
 }
 

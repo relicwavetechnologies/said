@@ -1297,6 +1297,7 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
         let hot_cache_arc    = Arc::clone(&app.state::<HotPathCache>().0);
         let backend_for_pe   = Arc::clone(&app.state::<BackendState>().0);
         let prewarm_arc      = Arc::clone(&app.state::<PrewarmedWsState>().0);
+        let app_for_interim  = app.clone();
 
         tauri::async_runtime::spawn(async move {
             let deepgram_key = std::env::var("DEEPGRAM_API_KEY").unwrap_or_default();
@@ -1323,6 +1324,33 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
                 .as_ref()
                 .map(|(url, secret)| (url.as_str(), secret.as_str()));
 
+            // ── Live interim transcript pipe ────────────────────────────────
+            // Forward every Deepgram Results message (interim and final) to the
+            // UI so the user sees text appear while they speak — closes the
+            // perceived-latency gap that was paid for but discarded before.
+            // Unbounded so the WS task never stalls on a slow renderer; the
+            // consumer task ends when the sender drops at end of stream.
+            let (interim_tx, mut interim_rx) =
+                tokio::sync::mpsc::unbounded_channel::<dg_stream::InterimUpdate>();
+            tauri::async_runtime::spawn(async move {
+                while let Some(update) = interim_rx.recv().await {
+                    if update.is_final {
+                        let _ = app_for_interim.emit(
+                            "voice-segment-final",
+                            serde_json::json!({
+                                "text":         update.text,
+                                "speech_final": update.speech_final,
+                            }),
+                        );
+                    } else {
+                        let _ = app_for_interim.emit(
+                            "voice-interim",
+                            serde_json::json!({ "text": update.text }),
+                        );
+                    }
+                }
+            });
+
             let transcript = dg_stream::stream_to_deepgram(
                 chunk_recv,
                 &deepgram_key,
@@ -1330,6 +1358,7 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
                 &keyterms,
                 pre_embed_ref,
                 prewarmed,
+                Some(interim_tx),
             ).await;
 
             tracing::info!("[dg_stream] pre-transcript: {}",
