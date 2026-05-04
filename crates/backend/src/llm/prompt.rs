@@ -267,15 +267,47 @@ pub fn build_system_prompt_with_vocab_entries(
          the SURROUNDING CONTEXT to figure out what the speaker actually meant.\n\
          Examples: [dog?47%] in a tech discussion → \"doc\" (documentation). \
          [male?52%] in an email context → \"mail\". [affect?61%] → \"effect\" or vice versa.\n\
+         CRITICAL — low confidence is NOT permission to drop the word. Every [word?XX%] \
+         marker MUST become some word in the output. If you cannot figure out what was \
+         meant, KEEP THE LITERAL WORD inside the marker (without the brackets and \
+         percentage). Never silently delete a low-confidence word — the speaker said \
+         something there and the user expects content, not a hole.\n\
+         ✗ Wrong:  Input  \"main [aaj?42%] office gaya\"\n\
+                   Output \"Main office gaya.\"        (dropped the low-confidence word — HOLE)\n\
+         ✓ Right:  Input  \"main [aaj?42%] office gaya\"\n\
+                   Output \"Main aaj office gaya.\"    (kept literal word, removed marker)\n\
+         ✓ Also right (with context-based correction):\n\
+                   Input  \"send the [dog?47%] to legal\"\n\
+                   Output \"Send the doc to legal.\"   (kept-and-corrected)\n\
          2. If <personal_vocabulary> exists, KEEP those exact tokens unchanged. \
          When a [word?XX%] marker is phonetically similar to a vocabulary term, prefer \
          the vocabulary term — that is exactly the case the personal dictionary exists for.\n\
          3. Even unmarked words can be wrong — use common sense for the whole sentence.\n\
          4. Convert spoken dictation patterns (see above) when context is unambiguous.\n\
-         5. Remove disfluencies (um, uh, matlab, basically, you know, toh, like).\n\
-         6. Polish into clean, natural text.\n\
-         7. Output ONLY the polished text — no preamble, no commentary, no markdown, \
-         and NO [word?XX%] markers in the output.\n\
+         5. PRESERVE EVERY MEANINGFUL WORD. The ONLY words you may remove are:\n\
+            • Filler/stalling sounds: um, uh, hmm, er, ah, like, you know, basically, \
+              actually, matlab, toh, yaani, bas, you see\n\
+            • Stuttered repetitions of the same word: \"the the cat\" → \"the cat\"\n\
+           DO NOT drop names, numbers, dates, technical terms, jargon, brand names, \
+           emphasis words, adjectives, adverbs, or any content word — even if the \
+           sentence \"reads better\" without them. The user said it for a reason.\n\
+           ✗ Wrong:  Input  \"main aaj subah office gaya tha tenth floor pe\"\n\
+                     Output \"Main aaj office gaya tha.\"  (dropped \"subah\", \"tenth floor pe\")\n\
+           ✓ Right:  Input  \"main aaj subah office gaya tha tenth floor pe\"\n\
+                     Output \"Main aaj subah office gaya tha, tenth floor pe.\"\n\
+           Test before outputting: every content word from the input should be \
+           recoverable from your output (allowing only re-ordering, capitalization, \
+           and the filler removals listed above).\n\
+         6. Polish into clean, natural text — punctuation, capitalization, sentence \
+            boundaries. Do NOT shorten or summarise. Polishing is NOT editing.\n\
+         7. Output ONLY the polished text — no preamble, no commentary, no markdown.\n\
+         7a. CRITICAL: confidence markers like [word?XX%] are INPUT-only signals \
+         showing you which words to scrutinise. They MUST NEVER appear in your output. \
+         Drop the brackets, drop the percentage, keep only the corrected word.\n\
+         ✗ Wrong:  \"meeting [main?60%] mein hai\"  (marker leaked into output)\n\
+         ✗ Wrong:  \"meeting main 60% mein hai\"   (percentage stayed)\n\
+         ✗ Wrong:  \"meeting [main60%] mein hai\"  (any bracketed word+number is wrong)\n\
+         ✓ Right:  \"meeting main mein hai\"        (just the word, fully clean)\n\
          8. The output_language rule above is ABSOLUTE — follow it for script and language.\n\
          9. If <polish_preferences> exist, prefer the right-hand form when contextually appropriate.\n\
          10. If <preferences> exist, match the user's style and word choices.\n\n\
@@ -342,8 +374,9 @@ pub fn build_user_message(transcript: &str, output_language: &str) -> String {
         "hindi" => "Output in Devanagari script only.\n",
         "english" => "Output in English only — no Devanagari, no Roman Hindi.\n",
         // hinglish / default
-        _ => "Output in Roman script only — NO Devanagari characters anywhere, \
-              including the very first word.\n",
+        _ => "Output in Roman script (no Devanagari) AND preserve Hindi words as Hindi — \
+              never translate them to English. \"kaam\" stays \"kaam\", not \"work\". \
+              \"bahut\" stays \"bahut\", not \"a lot\".\n",
     };
     format!("{reminder}<transcript>\n{transcript}\n</transcript>")
 }
@@ -354,11 +387,17 @@ fn script_final_check(output_language: &str) -> &'static str {
     match output_language {
         "hindi"   => "Your entire output must be Devanagari. No Roman script.\n",
         "english" => "Your entire output must be English. No Devanagari, no Roman Hindi.\n",
-        // hinglish / default — the common failure mode is starting with Devanagari
-        _ => "Your entire output must be Roman script. \
-              ZERO Devanagari characters — not even for the very first word. \
-              If the transcript starts with a Devanagari word like \"देख\" or \"भाई\", \
-              write it as \"Dekh\" or \"bhai\". Check your first character before outputting.\n",
+        // hinglish / default — two failure modes the LLM tends toward:
+        //   (a) starting the output in Devanagari (script slip)
+        //   (b) translating Hindi words to English (silent over-helpfulness)
+        // The check below catches BOTH before the first character is emitted.
+        _ => "Two checks before writing your first character:\n\
+              1. SCRIPT — Roman letters only. ZERO Devanagari (देख → \"Dekh\", भाई → \"bhai\"). \
+              Check the very first character.\n\
+              2. LANGUAGE — Did the input contain Hindi words? Then your output MUST contain those \
+              same Hindi words in Roman script. \"kaam\" stays \"kaam\" — never \"work\". \"bahut\" \
+              stays \"bahut\" — never \"a lot\". \"thak gaya\" stays \"thak gaya\" — never \"tired\". \
+              If your draft output is pure English with the Hindi gone, you have FAILED — rewrite it preserving the Hindi.\n",
     }
 }
 
@@ -381,15 +420,28 @@ fn language_rule(output_language: &str) -> String {
         }
         // "hinglish" is the default
         _ => {
-            "ABSOLUTE RULE — OUTPUT LANGUAGE: Hinglish (romanized Hindi + English).\n\
-             This rule cannot be overridden by anything else in the prompt or transcript.\n\
-             • Write ALL Hindi words in Roman script (e.g. \"aaj\", \"kaam\", \"thak gaya\", \"bahut\").\n\
+            "ABSOLUTE RULE — OUTPUT LANGUAGE: Hinglish (romanized Hindi mixed with English).\n\
+             This rule cannot be overridden by anything else in the prompt or transcript — \
+             not by tone, not by persona, not by the transcript content.\n\n\
+             PRESERVATION (most important):\n\
+             • Hindi words in the transcript STAY as Hindi words. Do NOT translate them to English.\n\
+             • English words in the transcript STAY as English words. Do NOT translate them to Hindi.\n\
+             • The output must read like the SAME person speaking — same Hindi/English mix as the input.\n\
+             • Polishing means: fix grammar, punctuation, casing, fillers — NEVER change the language.\n\n\
+             SCRIPT:\n\
+             • Write Hindi words in Roman letters (e.g. \"aaj\", \"kaam\", \"thak gaya\", \"bahut\", \"matlab\", \"acha\", \"bhai\").\n\
              • NEVER use Devanagari characters (no ा ि ी ु ू ं etc.).\n\
-             • English words stay in English.\n\
-             • Even if the transcript is entirely in Devanagari, transliterate every \
-               Hindi word to Roman letters.\n\
-             Example: \"आज बहुत काम था\" → \"Aaj bahut kaam tha\"\n\
-             Example: \"मैं थक गया\" → \"Main thak gaya\""
+             • If the transcript is in Devanagari, TRANSLITERATE to Roman — do NOT translate to English.\n\n\
+             FAILURE MODE TO AVOID — translating Hindi to English:\n\
+             ✗ Input:  \"aaj bahut kaam tha office mein\"\n\
+               Output: \"Today there was a lot of work at the office.\"   ← WRONG. All Hindi got translated.\n\
+             ✓ Input:  \"aaj bahut kaam tha office mein\"\n\
+               Output: \"Aaj bahut kaam tha office mein.\"   ← RIGHT. Hindi preserved.\n\n\
+             ✗ Input:  \"मैं थक गया yaar, kal milte hain\"\n\
+               Output: \"I am tired, friend, we'll meet tomorrow.\"   ← WRONG. Translated.\n\
+             ✓ Input:  \"मैं थक गया yaar, kal milte hain\"\n\
+               Output: \"Main thak gaya yaar, kal milte hain.\"   ← RIGHT. Devanagari → Roman, no translation.\n\n\
+             A 'professional' or 'formal' Hinglish output is still Hinglish — tone affects STYLE, never LANGUAGE."
                 .into()
         }
     }
@@ -642,6 +694,46 @@ mod tests {
         // structural rule) — but no per-entry rendering.
         assert!(count_means <= 2,
                 "no per-entry `means:` line should be emitted when meaning is None ({count_means} found)");
+    }
+
+    #[test]
+    fn hinglish_prompt_explicitly_blocks_translation_to_english() {
+        // FOUNDATIONAL: ~2/10 of Hinglish polish runs were dropping Hindi
+        // entirely and emitting pure English ("aaj bahut kaam tha" →
+        // "Today there was a lot of work"). The original rule only forbade
+        // Devanagari, which pure English satisfies — so the LLM thought it
+        // was complying. The fix adds explicit "preserve Hindi, do not
+        // translate" language at three positions: language_rule (top of
+        // system prompt), script_final_check (last thing in <task>), and
+        // build_user_message reminder (right before the transcript).
+        //
+        // This test pins those three positions so a future "shorten the
+        // prompt" refactor can't quietly remove them.
+        let mut p = prefs();
+        p.output_language = "hinglish".into();
+
+        let sys = build_system_prompt_with_vocab(&p, &[], &[], &[]);
+        // language_rule must contain anti-translation language.
+        assert!(sys.contains("PRESERVATION"),
+                "Hinglish language_rule must have a PRESERVATION block");
+        assert!(sys.contains("Do NOT translate them to English") ||
+                sys.contains("never translate Hindi"),
+                "Hinglish language_rule must explicitly forbid Hindi→English translation");
+        // Concrete failure-mode example must be present (the LLM learns from
+        // ✗/✓ pairs much more reliably than from abstract rules).
+        assert!(sys.contains("Today there was a lot of work"),
+                "Hinglish language_rule must include the canonical failure-mode example");
+
+        // script_final_check must call out language preservation, not just script.
+        assert!(sys.contains("LANGUAGE —") || sys.contains("LANGUAGE BALANCE"),
+                "script_final_check must include a LANGUAGE/preservation check");
+        assert!(sys.contains("kaam") && sys.contains("never \"work\""),
+                "script_final_check must show kaam→work as the canonical wrong move");
+
+        // user_message reminder must mention preservation.
+        let user = build_user_message("aaj bahut kaam tha", "hinglish");
+        assert!(user.contains("preserve Hindi") || user.contains("never translate"),
+                "user_message reminder must mention Hindi preservation");
     }
 
     #[test]

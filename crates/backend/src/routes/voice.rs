@@ -391,7 +391,7 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
                 .data(json!({"token": token}).to_string()));
         }
 
-        let llm_result = match llm_task.await {
+        let mut llm_result = match llm_task.await {
             Ok(Ok(r))   => r,
             Ok(Err(e))  => {
                 warn!("[voice] LLM error: {e}");
@@ -408,6 +408,19 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
                 return;
             }
         };
+
+        // Defensive scrub: the LLM is told NOT to emit [word?XX%] confidence
+        // markers, but occasionally leaks them anyway (sometimes malformed,
+        // e.g. "[main60%]" with no '?'). Strip any survivors before this
+        // text reaches the user, the paste path, or the DB.
+        let scrubbed = strip_confidence_markers(&llm_result.polished);
+        if scrubbed != llm_result.polished {
+            warn!(
+                "[voice] LLM leaked confidence markers — scrubbed {} → {} chars",
+                llm_result.polished.len(), scrubbed.len(),
+            );
+            llm_result.polished = scrubbed;
+        }
 
         let llm_ms   = llm_start.elapsed().as_millis() as i64;
         let total_ms = total_start.elapsed().as_millis() as i64;
@@ -489,15 +502,25 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
         .into_response()
 }
 
-/// Strip `[word?XX%]` confidence markers from an enriched transcript
-/// to recover the plain text (for DB storage, embedding, display).
+/// Strip `[word?XX%]`-style confidence markers from a string.
+///
+/// Used for two purposes:
+///   1. Recovering plain text from an enriched STT transcript (where we
+///      add the markers ourselves, so the canonical `word?NN%` form is
+///      guaranteed).
+///   2. Defensive scrubbing of LLM output, where the model occasionally
+///      leaks malformed variants like `[main60%]` (no `?`), `[main 60%]`
+///      (space), `[main ?60%]`, etc. The lenient parser below catches all
+///      of these by detecting the trailing `NN%` or `NN.NN%` shape inside
+///      brackets and treating everything before it (after stripping any
+///      `?` and whitespace) as the word.
 fn strip_confidence_markers(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
 
     while let Some(c) = chars.next() {
         if c == '[' {
-            // Try to parse [word?XX%] — extract just the word
+            // Collect bracket content
             let mut inner = String::new();
             let mut found_close = false;
             for ic in chars.by_ref() {
@@ -508,16 +531,12 @@ fn strip_confidence_markers(s: &str) -> String {
                 inner.push(ic);
             }
             if found_close {
-                if let Some(qpos) = inner.rfind('?') {
-                    let after_q = &inner[qpos + 1..];
-                    if after_q.ends_with('%') && after_q[..after_q.len() - 1].parse::<f64>().is_ok()
-                    {
-                        // Valid confidence marker — emit just the word part
-                        result.push_str(&inner[..qpos]);
-                        continue;
-                    }
+                if let Some(word) = parse_confidence_marker(&inner) {
+                    // Looked like a confidence marker — emit just the word
+                    result.push_str(&word);
+                    continue;
                 }
-                // Not a valid marker — emit the brackets and content as-is
+                // Not a marker — emit brackets + content unchanged
                 result.push('[');
                 result.push_str(&inner);
                 result.push(']');
@@ -531,4 +550,99 @@ fn strip_confidence_markers(s: &str) -> String {
     }
 
     result
+}
+
+/// If `inner` (the content between `[` and `]`) looks like a confidence
+/// marker — i.e. ends in `NN%` or `NN.NN%` with at least one non-digit
+/// character before it — return the cleaned word part. Otherwise None.
+///
+/// Accepts all of these (canonical + LLM-leaked variants):
+///   "main?60%", "main 60%", "main60%", "main ?60%", "main? 60%",
+///   "main ? 60 %", "main?60.5%", "मैं?47%"
+///
+/// Rejects bracket content that doesn't end in `NN%` or has no word part:
+///   "x", "see [1]", "60%", "%60", "main"
+fn parse_confidence_marker(inner: &str) -> Option<String> {
+    let trimmed = inner.trim_end();
+    // Must end with '%'
+    let without_pct = trimmed.strip_suffix('%')?.trim_end();
+    // Last whitespace-separated number is the percentage. Walk backward
+    // collecting digits, decimal point, and optional sign — until we hit
+    // anything else.
+    let mut split_at = without_pct.len();
+    for (i, ch) in without_pct.char_indices().rev() {
+        if ch.is_ascii_digit() || ch == '.' {
+            split_at = i;
+        } else {
+            break;
+        }
+    }
+    let pct_str = &without_pct[split_at..];
+    if pct_str.is_empty() || pct_str.parse::<f64>().is_err() {
+        return None;
+    }
+    // Word part = everything before the percentage, with any '?' and
+    // surrounding whitespace stripped.
+    let word_part = without_pct[..split_at]
+        .trim_end_matches(|c: char| c == '?' || c.is_whitespace());
+    if word_part.is_empty() {
+        return None;
+    }
+    Some(word_part.to_string())
+}
+
+#[cfg(test)]
+mod scrub_tests {
+    use super::strip_confidence_markers;
+
+    #[test]
+    fn canonical_form_strips_cleanly() {
+        // Form we emit ourselves from STT.
+        assert_eq!(strip_confidence_markers("aaj [kaam?60%] tha"), "aaj kaam tha");
+        assert_eq!(strip_confidence_markers("[main?47%] meeting"), "main meeting");
+    }
+
+    #[test]
+    fn malformed_llm_leaks_get_scrubbed() {
+        // The actual user-reported failure: [main60%] with NO question mark.
+        assert_eq!(strip_confidence_markers("hello [main60%] there"), "hello main there");
+        // Space instead of '?'
+        assert_eq!(strip_confidence_markers("[main 60%] hai"), "main hai");
+        // Both space and '?'
+        assert_eq!(strip_confidence_markers("[main ?60%] hai"), "main hai");
+        assert_eq!(strip_confidence_markers("[main? 60%] hai"), "main hai");
+        // Decimal percentage
+        assert_eq!(strip_confidence_markers("[main?60.5%] hai"), "main hai");
+        // Devanagari word inside marker
+        assert_eq!(strip_confidence_markers("[मैं?47%] tired"), "मैं tired");
+        // Trailing whitespace inside brackets
+        assert_eq!(strip_confidence_markers("[main 60% ] hai"), "main hai");
+    }
+
+    #[test]
+    fn non_marker_brackets_preserved() {
+        // Plain footnote-style — must NOT be scrubbed.
+        assert_eq!(strip_confidence_markers("see [1] for context"), "see [1] for context");
+        assert_eq!(strip_confidence_markers("[note]"),               "[note]");
+        // Bracketed text with no trailing percentage stays.
+        assert_eq!(strip_confidence_markers("[hello world]"),        "[hello world]");
+        // Just a percentage with no word part — keep brackets, not a marker.
+        assert_eq!(strip_confidence_markers("[60%]"),                "[60%]");
+        assert_eq!(strip_confidence_markers("[%60]"),                "[%60]");
+    }
+
+    #[test]
+    fn unclosed_bracket_doesnt_eat_rest_of_string() {
+        // If the bracket never closes, emit it as-is — don't gobble the tail.
+        assert_eq!(strip_confidence_markers("hello [main60% rest"),
+                   "hello [main60% rest");
+    }
+
+    #[test]
+    fn multiple_markers_in_one_string() {
+        assert_eq!(
+            strip_confidence_markers("[hello?80%] [world?70%]"),
+            "hello world",
+        );
+    }
 }
