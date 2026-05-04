@@ -631,6 +631,44 @@ body.statusbar-mode #app {
   animation-delay: 0.24s;
 }
 
+/* Live transcript preview shown inside the recording pill while Deepgram
+   streams interim partials. Stays single-line; long utterances ellipsize on
+   the leading edge so the most-recent words remain visible. */
+.sb-live-text {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  width: 100%;
+  padding: 0 14px;
+  font-size: 13.5px;
+  font-weight: 500;
+  letter-spacing: -0.005em;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  /* Truncate from the start so newly-arriving words stay on screen — mirrors
+     how a typewriter scrolls; head of the sentence drops off if it exceeds
+     the pill width. */
+  direction: rtl;
+  text-align: left;
+}
+
+.sb-live-text__committed,
+.sb-live-text__interim {
+  /* Inner spans flip back to LTR so the actual text isn't reversed; only the
+     overflow direction inherits from the parent. */
+  direction: ltr;
+  unicode-bidi: embed;
+}
+
+.sb-live-text__committed {
+  color: rgba(255, 255, 255, 0.96);
+}
+
+.sb-live-text__interim {
+  color: rgba(255, 255, 255, 0.55);
+}
+
 @keyframes sb-wave {
   0%, 100% { transform: scaleY(0.55); opacity: 0.58; }
   50%      { transform: scaleY(1);    opacity: 1;    }

@@ -18,15 +18,31 @@ type BarState =
 type PillKind = BarState["kind"];
 const BOTTOM_OFFSET = 64;
 
+// Width of the pill while showing live transcript. Fixed (not text-driven) so
+// the window doesn't resize on every interim revision — text overflow is
+// handled by ellipsis via CSS.
+const LIVE_TEXT_PILL_WIDTH = 520;
+const LIVE_TEXT_PILL_HEIGHT = 38;
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function pillSize(kind: PillKind, hovered = false): { width: number; height: number } {
+function pillSize(kind: PillKind, hovered = false, hasLiveText = false): { width: number; height: number } {
   if (kind === "idle") return hovered ? { width: 100, height: 30 } : { width: 72, height: 20 };
-  if (kind === "recording") return { width: 76, height: 26 };
+  if (kind === "recording") {
+    return hasLiveText
+      ? { width: LIVE_TEXT_PILL_WIDTH, height: LIVE_TEXT_PILL_HEIGHT }
+      : { width: 76, height: 26 };
+  }
   if (kind === "processing") return { width: 70, height: 26 };
   if (kind === "manual_paste") return { width: 82, height: 26 };
   if (kind === "error") return { width: 90, height: 26 };
   return { width: 70, height: 26 };
+}
+
+// Strip Deepgram's [word?XX%] confidence markers for display.
+// The markers are useful to the LLM polish stage but noisy in a UI preview.
+function stripConfidenceMarkers(s: string): string {
+  return s.replace(/\[([^?\]]+)\?\d+%\]/g, "$1");
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -34,8 +50,28 @@ function pillSize(kind: PillKind, hovered = false): { width: number; height: num
 export default function StatusBar() {
   const [bar, setBar] = useState<BarState>({ kind: "idle" });
   const [idleHovered, setIdleHovered] = useState(false);
+  // Live transcript pieces emitted by the Deepgram WS streamer:
+  //   committed = concatenation of `voice-segment-final` events (won't revise)
+  //   interim   = latest `voice-interim` event for the in-progress segment
+  // Stored in refs so the WS listeners don't re-trigger the resize effect on
+  // every keystroke; we only resize when the visibility flag flips.
+  const committedRef = useRef<string>("");
+  const interimRef = useRef<string>("");
+  const [liveText, setLiveText] = useState({ committed: "", interim: "" });
   const doneTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const win = getCurrentWindow();
+
+  const resetLiveText = () => {
+    committedRef.current = "";
+    interimRef.current = "";
+    setLiveText({ committed: "", interim: "" });
+  };
+  const pushLiveText = () => {
+    setLiveText({
+      committed: committedRef.current,
+      interim:   interimRef.current,
+    });
+  };
 
   useEffect(() => {
     console.info("[status-bar] mounted", {
@@ -48,9 +84,10 @@ export default function StatusBar() {
 
   // Keep the overlay visible at idle as a tiny reference-style hover pill.
   // Rust owns the native always-on-top behavior; React only changes content.
+  const hasLiveText = liveText.committed.length > 0 || liveText.interim.length > 0;
   useEffect(() => {
     console.info("[status-bar] state", bar);
-    const { width, height } = pillSize(bar.kind, bar.kind === "idle" && idleHovered);
+    const { width, height } = pillSize(bar.kind, bar.kind === "idle" && idleHovered, hasLiveText);
     primaryMonitor()
       .then((monitor) => {
         const scale = monitor?.scaleFactor ?? 1;
@@ -66,7 +103,7 @@ export default function StatusBar() {
       })
       .then(() => console.info("[status-bar] chrome sized", { kind: bar.kind, idleHovered, width, height }))
       .catch((err) => console.warn("[status-bar] chrome size failed", err));
-  }, [bar.kind, idleHovered]);
+  }, [bar.kind, idleHovered, hasLiveText]);
 
   // Seed from current snapshot on mount so we reflect any in-progress state
   useEffect(() => {
@@ -93,6 +130,9 @@ export default function StatusBar() {
       console.info("[status-bar] app-state event", state);
       if (state === "recording") {
         if (doneTimer.current) clearTimeout(doneTimer.current);
+        // New recording — clear any leftover preview from the previous one
+        // before the WS task starts emitting fresh interim updates.
+        resetLiveText();
         setBar({ kind: "recording", startMs: Date.now() });
       } else if (state === "processing") {
         setBar((prev) =>
@@ -115,6 +155,33 @@ export default function StatusBar() {
       console.info("[status-bar] subscribed app-state");
       subs.push(fn);
     }).catch((err) => console.warn("[status-bar] app-state subscribe failed", err));
+
+    // ── Live transcript preview (Deepgram WS interim partials) ─────────────
+    // Updates faster than is_final segments so the user sees text appear as
+    // they speak. Each event replaces the current interim — Deepgram revises
+    // the in-progress segment until it commits via voice-segment-final.
+    listen<{ text: string }>("voice-interim", (e) => {
+      interimRef.current = stripConfidenceMarkers(e.payload.text);
+      pushLiveText();
+    }).then((fn) => {
+      console.info("[status-bar] subscribed voice-interim");
+      subs.push(fn);
+    }).catch((err) => console.warn("[status-bar] voice-interim subscribe failed", err));
+
+    // ── Committed segment from Deepgram (is_final == true) ─────────────────
+    // The text won't revise. Append it to the committed buffer and clear the
+    // interim slot so the next segment's revisions don't visually clobber it.
+    listen<{ text: string; speech_final: boolean }>("voice-segment-final", (e) => {
+      const text = stripConfidenceMarkers(e.payload.text);
+      committedRef.current = committedRef.current
+        ? `${committedRef.current} ${text}`
+        : text;
+      interimRef.current = "";
+      pushLiveText();
+    }).then((fn) => {
+      console.info("[status-bar] subscribed voice-segment-final");
+      subs.push(fn);
+    }).catch((err) => console.warn("[status-bar] voice-segment-final subscribe failed", err));
 
     // ── Sub-phase label updates ────────────────────────────────────────────
     listen<{ phase: string; transcript?: string }>("voice-status", (e) => {
@@ -188,11 +255,23 @@ export default function StatusBar() {
       )}
 
       {bar.kind === "recording" && (
-        <>
-          <span className="sb-rec-wave sb-rec-wave--a" />
-          <span className="sb-rec-wave sb-rec-wave--b" />
-          <span className="sb-rec-wave sb-rec-wave--c" />
-        </>
+        hasLiveText ? (
+          <span className="sb-live-text" aria-live="polite">
+            {liveText.committed && (
+              <span className="sb-live-text__committed">{liveText.committed}</span>
+            )}
+            {liveText.committed && liveText.interim && " "}
+            {liveText.interim && (
+              <span className="sb-live-text__interim">{liveText.interim}</span>
+            )}
+          </span>
+        ) : (
+          <>
+            <span className="sb-rec-wave sb-rec-wave--a" />
+            <span className="sb-rec-wave sb-rec-wave--b" />
+            <span className="sb-rec-wave sb-rec-wave--c" />
+          </>
+        )
       )}
 
       {bar.kind === "processing" && (
