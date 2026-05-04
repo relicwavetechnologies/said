@@ -34,6 +34,7 @@ use crate::{
     llm::{
         classifier, classifier::{EditClass, LabelledHunk},
         edit_diff, edit_diff::Hunk,
+        meaning,
         phonetic_triage, phonetics, pre_filter, promotion_gate,
     },
     store::{
@@ -723,7 +724,7 @@ fn spawn_vocab_embedding(
         let uid       = state.default_user_id.clone();
         let term2     = term.clone();
         let example   = text.clone();
-        tokio::task::spawn_blocking(move || {
+        let blocking  = tokio::task::spawn_blocking(move || {
             // Append this sighting to the per-term FIFO ring (cap N=10) and
             // recompute the centroid. The centroid replaces the legacy
             // single-embedding representation in vocab_embeddings.embedding
@@ -733,6 +734,9 @@ fn spawn_vocab_embedding(
             vocab_embeddings::record_example_and_recentre(
                 &pool, &uid, &term2, &embedding, &example,
             );
+            // Increment the per-term counter so meaning_needs_refresh fires
+            // every K=MEANING_REFRESH_THRESHOLD examples.
+            vocabulary::bump_examples_since_meaning(&pool, &uid, &term2);
             // Diagnostic: log cluster spread so we can see when a term is
             // being used in semantically distinct contexts (future: trigger
             // an auto-split into two prototypes).
@@ -744,6 +748,73 @@ fn spawn_vocab_embedding(
                 );
             }
         });
+        // Wait for centroid + counter persistence before deciding on a
+        // meaning refresh (so meaning_needs_refresh sees the bumped count).
+        let _ = blocking.await;
+        spawn_meaning_refresh(state, term, example_context.unwrap_or_default());
+    });
+}
+
+/// Fire-and-forget: refresh a term's distilled meaning when needed.
+///
+/// Trigger conditions (computed in vocabulary::meaning_needs_refresh):
+///   • meaning is NULL (first time after promotion), OR
+///   • examples_since_meaning ≥ MEANING_REFRESH_THRESHOLD (default 3).
+///
+/// Why fire-and-forget: the Groq call is ~50–200ms and tied to a third-party
+/// API. The vocab term works without a meaning (the polish prompt simply
+/// omits that line); we never want to block the user-visible learning toast
+/// on this. Failures log and degrade gracefully — the next promotion or
+/// refresh tick will retry.
+fn spawn_meaning_refresh(state: AppState, term: String, latest_example: String) {
+    tokio::spawn(async move {
+        let uid  = state.default_user_id.clone();
+        let pool = state.pool.clone();
+
+        // Cheap synchronous gate — most calls exit here without touching Groq.
+        if !vocabulary::meaning_needs_refresh(&pool, &uid, &term) {
+            return;
+        }
+
+        let key = get_prefs(&pool, &uid)
+            .and_then(|p| p.groq_api_key)
+            .or_else(|| std::env::var("GROQ_API_KEY").ok())
+            .unwrap_or_default();
+        if key.is_empty() {
+            // No Groq key — silent skip. Term still works without meaning.
+            return;
+        }
+
+        let current = vocabulary::get_meaning(&pool, &uid, &term);
+        let result = match &current {
+            // First-time generation from the most recently observed example.
+            None => {
+                let example = if latest_example.trim().is_empty() {
+                    term.clone()
+                } else { latest_example.clone() };
+                meaning::generate_initial(&state.http_client, &key, &term, &example).await
+            }
+            // Refinement: hand the LLM the prior description + recent ring.
+            Some(prev) => {
+                let examples = vocab_embeddings::recent_example_texts(
+                    &pool, &uid, &term, 10,
+                );
+                if examples.is_empty() {
+                    None
+                } else {
+                    meaning::refine(&state.http_client, &key, &term, prev, &examples).await
+                }
+            }
+        };
+
+        if let Some(new_meaning) = result {
+            let pool2 = pool.clone();
+            let uid2  = uid.clone();
+            let term2 = term.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                vocabulary::update_meaning(&pool2, &uid2, &term2, &new_meaning);
+            }).await;
+        }
     });
 }
 

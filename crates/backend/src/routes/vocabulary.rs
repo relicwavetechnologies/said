@@ -15,7 +15,11 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::{store::{vocabulary, vocab_embeddings, vocab_fts, prefs::get_prefs, now_ms}, AppState};
+use crate::{store::{
+    vocabulary, vocab_embeddings, vocab_fts,
+    pending_promotions, stt_replacements,
+    prefs::get_prefs, now_ms,
+}, AppState};
 
 // ── GET /v1/vocabulary/terms (hot path) ──────────────────────────────────────
 
@@ -131,13 +135,27 @@ pub async fn delete(
         "DELETE FROM vocabulary WHERE user_id = ?1 AND term = ?2",
         params![state.default_user_id.as_str(), trimmed],
     ).unwrap_or(0);
-    // Cascade-clean both the dense embedding and the FTS row so future
-    // hybrid retrieval doesn't surface a stale match for a term that no
-    // longer exists in vocabulary.
     drop(conn);
+
+    // Cascade-clean every per-term side table. None of these have FK cascades
+    // back to `vocabulary`, so each must be cleared explicitly. Skipping any
+    // one of them leaves a different ghost behaviour:
+    //   • vocab_embeddings    — stale centroid surfaces in dense retrieval
+    //   • vocab_fts           — stale BM25 hit surfaces in lexical gate
+    //   • vocab_embedding_examples — zombie ring resurfaces if term re-added
+    //   • stt_replacements    — pre-polish layer keeps rewriting → canonical
+    //   • pending_promotions  — queued K-event resurrects the deleted term
     vocab_embeddings::delete(&state.pool, &state.default_user_id, trimmed);
     vocab_fts::delete(&state.pool, &state.default_user_id, trimmed);
-    info!("[vocab] delete term={trimmed:?} rows={n}");
+    let stt_n  = stt_replacements::delete_by_correct_form(
+        &state.pool, &state.default_user_id, trimmed,
+    );
+    let pend_n = pending_promotions::delete_all_for_term(
+        &state.pool, &state.default_user_id, trimmed,
+    );
+    info!(
+        "[vocab] delete term={trimmed:?} vocab_rows={n} stt_aliases={stt_n} pending={pend_n}",
+    );
     if n > 0 { StatusCode::NO_CONTENT } else { StatusCode::NOT_FOUND }
 }
 

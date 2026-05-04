@@ -159,6 +159,29 @@ pub fn demote(
     true
 }
 
+/// Drop every alias whose `correct_form` matches the given canonical (case-
+/// insensitive). Called from the vocabulary delete path so a removed vocab
+/// term can no longer fire as a pre-polish substitution. Without this, the
+/// raw STT layer would keep rewriting "main corps" → "MACOBS" even after
+/// the user explicitly deleted MACOBS from their vocabulary.
+///
+/// Returns the number of rows removed (for logging / regression assertions).
+pub fn delete_by_correct_form(pool: &DbPool, user_id: &str, correct_form: &str) -> usize {
+    let Ok(conn) = pool.get() else { return 0; };
+    let canon = correct_form.trim();
+    if canon.is_empty() { return 0; }
+    let n = conn.execute(
+        "DELETE FROM stt_replacements
+          WHERE user_id = ?1
+            AND lower(correct_form) = lower(?2)",
+        params![user_id, canon],
+    ).unwrap_or(0);
+    if n > 0 {
+        info!("[stt-repl] cleared {n} alias(es) pointing at {canon:?}");
+    }
+    n
+}
+
 /// Load all replacements for a user.  Always small (tens of rows); we apply
 /// them in a single linear pass over the transcript.
 pub fn load_all(pool: &DbPool, user_id: &str) -> Vec<SttReplacement> {
@@ -532,6 +555,39 @@ mod tests {
         assert_eq!(n, 1);
         let rules = super::load_all(&pool, "u1");
         assert_eq!(rules.len(), 1);
+    }
+
+    #[test]
+    fn delete_by_correct_form_clears_all_aliases_pointing_at_it() {
+        // Regression: when a user deletes a vocab term, EVERY alias that
+        // would otherwise rewrite raw STT into that canonical must die too.
+        // Without this, the pre-polish layer keeps mapping "main corps" →
+        // "MACOBS" even after MACOBS was explicitly removed from vocab.
+        let pool = mem_pool();
+        super::upsert_aliases(&pool, "u1", "मैं Corps", "Main corps", "MACOBS", 1.0);
+        super::upsert(&pool, "u1", "main corp", "MACOBS", 1.0);
+        // Unrelated alias for a different canonical — must survive.
+        super::upsert(&pool, "u1", "Written", "n8n", 1.0);
+        assert_eq!(super::load_all(&pool, "u1").len(), 4);
+
+        // Case-insensitive on the canonical so `delete("macobs")` still wipes
+        // an alias stored as "MACOBS".
+        let n = super::delete_by_correct_form(&pool, "u1", "macobs");
+        assert_eq!(n, 3, "expected 3 MACOBS aliases removed");
+
+        let remaining = super::load_all(&pool, "u1");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].correct_form, "n8n",
+                   "unrelated alias for n8n must survive");
+    }
+
+    #[test]
+    fn delete_by_correct_form_is_safe_on_no_match() {
+        let pool = mem_pool();
+        super::upsert(&pool, "u1", "Written", "n8n", 1.0);
+        let n = super::delete_by_correct_form(&pool, "u1", "NeverExisted");
+        assert_eq!(n, 0);
+        assert_eq!(super::load_all(&pool, "u1").len(), 1, "unrelated rule untouched");
     }
 
     #[test]

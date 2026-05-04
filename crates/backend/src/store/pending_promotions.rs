@@ -133,6 +133,19 @@ pub fn delete(pool: &DbPool, user_id: &str, correct_form: &str, output_language:
     );
 }
 
+/// Drop EVERY pending row for a `correct_form`, across all languages. Called
+/// from the vocabulary delete path: when a user removes a term explicitly,
+/// any queued promotion sightings for it should die too — otherwise a
+/// future K-event tick could resurrect the deleted term silently.
+pub fn delete_all_for_term(pool: &DbPool, user_id: &str, correct_form: &str) -> usize {
+    let Ok(conn) = pool.get() else { return 0; };
+    conn.execute(
+        "DELETE FROM pending_promotions
+          WHERE user_id = ?1 AND correct_form = ?2",
+        params![user_id, correct_form.trim()],
+    ).unwrap_or(0)
+}
+
 /// Aging: drop pending rows older than `max_age_ms` (e.g. 30 days).  Called
 /// periodically by the route or a background tick.
 pub fn prune_stale(pool: &DbPool, user_id: &str, max_age_ms: i64) -> usize {
@@ -213,6 +226,29 @@ mod tests {
         delete(&p, "u1", "n8n", "english");
         let d = record_sighting(&p, "u1", "n8n", "written", "english", 2).unwrap();
         assert_eq!(d, PromotionDecision::Pending { sighting_count: 1 });
+    }
+
+    #[test]
+    fn delete_all_for_term_wipes_every_language() {
+        // Regression: when the user deletes a vocab term, queued promotion
+        // sightings for that correct_form must die across ALL languages —
+        // otherwise a later K-event in any locale could resurrect the
+        // deleted term silently.
+        let p = mem_pool();
+        record_sighting(&p, "u1", "MACOBS", "main corps", "english",  2).unwrap();
+        record_sighting(&p, "u1", "MACOBS", "main corps", "hinglish", 2).unwrap();
+        record_sighting(&p, "u1", "OTHER",  "uthhrr",     "english",  2).unwrap();
+
+        let n = delete_all_for_term(&p, "u1", "MACOBS");
+        assert_eq!(n, 2, "both MACOBS rows (english + hinglish) removed");
+
+        // Re-sighting MACOBS in either language starts from count=1.
+        let d = record_sighting(&p, "u1", "MACOBS", "main corps", "english", 2).unwrap();
+        assert_eq!(d, PromotionDecision::Pending { sighting_count: 1 });
+        // Unrelated term is untouched.
+        let d2 = record_sighting(&p, "u1", "OTHER", "uthhrr", "english", 2).unwrap();
+        assert_eq!(d2, PromotionDecision::Promote { sighting_count: 2 },
+                   "unrelated pending row must survive");
     }
 
     #[test]

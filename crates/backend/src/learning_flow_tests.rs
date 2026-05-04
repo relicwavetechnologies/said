@@ -29,15 +29,18 @@ fn pool() -> DbPool {
          INSERT INTO local_user(id) VALUES ('u1');
 
          CREATE TABLE vocabulary (
-             user_id          TEXT NOT NULL REFERENCES local_user(id),
-             term             TEXT NOT NULL,
-             weight           REAL NOT NULL DEFAULT 1.0,
-             use_count        INTEGER NOT NULL DEFAULT 1,
-             last_used        INTEGER NOT NULL,
-             source           TEXT NOT NULL DEFAULT 'auto',
-             language         TEXT,
-             example_context  TEXT,
-             term_type        TEXT,
+             user_id                 TEXT NOT NULL REFERENCES local_user(id),
+             term                    TEXT NOT NULL,
+             weight                  REAL NOT NULL DEFAULT 1.0,
+             use_count               INTEGER NOT NULL DEFAULT 1,
+             last_used               INTEGER NOT NULL,
+             source                  TEXT NOT NULL DEFAULT 'auto',
+             language                TEXT,
+             example_context         TEXT,
+             term_type               TEXT,
+             meaning                 TEXT,
+             meaning_updated_at      INTEGER,
+             examples_since_meaning  INTEGER NOT NULL DEFAULT 0,
              UNIQUE(user_id, term)
          );
 

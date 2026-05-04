@@ -172,6 +172,7 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
             term:      v.term.clone(),
             context:   v.example_context.clone(),
             term_type: v.term_type.clone(),
+            meaning:   v.meaning.clone(),
         })
         .collect();
 
@@ -323,6 +324,7 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
                     term:      v.term,
                     context:   v.example_context,
                     term_type: v.term_type,
+                    meaning:   v.meaning,
                 }).collect()
             }
         };

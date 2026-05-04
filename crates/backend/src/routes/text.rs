@@ -122,6 +122,7 @@ pub async fn polish(
                     term:      v.term,
                     context:   v.example_context,
                     term_type: v.term_type,
+                    meaning:   v.meaning,
                 })
                 .collect()
         } else {

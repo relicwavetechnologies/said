@@ -3,6 +3,7 @@ pub mod edit_diff;
 pub mod gateway;
 pub mod gemini_direct;
 pub mod groq;
+pub mod meaning;
 pub mod openai_codex;
 pub mod phonetic_triage;
 pub mod phonetics;

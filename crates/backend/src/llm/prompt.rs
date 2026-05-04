@@ -2,7 +2,7 @@
 //!
 //! Structure (injection-safe: transcript always last, tag-wrapped):
 //!
-//! ```
+//! ```text
 //! <output_language> … enforced script rule … </output_language>
 //! <role> … persona … </role>
 //! <tone> … tone preset … </tone>
@@ -16,29 +16,45 @@
 use crate::store::{corrections::Correction, prefs::Preferences};
 
 /// Render a single vocab entry for the polish prompt. Output shape:
-///   `  MACOBS [acronym] — example: "MACOBS ka IPO ka 12 hazaar batana"`
-///   `  Anish [proper noun] — example: "Anish ne mail bhejna hai"`
-///   `  n8n [code identifier] — example: "I run n8n for automation"`
-///   `  Cloud Code [phrase] — example: "Cloud Code is faster"`
-///   `  TermWithoutContext [other]`
+///   `  MACOBS [acronym]`
+///   `    means: indian SME stock acronym used in market-cap discussions`
+///   `    example: "MACOBS ka IPO ka 12 hazaar batana"`
 ///
-/// The bracketed type tag is what enables type-aware reasoning in the LLM —
-/// e.g. an acronym entry must not match a single common English word.
+/// Three layers of structured signal in one entry:
+///   • The bracketed type tag drives type-aware reasoning (an acronym entry
+///     must not match a single common English word).
+///   • The `means:` line carries the LLM-distilled semantic description,
+///     refined over time. The polish LLM can semantic-align the transcript
+///     context against this instead of inferring from one example.
+///   • The `example:` line preserves a concrete usage shape for the cases
+///     where a semantically-noisy meaning still needs a literal anchor.
+///
+/// All three lines are optional — entries without context, type, or meaning
+/// degrade gracefully (just the term, just the type, etc.).
 fn format_vocab_entry(e: &VocabEntry) -> String {
-    let type_label = match e.term_type.as_deref() {
-        Some("acronym")          => " [acronym]",
-        Some("proper_noun")      => " [proper noun]",
-        Some("brand")            => " [brand]",
-        Some("code_identifier")  => " [code identifier]",
-        Some("phrase")           => " [phrase]",
-        Some("other") | None     => "",            // no signal — render bare
-        Some(other)              => return format!("  {} [{other}]", e.term),
+    let type_label: String = match e.term_type.as_deref() {
+        Some("acronym")          => " [acronym]".into(),
+        Some("proper_noun")      => " [proper noun]".into(),
+        Some("brand")            => " [brand]".into(),
+        Some("code_identifier")  => " [code identifier]".into(),
+        Some("phrase")           => " [phrase]".into(),
+        Some("other") | None     => String::new(), // no signal — render bare
+        Some(other)              => format!(" [{other}]"),
     };
-    match &e.context {
-        Some(ctx) if !ctx.trim().is_empty() =>
-            format!("  {}{type_label} — example: \"{}\"", e.term, ctx.trim()),
-        _ => format!("  {}{type_label}", e.term),
+    let mut out = format!("  {}{type_label}", e.term);
+    if let Some(m) = &e.meaning {
+        let m = m.trim();
+        if !m.is_empty() {
+            out.push_str(&format!("\n    means: {m}"));
+        }
     }
+    if let Some(ctx) = &e.context {
+        let ctx = ctx.trim();
+        if !ctx.is_empty() {
+            out.push_str(&format!("\n    example: \"{ctx}\""));
+        }
+    }
+    out
 }
 
 pub struct RagExample {
@@ -63,11 +79,24 @@ pub struct VocabEntry {
     /// signals (an acronym entry should not match a common single word)
     /// instead of needing hardcoded exception lists.
     pub term_type: Option<String>,
+    /// LLM-distilled 1-2 sentence description of what the term refers to
+    /// and the contexts it appears in, refined over time as more examples
+    /// accumulate. When present, the polish prompt surfaces it so the LLM
+    /// can do semantic alignment (does the transcript context match this
+    /// term's meaning?) instead of inferring from a single example. None
+    /// when meaning hasn't been generated yet — entry still renders, just
+    /// without the meaning line.
+    pub meaning:   Option<String>,
 }
 
 impl VocabEntry {
     pub fn from_term(term: impl Into<String>) -> Self {
-        Self { term: term.into(), context: None, term_type: None }
+        Self {
+            term:      term.into(),
+            context:   None,
+            term_type: None,
+            meaning:   None,
+        }
     }
 }
 
@@ -145,12 +174,13 @@ pub fn build_system_prompt_with_vocab_entries(
             .join("\n");
         format!(
             "<personal_vocabulary>\n\
-             User's personal terms. If a transcript phrase matches a term \
-             verbatim, KEEP the canonical spelling. If a phrase is phonetically \
-             similar to a term AND the surrounding context resembles the term's \
-             example, replace it with the canonical. If type doesn't fit (e.g. \
-             a single common word is never compatible with an acronym entry), \
-             leave the transcript unchanged.\n\n\
+             User's personal terms. Each entry has a type tag, an optional \
+             `means:` line (what the term refers to), and an optional `example:` \
+             line. Replace a transcript phrase with the canonical spelling ONLY \
+             when ALL THREE align: type fits (an acronym entry is incompatible \
+             with a single common word), the surrounding transcript topic matches \
+             the `means:` description, and the phrase is verbatim or phonetically \
+             close. When any layer disagrees, leave the transcript unchanged.\n\n\
              {table}\n\
              </personal_vocabulary>\n\n"
         )
@@ -420,9 +450,11 @@ mod tests {
         assert!(prompt.contains("<personal_vocabulary>"), "vocab block should be emitted");
         assert!(prompt.contains("n8n"));
         assert!(prompt.contains("Vipassana"));
-        // Compact form: the "KEEP the canonical spelling" rule appears.
-        assert!(prompt.contains("KEEP the canonical"),
-                "verbatim-keep instruction should appear in compact form");
+        // Compact form: the canonical-spelling rule appears (now phrased as
+        // "Replace ... with the canonical spelling ONLY when ALL THREE align"
+        // since the three-layer matching upgrade — lexical + type + meaning).
+        assert!(prompt.contains("canonical spelling"),
+                "canonical-spelling instruction should appear in compact form");
         // The vocab block should NOT contain the verbose multi-rule form
         // that caused duplicate-output regressions.
         assert!(!prompt.contains("**Verbatim match**"),
@@ -455,6 +487,7 @@ mod tests {
             term:      "MACOBS".into(),
             context:   Some("MACOBS ka IPO".into()),
             term_type: Some("acronym".into()),
+            meaning:   None,
         }];
         let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
 
@@ -508,17 +541,20 @@ mod tests {
     fn vocab_block_renders_type_tag_per_entry() {
         let p = prefs();
         let entries = vec![
-            VocabEntry { term: "MACOBS".into(),     context: Some("MACOBS ka IPO".into()),     term_type: Some("acronym".into()) },
-            VocabEntry { term: "Anish".into(),      context: None,                              term_type: Some("proper_noun".into()) },
-            VocabEntry { term: "n8n".into(),        context: Some("I run n8n".into()),         term_type: Some("code_identifier".into()) },
-            VocabEntry { term: "ClaudeCode".into(), context: None,                              term_type: Some("brand".into()) },
-            VocabEntry { term: "Cloud Code".into(), context: None,                              term_type: Some("phrase".into()) },
-            VocabEntry { term: "weird".into(),      context: None,                              term_type: Some("other".into()) },
+            VocabEntry { term: "MACOBS".into(),     context: Some("MACOBS ka IPO".into()),     term_type: Some("acronym".into()),         meaning: None },
+            VocabEntry { term: "Anish".into(),      context: None,                              term_type: Some("proper_noun".into()),     meaning: None },
+            VocabEntry { term: "n8n".into(),        context: Some("I run n8n".into()),         term_type: Some("code_identifier".into()), meaning: None },
+            VocabEntry { term: "ClaudeCode".into(), context: None,                              term_type: Some("brand".into()),           meaning: None },
+            VocabEntry { term: "Cloud Code".into(), context: None,                              term_type: Some("phrase".into()),          meaning: None },
+            VocabEntry { term: "weird".into(),      context: None,                              term_type: Some("other".into()),           meaning: None },
         ];
         let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
-        assert!(prompt.contains("MACOBS [acronym] — example: \"MACOBS ka IPO\""));
+        // Multi-line entry shape: "  TERM [type]\n    example: \"...\""
+        assert!(prompt.contains("MACOBS [acronym]"));
+        assert!(prompt.contains("example: \"MACOBS ka IPO\""));
         assert!(prompt.contains("Anish [proper noun]"));
-        assert!(prompt.contains("n8n [code identifier] — example: \"I run n8n\""));
+        assert!(prompt.contains("n8n [code identifier]"));
+        assert!(prompt.contains("example: \"I run n8n\""));
         assert!(prompt.contains("ClaudeCode [brand]"));
         assert!(prompt.contains("Cloud Code [phrase]"));
         // "other" type means no signal — render bare without a tag.
@@ -537,18 +573,75 @@ mod tests {
                 term:      "MACOBS".into(),
                 context:   Some("MACOBS ka IPO ka 12 hazaar batana".into()),
                 term_type: None,
+                meaning:   None,
             },
             VocabEntry {
                 term:      "n8n".into(),
                 context:   None,
                 term_type: None,
+                meaning:   None,
             },
         ];
         let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
-        assert!(prompt.contains("MACOBS — example: \"MACOBS ka IPO ka 12 hazaar batana\""),
-                "entry without type tag should still render context");
+        // No type tag, with context — `  TERM\n    example: "..."`
+        assert!(prompt.contains("  MACOBS\n    example: \"MACOBS ka IPO ka 12 hazaar batana\""),
+                "entry without type tag should still render context on its own line");
         assert!(prompt.contains("  n8n\n"),
                 "bare entry should render just the term");
+    }
+
+    #[test]
+    fn vocab_entry_renders_meaning_line_when_present() {
+        // Foundational: when the term has a stored meaning, the polish prompt
+        // must surface it as a `means:` line so the LLM can do semantic
+        // alignment between the transcript context and the term's distilled
+        // description. This is the third matching layer (alongside lexical
+        // gate + type signal) — without it we'd be back to inferring meaning
+        // from one example each call.
+        let p = prefs();
+        let entries = vec![VocabEntry {
+            term:      "MACOBS".into(),
+            context:   Some("MACOBS ka IPO".into()),
+            term_type: Some("acronym".into()),
+            meaning:   Some(
+                "Indian SME stock acronym used in market-cap discussions.".into(),
+            ),
+        }];
+        let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
+        assert!(prompt.contains("MACOBS [acronym]"),
+                "term + type tag still render");
+        assert!(
+            prompt.contains("means: Indian SME stock acronym used in market-cap discussions."),
+            "meaning surfaces as a `means:` line",
+        );
+        assert!(prompt.contains("example: \"MACOBS ka IPO\""),
+                "example still renders alongside meaning");
+        // The block-level instruction must mention semantic alignment, not
+        // just type compatibility — that's the upgrade.
+        assert!(prompt.contains("means:"),
+                "vocab block instructions reference the means: layer");
+    }
+
+    #[test]
+    fn vocab_entry_omits_meaning_when_absent() {
+        // When meaning is None the entry must still render cleanly — the
+        // `means:` line is suppressed (we never emit `means:` followed by
+        // empty content) and the rest of the entry is unchanged.
+        let p = prefs();
+        let entries = vec![VocabEntry {
+            term:      "Anish".into(),
+            context:   None,
+            term_type: Some("proper_noun".into()),
+            meaning:   None,
+        }];
+        let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
+        assert!(prompt.contains("Anish [proper noun]"));
+        // No phantom `means:` line for entries without one.
+        let count_means = prompt.matches("means:").count();
+        // The block-level instructions reference `means:` exactly twice (the
+        // structural rule) — but no per-entry rendering.
+        assert!(count_means <= 2,
+                "no per-entry `means:` line should be emitted when meaning is None ({count_means} found)");
     }
 
     #[test]

@@ -31,6 +31,7 @@ struct VocabRow {
     source:          String,
     example_context: Option<String>,
     term_type:       Option<String>,
+    meaning:         Option<String>,
 }
 
 impl VocabRow {
@@ -43,6 +44,7 @@ impl VocabRow {
             source:          self.source,
             example_context: self.example_context,
             term_type:       self.term_type,
+            meaning:         self.meaning,
         }
     }
 }
@@ -162,6 +164,31 @@ pub fn cluster_spread(pool: &DbPool, user_id: &str, term: &str) -> f32 {
     (1.0 - mean_sim).max(0.0)
 }
 
+/// Load the most-recent example texts for a (user, term), newest first,
+/// capped at `limit`. Used by the meaning-refinement path so the LLM can
+/// re-distill the term's description from its current usage cloud.
+pub fn recent_example_texts(
+    pool:    &DbPool,
+    user_id: &str,
+    term:    &str,
+    limit:   usize,
+) -> Vec<String> {
+    let Ok(conn) = pool.get() else { return vec![]; };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT example_text FROM vocab_embedding_examples
+          WHERE user_id = ?1 AND term = ?2
+          ORDER BY recorded_at DESC
+          LIMIT ?3",
+    ) else { return vec![]; };
+    stmt.query_map(
+        params![user_id, term.trim(), limit as i64],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
+
 /// Bump `last_used` on a set of vocab terms — called after polish completes
 /// so terms that actually appeared in the prompt get reinforced. This is
 /// the "use signal" half of the time-decay scoring (the other half is the
@@ -266,13 +293,23 @@ fn use_count_factor(use_count: i64) -> f32 {
     (1.0 + use_count.max(0) as f32).ln() + 1.0
 }
 
-/// Remove an embedding when its parent term is deleted from `vocabulary`.
+/// Remove a term's centroid AND its FIFO ring of example embeddings.
 /// Called by the vocabulary delete path; safe to call when no row exists.
+///
+/// Why both: `vocab_embedding_examples` has no FK cascade to `vocabulary`.
+/// Without explicit cleanup, deleting a term leaves 1–10 orphan ring rows
+/// behind. If the user later re-adds the same term, those zombie rows
+/// would resurface in the centroid recompute as ghost sightings.
 pub fn delete(pool: &DbPool, user_id: &str, term: &str) {
     let Ok(conn) = pool.get() else { return; };
+    let term_trim = term.trim();
     let _ = conn.execute(
         "DELETE FROM vocab_embeddings WHERE user_id = ?1 AND term = ?2",
-        params![user_id, term.trim()],
+        params![user_id, term_trim],
+    );
+    let _ = conn.execute(
+        "DELETE FROM vocab_embedding_examples WHERE user_id = ?1 AND term = ?2",
+        params![user_id, term_trim],
     );
 }
 
@@ -296,7 +333,7 @@ pub fn top_k_relevant(
 
     let mut stmt = match conn.prepare(
         "SELECT v.term, ve.embedding, v.weight, v.use_count, v.last_used,
-                v.source, v.example_context, v.term_type
+                v.source, v.example_context, v.term_type, v.meaning
            FROM vocab_embeddings ve
            JOIN vocabulary v
              ON v.user_id = ve.user_id AND v.term = ve.term
@@ -318,12 +355,13 @@ pub fn top_k_relevant(
             row.get::<_, String>(5)?,
             row.get::<_, Option<String>>(6)?,
             row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(8)?,
         ))
     })
     .ok()
     .map(|iter| {
         iter.filter_map(|r| r.ok())
-            .filter_map(|(term, blob, weight, uc, lu, src, ctx, ty)| {
+            .filter_map(|(term, blob, weight, uc, lu, src, ctx, ty, mn)| {
                 blob_to_floats(&blob).map(|embedding| VocabRow {
                     term,
                     embedding,
@@ -333,6 +371,7 @@ pub fn top_k_relevant(
                     source: src,
                     example_context: ctx,
                     term_type: ty,
+                    meaning: mn,
                 })
             })
             .collect()
@@ -616,15 +655,18 @@ mod tests {
             "CREATE TABLE local_user (id TEXT PRIMARY KEY);
              INSERT INTO local_user(id) VALUES ('u1');
              CREATE TABLE vocabulary (
-                 user_id          TEXT NOT NULL REFERENCES local_user(id),
-                 term             TEXT NOT NULL,
-                 weight           REAL NOT NULL DEFAULT 1.0,
-                 use_count        INTEGER NOT NULL DEFAULT 1,
-                 last_used        INTEGER NOT NULL,
-                 source           TEXT NOT NULL DEFAULT 'auto',
-                 language         TEXT,
-                 example_context  TEXT,
-                 term_type        TEXT,
+                 user_id                 TEXT NOT NULL REFERENCES local_user(id),
+                 term                    TEXT NOT NULL,
+                 weight                  REAL NOT NULL DEFAULT 1.0,
+                 use_count               INTEGER NOT NULL DEFAULT 1,
+                 last_used               INTEGER NOT NULL,
+                 source                  TEXT NOT NULL DEFAULT 'auto',
+                 language                TEXT,
+                 example_context         TEXT,
+                 term_type               TEXT,
+                 meaning                 TEXT,
+                 meaning_updated_at      INTEGER,
+                 examples_since_meaning  INTEGER NOT NULL DEFAULT 0,
                  UNIQUE(user_id, term)
              );
              CREATE TABLE vocab_embeddings (
@@ -872,6 +914,28 @@ mod tests {
         seed(&pool, "TERM", 1.0, "auto", &vec4(1.0, 0.0, 0.0, 0.0), "english");
         delete(&pool, "u1", "TERM");
         assert!(top_k_relevant(&pool, "u1", &vec4(1.0, 0.0, 0.0, 0.0), "english", 5, 0.0).is_empty());
+    }
+
+    #[test]
+    fn delete_also_clears_examples_ring() {
+        // Regression: deleting a vocab term used to leak its FIFO ring of
+        // example embeddings (no FK cascade from vocabulary). Re-adding the
+        // same term later would resurrect those rows in the centroid
+        // recompute. delete() must wipe both the centroid and the ring.
+        let pool = mem_pool();
+        seed(&pool, "TERM", 1.0, "auto", &vec4(1.0, 0.0, 0.0, 0.0), "english");
+        record_example_and_recentre(&pool, "u1", "TERM", &unit(vec![1.0, 0.0, 0.0, 0.0]), "ex1");
+        record_example_and_recentre(&pool, "u1", "TERM", &unit(vec![0.0, 1.0, 0.0, 0.0]), "ex2");
+
+        delete(&pool, "u1", "TERM");
+
+        let conn = pool.get().unwrap();
+        let ring_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM vocab_embedding_examples WHERE user_id='u1' AND term='TERM'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(ring_count, 0,
+                   "examples ring must be cleared on term delete (no zombie sightings)");
     }
 
     #[test]
