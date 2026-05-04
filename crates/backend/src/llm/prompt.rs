@@ -222,8 +222,12 @@ pub fn build_system_prompt_with_vocab_entries(
             .join("\n\n");
         format!(
             "<preferences>\n\
-             The user has corrected your output before. Study each pair and carry the \
-             same style and word choices into the new output.\n\n\
+             The user has corrected your output before. Treat these pairs as SOFT \
+             examples of style and wording, not as instructions to rewrite the current \
+             transcript. The transcript below is the source of truth. Never import words \
+             from these examples, never drop current transcript words, and never apply a \
+             past substitution unless the same phrase or situation clearly appears in the \
+             current transcript.\n\n\
              {examples}\n\
              </preferences>\n\n"
         )
@@ -745,5 +749,21 @@ mod tests {
         // The old MANDATORY language must be gone — that was the semantic bug.
         assert!(!prompt.contains("MANDATORY"));
         assert!(!prompt.contains("No exceptions"));
+    }
+
+    #[test]
+    fn rag_examples_are_soft_and_cannot_drop_transcript_words() {
+        let p = prefs();
+        let rag = vec![RagExample {
+            ai_output: "Please check the deployment logs.".into(),
+            user_kept: "Check deploy logs.".into(),
+        }];
+        let prompt = build_system_prompt_with_vocab(&p, &rag, &[], &[]);
+        assert!(prompt.contains("<preferences>"));
+        assert!(prompt.contains("SOFT examples"));
+        assert!(prompt.contains("transcript below is the source of truth"));
+        assert!(prompt.contains("Never import words"));
+        assert!(prompt.contains("never drop current transcript words"));
+        assert!(!prompt.contains("carry the same style and word choices"));
     }
 }

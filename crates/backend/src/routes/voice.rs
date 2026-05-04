@@ -163,18 +163,7 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
     // most-trusted slate).
     let vocab_terms: Vec<String> = vocab_full.iter().map(|v| v.term.clone()).collect();
     // The polish-prompt vocab slice is computed below, AFTER the transcript
-    // embedding lands, so we can do relevance retrieval. Reserve the binding
-    // here so the existing build_system_prompt_with_vocab_entries call site
-    // doesn't need to move.
-    let vocab_entries_pre: Vec<VocabEntry> = vocab_full
-        .iter()
-        .map(|v| VocabEntry {
-            term:      v.term.clone(),
-            context:   v.example_context.clone(),
-            term_type: v.term_type.clone(),
-            meaning:   v.meaning.clone(),
-        })
-        .collect();
+    // embedding lands, so we can do relevance retrieval.
 
     // ── Build SSE stream ───────────────────────────────────────────────────────
     let audio_id_ref = saved_audio_id.clone();
@@ -312,11 +301,15 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
                 )
             }).await.unwrap_or_default();
             if chosen.is_empty() {
-                // Fresh install / no embeddings yet — fall back to the full
-                // pre-computed slate so existing users aren't degraded.
-                info!("[voice] vocab selector empty — using full slate ({} entries)",
-                      vocab_entries_pre.len());
-                vocab_entries_pre.clone()
+                // Empty is a meaningful result when a transcript was passed:
+                // there was no lexical evidence that any vocab term applied.
+                // Do not fall back to the full slate; that reintroduces
+                // over-replacement from unrelated learned terms.
+                info!(
+                    "[voice] vocab selector picked 0/{} entries — no transcript evidence",
+                    vocab_full.len(),
+                );
+                vec![]
             } else {
                 info!("[voice] vocab selector picked {}/{} entries (relevance-aware)",
                       chosen.len(), vocab_full.len());
