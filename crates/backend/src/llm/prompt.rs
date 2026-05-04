@@ -62,6 +62,12 @@ pub struct RagExample {
     pub user_kept: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VocabResolution {
+    Candidate,
+    Resolved,
+}
+
 /// One vocabulary entry as fed to the polish prompt. Carries the canonical
 /// term and (optionally) an example sentence the term was first observed
 /// in. The example is what enables context-aware recognition of unseen STT
@@ -73,6 +79,7 @@ pub struct RagExample {
 pub struct VocabEntry {
     pub term: String,
     pub context: Option<String>,
+    pub resolution: VocabResolution,
     /// Lexical-shape classification ("acronym" / "proper_noun" / "brand" /
     /// "code_identifier" / "phrase" / "other"). Used by the polish prompt
     /// to render structured, type-aware entries so the LLM can reason from
@@ -94,6 +101,7 @@ impl VocabEntry {
         Self {
             term: term.into(),
             context: None,
+            resolution: VocabResolution::Candidate,
             term_type: None,
             meaning: None,
         }
@@ -106,6 +114,20 @@ pub fn vocab_terms_to_entries(terms: Vec<VocabTerm>) -> Vec<VocabEntry> {
         .map(|v| VocabEntry {
             term: v.term,
             context: v.example_context,
+            resolution: VocabResolution::Candidate,
+            term_type: v.term_type,
+            meaning: v.meaning,
+        })
+        .collect()
+}
+
+pub fn resolved_vocab_terms_to_entries(terms: Vec<VocabTerm>) -> Vec<VocabEntry> {
+    terms
+        .into_iter()
+        .map(|v| VocabEntry {
+            term: v.term,
+            context: v.example_context,
+            resolution: VocabResolution::Resolved,
             term_type: v.term_type,
             meaning: v.meaning,
         })
@@ -179,24 +201,41 @@ pub fn build_system_prompt_with_vocab_entries(
     let vocab_block = if vocabulary_entries.is_empty() {
         String::new()
     } else {
-        let table = vocabulary_entries
+        let resolved = vocabulary_entries
             .iter()
+            .filter(|e| e.resolution == VocabResolution::Resolved)
             .map(format_vocab_entry)
             .collect::<Vec<_>>()
             .join("\n");
+        let candidates = vocabulary_entries
+            .iter()
+            .filter(|e| e.resolution == VocabResolution::Candidate)
+            .map(format_vocab_entry)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let resolved_block = if resolved.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Confirmed terms already resolved by deterministic matching. Keep them exactly as written and do not rewrite away from them.\n\
+                 {resolved}\n\n"
+            )
+        };
+        let candidate_block = if candidates.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Candidate terms below are NOT resolved yet. Consider a candidate's canonical spelling only when the phrase is phonetically close and the type + `means:` + `example:` signals all agree. An acronym entry should still look acronym-like; a proper noun entry should still sound name-like.\n\
+                 {candidates}\n"
+            )
+        };
         format!(
             "<personal_vocabulary>\n\
              User's personal terms. Each entry has a type tag, an optional \
              `means:` line (what the term refers to), and an optional `example:` \
-             line. Replace a transcript phrase with the canonical spelling ONLY \
-             when ALL THREE align: the phrase is verbatim or phonetically close, \
-             type fits (an acronym entry is incompatible with a single common \
-             word), and the surrounding transcript topic matches the `means:` \
-             description. That meaning line is a confirmation layer, never a rescue layer \
-             - do not replace a generic word with a vocab term from semantic \
-             similarity alone. When any layer disagrees, leave the transcript \
-             unchanged.\n\n\
-             {table}\n\
+             line. `means:` is a confirmation layer, never a rescue layer.\n\n\
+             {resolved_block}\
+             {candidate_block}\
              </personal_vocabulary>\n\n"
         )
     };
@@ -270,8 +309,8 @@ pub fn build_system_prompt_with_vocab_entries(
          Don't convert in plain prose (\"growing at the rate of 10%\" stays as-is).\n\n\
          RULES:\n\
          1. Vocabulary terms in <personal_vocabulary> (if present) are precision hints. \
-         Keep an exact vocab term verbatim. Replace another transcript token with a vocab \
-         term only when it is phonetically close and the type + meaning checks also agree.\n\
+         Preserve confirmed terms exactly. For unresolved candidates, replace another transcript \
+         token only when it is phonetically close and the type + meaning + example checks also agree.\n\
          2. Preserve every content word. Remove ONLY fillers (um, uh, hmm, like, you know, \
          basically, matlab, toh, yaani, bas) and stuttered repetitions (\"the the cat\" → \"the cat\"). \
          Do NOT drop names, numbers, dates, jargon, adjectives, adverbs.\n\
@@ -505,6 +544,7 @@ mod tests {
         let entries = vec![VocabEntry {
             term: "MACOBS".into(),
             context: Some("MACOBS ka IPO".into()),
+            resolution: VocabResolution::Candidate,
             term_type: Some("acronym".into()),
             meaning: None,
         }];
@@ -536,6 +576,39 @@ mod tests {
             prompt.contains("never a rescue layer"),
             "semantic meaning must be constrained as confirmation, not expansion"
         );
+    }
+
+    #[test]
+    fn resolved_terms_render_in_preserve_only_section() {
+        let p = prefs();
+        let entries = vec![VocabEntry {
+            term: "MACOBS".into(),
+            context: Some("MACOBS ka IPO".into()),
+            resolution: VocabResolution::Resolved,
+            term_type: Some("acronym".into()),
+            meaning: Some("Indian SME stock acronym.".into()),
+        }];
+        let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
+        assert!(prompt.contains("Confirmed terms already resolved by deterministic matching"));
+        assert!(prompt.contains("Keep them exactly as written"));
+        assert!(prompt.contains("MACOBS [acronym]"));
+        assert!(!prompt.contains("Candidate terms below are NOT resolved yet.\n  MACOBS"));
+    }
+
+    #[test]
+    fn candidate_terms_render_in_confirm_only_section() {
+        let p = prefs();
+        let entries = vec![VocabEntry {
+            term: "n8n".into(),
+            context: Some("I run n8n for automations".into()),
+            resolution: VocabResolution::Candidate,
+            term_type: Some("code_identifier".into()),
+            meaning: Some("Workflow automation tool.".into()),
+        }];
+        let prompt = build_system_prompt_with_vocab_entries(&p, &[], &[], &entries);
+        assert!(prompt.contains("Candidate terms below are NOT resolved yet"));
+        assert!(prompt.contains("canonical spelling only when the phrase is phonetically close"));
+        assert!(prompt.contains("n8n [code identifier]"));
     }
 
     #[test]
@@ -585,36 +658,42 @@ mod tests {
             VocabEntry {
                 term: "MACOBS".into(),
                 context: Some("MACOBS ka IPO".into()),
+                resolution: VocabResolution::Candidate,
                 term_type: Some("acronym".into()),
                 meaning: None,
             },
             VocabEntry {
                 term: "Anish".into(),
                 context: None,
+                resolution: VocabResolution::Candidate,
                 term_type: Some("proper_noun".into()),
                 meaning: None,
             },
             VocabEntry {
                 term: "n8n".into(),
                 context: Some("I run n8n".into()),
+                resolution: VocabResolution::Candidate,
                 term_type: Some("code_identifier".into()),
                 meaning: None,
             },
             VocabEntry {
                 term: "ClaudeCode".into(),
                 context: None,
+                resolution: VocabResolution::Candidate,
                 term_type: Some("brand".into()),
                 meaning: None,
             },
             VocabEntry {
                 term: "Cloud Code".into(),
                 context: None,
+                resolution: VocabResolution::Candidate,
                 term_type: Some("phrase".into()),
                 meaning: None,
             },
             VocabEntry {
                 term: "weird".into(),
                 context: None,
+                resolution: VocabResolution::Candidate,
                 term_type: Some("other".into()),
                 meaning: None,
             },
@@ -643,12 +722,14 @@ mod tests {
             VocabEntry {
                 term: "MACOBS".into(),
                 context: Some("MACOBS ka IPO ka 12 hazaar batana".into()),
+                resolution: VocabResolution::Candidate,
                 term_type: None,
                 meaning: None,
             },
             VocabEntry {
                 term: "n8n".into(),
                 context: None,
+                resolution: VocabResolution::Candidate,
                 term_type: None,
                 meaning: None,
             },
@@ -677,6 +758,7 @@ mod tests {
         let entries = vec![VocabEntry {
             term: "MACOBS".into(),
             context: Some("MACOBS ka IPO".into()),
+            resolution: VocabResolution::Candidate,
             term_type: Some("acronym".into()),
             meaning: Some("Indian SME stock acronym used in market-cap discussions.".into()),
         }];
@@ -710,6 +792,7 @@ mod tests {
         let entries = vec![VocabEntry {
             term: "Anish".into(),
             context: None,
+            resolution: VocabResolution::Candidate,
             term_type: Some("proper_noun".into()),
             meaning: None,
         }];
@@ -720,7 +803,7 @@ mod tests {
         // The block-level instructions reference `means:` exactly twice (the
         // structural rule) — but no per-entry rendering.
         assert!(
-            count_means <= 2,
+            count_means <= 3,
             "no per-entry `means:` line should be emitted when meaning is None ({count_means} found)"
         );
     }

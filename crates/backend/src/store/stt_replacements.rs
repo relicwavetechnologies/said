@@ -16,17 +16,36 @@ use rusqlite::params;
 use serde::Serialize;
 use tracing::info;
 
+use super::{DbPool, now_ms};
 use crate::llm::phonetics;
-use super::{now_ms, DbPool};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SttReplacement {
     pub transcript_form: String,
-    pub correct_form:    String,
-    pub phonetic_key:    String,
-    pub weight:          f64,
-    pub use_count:       i64,
-    pub last_used:       i64,
+    pub correct_form: String,
+    pub phonetic_key: String,
+    pub weight: f64,
+    pub use_count: i64,
+    pub last_used: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchKind {
+    Exact,
+    Phonetic,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedMatch {
+    pub transcript_form: String,
+    pub correct_form: String,
+    pub kind: MatchKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyResult {
+    pub text: String,
+    pub matches: Vec<AppliedMatch>,
 }
 
 /// Upsert a (transcript_form → correct_form) replacement rule.
@@ -48,18 +67,18 @@ pub struct SttReplacement {
 /// list, no fragmenting heuristic — just learn the actual STT output shape
 /// and match against it directly.
 pub fn upsert(
-    pool:            &DbPool,
-    user_id:         &str,
+    pool: &DbPool,
+    user_id: &str,
     transcript_form: &str,
-    correct_form:    &str,
-    bump:            f64,
+    correct_form: &str,
+    bump: f64,
 ) -> bool {
     let conn = match pool.get() {
         Ok(c) => c,
         Err(_) => return false,
     };
     let from = transcript_form.trim().to_ascii_lowercase();
-    let to   = correct_form.trim().to_string();
+    let to = correct_form.trim().to_string();
     if from.is_empty() || to.is_empty() {
         return false;
     }
@@ -69,16 +88,18 @@ pub fn upsert(
     }
     let key = phonetics::phonetic_key(&from);
     let now = now_ms();
-    let rows = conn.execute(
-        "INSERT INTO stt_replacements
+    let rows = conn
+        .execute(
+            "INSERT INTO stt_replacements
             (user_id, transcript_form, correct_form, phonetic_key, weight, use_count, last_used)
          VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)
          ON CONFLICT(user_id, transcript_form, correct_form) DO UPDATE SET
             weight    = MIN(5.0, weight + ?5),
             use_count = use_count + 1,
             last_used = excluded.last_used",
-        params![user_id, from, to, key, bump, now],
-    ).unwrap_or(0);
+            params![user_id, from, to, key, bump, now],
+        )
+        .unwrap_or(0);
 
     info!("[stt-repl] upsert {from:?} → {to:?} (key={key}, bump={bump}, rows={rows})");
     rows > 0
@@ -104,16 +125,15 @@ pub fn upsert(
 /// `transcript_window` may be empty (positional alignment failed in the
 /// diff stage) — we just skip it in that case.
 pub fn upsert_aliases(
-    pool:              &DbPool,
-    user_id:           &str,
+    pool: &DbPool,
+    user_id: &str,
     transcript_window: &str,
-    polish_window:     &str,
-    correct_form:      &str,
-    bump:              f64,
+    polish_window: &str,
+    correct_form: &str,
+    bump: f64,
 ) -> usize {
     let mut written = 0;
-    if !polish_window.trim().is_empty()
-        && upsert(pool, user_id, polish_window, correct_form, bump)
+    if !polish_window.trim().is_empty() && upsert(pool, user_id, polish_window, correct_form, bump)
     {
         written += 1;
     }
@@ -128,27 +148,31 @@ pub fn upsert_aliases(
 
 /// Decrement weight on revert; delete when ≤ 0.
 pub fn demote(
-    pool:            &DbPool,
-    user_id:         &str,
+    pool: &DbPool,
+    user_id: &str,
     transcript_form: &str,
-    correct_form:    &str,
-    penalty:         f64,
+    correct_form: &str,
+    penalty: f64,
 ) -> bool {
     let conn = match pool.get() {
         Ok(c) => c,
         Err(_) => return false,
     };
     let from = transcript_form.trim().to_ascii_lowercase();
-    let to   = correct_form.trim();
+    let to = correct_form.trim();
     if from.is_empty() || to.is_empty() {
         return false;
     }
-    let updated = conn.execute(
-        "UPDATE stt_replacements SET weight = weight - ?3
+    let updated = conn
+        .execute(
+            "UPDATE stt_replacements SET weight = weight - ?3
            WHERE user_id = ?1 AND transcript_form = ?2 AND correct_form = ?4",
-        params![user_id, from, penalty, to],
-    ).unwrap_or(0);
-    if updated == 0 { return false; }
+            params![user_id, from, penalty, to],
+        )
+        .unwrap_or(0);
+    if updated == 0 {
+        return false;
+    }
 
     let _ = conn.execute(
         "DELETE FROM stt_replacements
@@ -167,15 +191,21 @@ pub fn demote(
 ///
 /// Returns the number of rows removed (for logging / regression assertions).
 pub fn delete_by_correct_form(pool: &DbPool, user_id: &str, correct_form: &str) -> usize {
-    let Ok(conn) = pool.get() else { return 0; };
+    let Ok(conn) = pool.get() else {
+        return 0;
+    };
     let canon = correct_form.trim();
-    if canon.is_empty() { return 0; }
-    let n = conn.execute(
-        "DELETE FROM stt_replacements
+    if canon.is_empty() {
+        return 0;
+    }
+    let n = conn
+        .execute(
+            "DELETE FROM stt_replacements
           WHERE user_id = ?1
             AND lower(correct_form) = lower(?2)",
-        params![user_id, canon],
-    ).unwrap_or(0);
+            params![user_id, canon],
+        )
+        .unwrap_or(0);
     if n > 0 {
         info!("[stt-repl] cleared {n} alias(es) pointing at {canon:?}");
     }
@@ -201,11 +231,11 @@ pub fn load_all(pool: &DbPool, user_id: &str) -> Vec<SttReplacement> {
     stmt.query_map(params![user_id], |row| {
         Ok(SttReplacement {
             transcript_form: row.get(0)?,
-            correct_form:    row.get(1)?,
-            phonetic_key:    row.get(2)?,
-            weight:          row.get(3)?,
-            use_count:       row.get(4)?,
-            last_used:       row.get(5)?,
+            correct_form: row.get(1)?,
+            phonetic_key: row.get(2)?,
+            weight: row.get(3)?,
+            use_count: row.get(4)?,
+            last_used: row.get(5)?,
         })
     })
     .ok()
@@ -239,8 +269,15 @@ pub fn load_all(pool: &DbPool, user_id: &str) -> Vec<SttReplacement> {
 /// fork, and no language-specific stopword tricks. Whatever STT span we
 /// learned, we match the same span shape.
 pub fn apply(transcript: &str, rules: &[SttReplacement]) -> String {
+    apply_with_matches(transcript, rules).text
+}
+
+pub fn apply_with_matches(transcript: &str, rules: &[SttReplacement]) -> ApplyResult {
     if rules.is_empty() {
-        return transcript.to_string();
+        return ApplyResult {
+            text: transcript.to_string(),
+            matches: vec![],
+        };
     }
 
     // Pre-compute (word_count, lowercased_words) for each rule so the inner
@@ -248,7 +285,8 @@ pub fn apply(transcript: &str, rules: &[SttReplacement]) -> String {
     let mut indexed: Vec<(Vec<String>, &SttReplacement)> = rules
         .iter()
         .map(|r| {
-            let words: Vec<String> = r.transcript_form
+            let words: Vec<String> = r
+                .transcript_form
                 .split_whitespace()
                 .map(|w| w.to_ascii_lowercase())
                 .collect();
@@ -261,12 +299,13 @@ pub fn apply(transcript: &str, rules: &[SttReplacement]) -> String {
     // Tokenise the transcript while preserving each token's original chunk
     // (the word + any trailing whitespace and punctuation glued to it).
     let chunks: Vec<&str> = split_chunks(transcript);
-    let cores:  Vec<String> = chunks
+    let cores: Vec<String> = chunks
         .iter()
         .map(|c| word_core(c).to_ascii_lowercase())
         .collect();
 
     let mut out = String::with_capacity(transcript.len());
+    let mut matches = Vec::new();
     let mut i = 0;
     while i < chunks.len() {
         // Empty cores (pure-whitespace / pure-punct chunks) can't match anything.
@@ -280,7 +319,9 @@ pub fn apply(transcript: &str, rules: &[SttReplacement]) -> String {
         let mut matched = None;
         for (rule_words, rule) in &indexed {
             let n = rule_words.len();
-            if i + n > chunks.len() { continue; }
+            if i + n > chunks.len() {
+                continue;
+            }
             // Compare rule words to the cores starting at i.
             let mut ok = true;
             let mut consumed = 0;
@@ -310,20 +351,25 @@ pub fn apply(transcript: &str, rules: &[SttReplacement]) -> String {
             // leading punctuation of the first chunk and the trailing
             // whitespace/punct of the last consumed chunk.
             let first = chunks[i];
-            let last  = chunks[end - 1];
+            let last = chunks[end - 1];
             let (lead, _) = split_punct(first);
             let (_, trail) = split_punct_trailing(last);
             out.push_str(lead);
             out.push_str(&rule.correct_form);
             out.push_str(trail);
+            matches.push(AppliedMatch {
+                transcript_form: rule.transcript_form.clone(),
+                correct_form: rule.correct_form.clone(),
+                kind: MatchKind::Exact,
+            });
             i = end;
             continue;
         }
 
         // Fall back to single-token phonetic match.
         let chunk = chunks[i];
-        let core  = &cores[i];
-        let key   = phonetics::phonetic_key(core);
+        let core = &cores[i];
+        let key = phonetics::phonetic_key(core);
         let mut phonetic_hit = None;
         if !key.is_empty() {
             for (_, rule) in &indexed {
@@ -338,10 +384,15 @@ pub fn apply(transcript: &str, rules: &[SttReplacement]) -> String {
         }
         if let Some(rule) = phonetic_hit {
             let (lead, trail) = split_punct(chunk);
-            let (_, trail2)   = split_punct_trailing(trail);
+            let (_, trail2) = split_punct_trailing(trail);
             out.push_str(lead);
             out.push_str(&rule.correct_form);
             out.push_str(trail2);
+            matches.push(AppliedMatch {
+                transcript_form: rule.transcript_form.clone(),
+                correct_form: rule.correct_form.clone(),
+                kind: MatchKind::Phonetic,
+            });
             i += 1;
             continue;
         }
@@ -350,7 +401,7 @@ pub fn apply(transcript: &str, rules: &[SttReplacement]) -> String {
         i += 1;
     }
 
-    out
+    ApplyResult { text: out, matches }
 }
 
 /// Split a transcript into chunks where each chunk is one whitespace-bounded
@@ -362,9 +413,13 @@ fn split_chunks(text: &str) -> Vec<&str> {
     let mut i = 0;
     while i < bytes.len() {
         // Walk to next whitespace
-        while i < bytes.len() && !bytes[i].is_ascii_whitespace() { i += 1; }
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
         // Walk through the whitespace
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
         out.push(&text[start..i]);
         start = i;
     }
@@ -415,11 +470,11 @@ mod tests {
     fn rule(from: &str, to: &str) -> SttReplacement {
         SttReplacement {
             transcript_form: from.to_string(),
-            correct_form:    to.to_string(),
-            phonetic_key:    phonetics::phonetic_key(from),
-            weight:          1.0,
-            use_count:       1,
-            last_used:       0,
+            correct_form: to.to_string(),
+            phonetic_key: phonetics::phonetic_key(from),
+            weight: 1.0,
+            use_count: 1,
+            last_used: 0,
         }
     }
 
@@ -481,11 +536,11 @@ mod tests {
     }
 
     // ── pool-backed tests ──────────────────────────────────────────────────────
-    use r2d2_sqlite::SqliteConnectionManager;
     use crate::store::DbPool;
+    use r2d2_sqlite::SqliteConnectionManager;
 
     fn mem_pool() -> DbPool {
-        let mgr  = SqliteConnectionManager::memory();
+        let mgr = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(mgr).unwrap();
         let conn = pool.get().unwrap();
         conn.execute_batch(
@@ -500,8 +555,9 @@ mod tests {
                  use_count        INTEGER NOT NULL DEFAULT 1,
                  last_used        INTEGER NOT NULL,
                  UNIQUE(user_id, transcript_form, correct_form)
-             );"
-        ).unwrap();
+             );",
+        )
+        .unwrap();
         pool
     }
 
@@ -525,7 +581,8 @@ mod tests {
         // BOTH spans should land as aliases so we match either shape later.
         let pool = mem_pool();
         let n = super::upsert_aliases(
-            &pool, "u1",
+            &pool,
+            "u1",
             /* transcript_window */ "मैं Corps",
             /* polish_window     */ "Main corps",
             /* correct_form      */ "MACOBS",
@@ -577,8 +634,10 @@ mod tests {
 
         let remaining = super::load_all(&pool, "u1");
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].correct_form, "n8n",
-                   "unrelated alias for n8n must survive");
+        assert_eq!(
+            remaining[0].correct_form, "n8n",
+            "unrelated alias for n8n must survive"
+        );
     }
 
     #[test]
@@ -587,7 +646,11 @@ mod tests {
         super::upsert(&pool, "u1", "Written", "n8n", 1.0);
         let n = super::delete_by_correct_form(&pool, "u1", "NeverExisted");
         assert_eq!(n, 0);
-        assert_eq!(super::load_all(&pool, "u1").len(), 1, "unrelated rule untouched");
+        assert_eq!(
+            super::load_all(&pool, "u1").len(),
+            1,
+            "unrelated rule untouched"
+        );
     }
 
     #[test]
@@ -654,7 +717,8 @@ mod tests {
         assert_eq!(super::load_all(&pool, "u1").len(), 1);
         super::demote(&pool, "u1", "writen", "n8n", 1.5);
         assert_eq!(
-            super::load_all(&pool, "u1").len(), 0,
+            super::load_all(&pool, "u1").len(),
+            0,
             "rule must evict when weight ≤ 0",
         );
     }

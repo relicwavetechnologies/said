@@ -27,14 +27,15 @@ use crate::{
         gateway, gemini_direct, groq, openai_codex,
         prompt::{
             VocabEntry, build_system_prompt_with_vocab_entries, build_tray_system_prompt,
-            build_user_message, vocab_terms_to_entries,
+            build_user_message, resolved_vocab_terms_to_entries, vocab_terms_to_entries,
         },
+        vocab_resolver,
     },
     store::{
         history::{InsertRecording, insert_recording},
-        openai_oauth,
+        openai_oauth, stt_replacements,
         vectors::retrieve_similar,
-        vocab_embeddings,
+        vocab_embeddings, vocabulary,
     },
 };
 
@@ -45,22 +46,6 @@ pub struct TextPolishBody {
     /// When set (by tray "Polish my message"), overrides the user's stored tone_preset
     /// and forces English output — the preset label already encodes the output language.
     pub tone_override: Option<String>,
-}
-
-fn select_prompt_vocab_entries(
-    pool: &crate::store::DbPool,
-    user_id: &str,
-    output_language: &str,
-    transcript: &str,
-    query_embedding: Option<&[f32]>,
-) -> Vec<VocabEntry> {
-    vocab_terms_to_entries(vocab_embeddings::select_for_prompt(
-        pool,
-        user_id,
-        output_language,
-        query_embedding,
-        Some(transcript),
-    ))
 }
 
 pub async fn polish(
@@ -78,9 +63,15 @@ pub async fn polish(
     let tone_override = body.tone_override.clone();
 
     // Load prefs + lexicon from cache and grab shared HTTP client before stream.
+    let vocab_task = {
+        let pool_c = pool.clone();
+        let uid_c = user_id.clone();
+        tokio::task::spawn_blocking(move || vocabulary::top_terms(&pool_c, &uid_c, 500))
+    };
     let prefs_opt = crate::get_prefs_cached(&state.prefs_cache, &pool, &user_id).await;
-    let (word_corrections_cached, _) =
+    let (word_corrections_cached, stt_replacement_rules) =
         crate::get_lexicon_cached(&state.lexicon_cache, &pool, &user_id).await;
+    let vocab_full = vocab_task.await.unwrap_or_default();
     let http_client = state.http_client.clone();
 
     let stream = async_stream::stream! {
@@ -134,16 +125,36 @@ pub async fn polish(
 
         // tone_override → use tray-specific English-locked prompt (no RAG, no persona)
         // Otherwise → use full RACC prompt with user prefs + RAG examples + corrections
-        let vocab_entries: Vec<VocabEntry> = if tone_override.is_none() {
-            select_prompt_vocab_entries(
+        let (resolved_transcript, vocab_entries): (String, Vec<VocabEntry>) = if tone_override.is_none() {
+            let alias_t0 = Instant::now();
+            let alias_result = stt_replacements::apply_with_matches(&transcript, &stt_replacement_rules);
+            let selected_terms = vocab_embeddings::select_for_prompt(
                 &pool,
                 &user_id,
                 &prefs.output_language,
-                &transcript,
                 embedding.as_deref(),
-            )
+                Some(&alias_result.text),
+            );
+            let resolved = vocab_resolver::resolve_for_prompt(
+                &alias_result.text,
+                &selected_terms,
+                &vocab_full,
+                &alias_result,
+            );
+            let resolve_ms = alias_t0.elapsed().as_millis() as i64;
+            info!(
+                "[text] vocab resolver={}ms alias_matches={} context_matches={} resolved={} candidates={}",
+                resolve_ms,
+                resolved.alias_match_count,
+                resolved.context_match_count,
+                resolved.resolved_terms.len(),
+                resolved.candidate_terms.len(),
+            );
+            let mut entries = resolved_vocab_terms_to_entries(resolved.resolved_terms);
+            entries.extend(vocab_terms_to_entries(resolved.candidate_terms));
+            (resolved.transcript, entries)
         } else {
-            vec![]
+            (transcript.clone(), vec![])
         };
         let system_prompt = if let Some(ref tone) = tone_override {
             build_tray_system_prompt(tone)
@@ -152,7 +163,7 @@ pub async fn polish(
                 &prefs, &rag_examples, &word_corrections, &vocab_entries,
             )
         };
-        let user_message  = build_user_message(&transcript, &prefs.output_language);
+        let user_message  = build_user_message(&resolved_transcript, &prefs.output_language);
 
         let (token_tx, mut token_rx) = mpsc::channel::<String>(64);
         let gateway_key = prefs.gateway_api_key.clone()
@@ -242,7 +253,7 @@ pub async fn polish(
             let pool2  = pool.clone();
             let id2    = recording_id.clone();
             let uid2   = user_id.clone();
-            let t2     = transcript.clone();
+            let t2     = resolved_transcript.clone();
             let p2     = llm_result.polished.clone();
             let ta2    = target_app.clone();
             let model2 = model.clone(); // resolved string e.g. "gpt-5.4", not mode key "smart"
@@ -293,9 +304,12 @@ pub async fn polish(
 
 #[cfg(test)]
 mod tests {
-    use super::select_prompt_vocab_entries;
+    use crate::llm::{
+        prompt::{resolved_vocab_terms_to_entries, vocab_terms_to_entries},
+        vocab_resolver,
+    };
     use crate::store::vocab_embeddings::upsert_embedding;
-    use crate::store::{DbPool, now_ms};
+    use crate::store::{DbPool, now_ms, stt_replacements, vocab_embeddings};
     use r2d2_sqlite::SqliteConnectionManager;
     use rusqlite::params;
 
@@ -383,13 +397,25 @@ mod tests {
             &[1.0, 0.0, 0.0, 0.0],
         );
 
-        let chosen = select_prompt_vocab_entries(
+        let selected = vocab_embeddings::select_for_prompt(
             &pool,
             "u1",
             "english",
-            "what time is it",
             Some(&[0.99, 0.0, 0.0, 0.0]),
+            Some("what time is it"),
         );
+        let alias_result = stt_replacements::ApplyResult {
+            text: "what time is it".into(),
+            matches: vec![],
+        };
+        let resolved = vocab_resolver::resolve_for_prompt(
+            &alias_result.text,
+            &selected,
+            &selected,
+            &alias_result,
+        );
+        let mut chosen = resolved_vocab_terms_to_entries(resolved.resolved_terms);
+        chosen.extend(vocab_terms_to_entries(resolved.candidate_terms));
         assert!(
             chosen.is_empty(),
             "text polish should not inject unrelated top-weight vocab"

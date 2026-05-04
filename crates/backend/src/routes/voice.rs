@@ -79,8 +79,9 @@ use crate::{
         gateway, gemini_direct, groq, openai_codex,
         prompt::{
             VocabEntry, build_system_prompt_with_vocab_entries, build_user_message,
-            vocab_terms_to_entries,
+            resolved_vocab_terms_to_entries, vocab_terms_to_entries,
         },
+        vocab_resolver,
     },
     store::{
         history::{InsertRecording, insert_recording},
@@ -227,15 +228,26 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
             }
         };
 
-        let (stt_transcript, enriched_transcript) = if stt_replacement_rules.is_empty() {
-            (stt_transcript_raw, enriched_raw)
+        let (stt_transcript, _enriched_transcript, alias_result) = if stt_replacement_rules.is_empty() {
+            let text = stt_transcript_raw.clone();
+            let enriched = enriched_raw.clone();
+            (
+                text.clone(),
+                enriched,
+                stt_replacements::ApplyResult {
+                    text,
+                    matches: vec![],
+                },
+            )
         } else {
-            let plain_rewritten = stt_replacements::apply(&stt_transcript_raw, &stt_replacement_rules);
+            let alias_result =
+                stt_replacements::apply_with_matches(&stt_transcript_raw, &stt_replacement_rules);
+            let plain_rewritten = alias_result.text.clone();
             let enriched_rewritten = stt_replacements::apply(&enriched_raw, &stt_replacement_rules);
             if plain_rewritten != stt_transcript_raw {
                 info!("[voice] lexicon replacement: {:?} → {:?}", stt_transcript_raw, plain_rewritten);
             }
-            (plain_rewritten, enriched_rewritten)
+            (plain_rewritten, enriched_rewritten, alias_result)
         };
 
         let status_payload = json!({"phase": "polishing", "transcript": &stt_transcript}).to_string();
@@ -256,8 +268,7 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
         let embed_ms = embed_t0.elapsed().as_millis() as i64;
         info!("[timing] embed={}ms ({})", embed_ms, if embedding.is_some() { "ok" } else { "skip/no-key" });
 
-        let model        = voice_polish_core::resolve_model(&prefs.selected_model).to_string();
-        let user_message = build_user_message(&enriched_transcript, &prefs.output_language);
+        let model = voice_polish_core::resolve_model(&prefs.selected_model).to_string();
 
         // ── STEP 3: RAG retrieval — k-NN over preference_vectors ──────────────────
         let rag_examples = match &embedding {
@@ -280,12 +291,12 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
         // what the user actually said. Skip flooding the prompt with all 200
         // vocab rows — pick starred + top-weight + top-relevance (deduped,
         // capped at 25). Falls back to starred + top-weight when no embedding.
-        let vocab_entries: Vec<VocabEntry> = {
+        let (resolved_transcript, vocab_entries): (String, Vec<VocabEntry>) = {
             let pool_v   = pool.clone();
             let uid_v    = user_id.clone();
             let lang_v   = prefs.output_language.clone();
             let emb_v    = embedding.clone();
-            let txt_v = stt_transcript.clone();
+            let txt_v = alias_result.text.clone();
             let chosen = tokio::task::spawn_blocking(move || {
                 vocab_embeddings::select_for_prompt(
                     &pool_v, &uid_v, &lang_v, emb_v.as_deref(), Some(&txt_v),
@@ -300,13 +311,30 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
                     "[voice] vocab selector picked 0/{} entries — no transcript evidence",
                     vocab_full.len(),
                 );
-                vec![]
+                (alias_result.text.clone(), vec![])
             } else {
-                info!("[voice] vocab selector picked {}/{} entries (relevance-aware)",
-                      chosen.len(), vocab_full.len());
-                vocab_terms_to_entries(chosen)
+                let resolve_t0 = Instant::now();
+                let resolved = vocab_resolver::resolve_for_prompt(
+                    &alias_result.text,
+                    &chosen,
+                    &vocab_full,
+                    &alias_result,
+                );
+                let resolve_ms = resolve_t0.elapsed().as_millis() as i64;
+                info!(
+                    "[voice] vocab resolver={}ms alias_matches={} context_matches={} resolved={} candidates={}",
+                    resolve_ms,
+                    resolved.alias_match_count,
+                    resolved.context_match_count,
+                    resolved.resolved_terms.len(),
+                    resolved.candidate_terms.len(),
+                );
+                let mut entries = resolved_vocab_terms_to_entries(resolved.resolved_terms);
+                entries.extend(vocab_terms_to_entries(resolved.candidate_terms));
+                (resolved.transcript, entries)
             }
         };
+        let user_message = build_user_message(&resolved_transcript, &prefs.output_language);
 
         let system_prompt = build_system_prompt_with_vocab_entries(
             &prefs, &rag_examples, &word_corrections, &vocab_entries,
@@ -415,7 +443,7 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
             let pool2   = pool.clone();
             let id2     = recording_id.clone();
             let uid2    = user_id.clone();
-            let t2      = stt_transcript.clone();
+            let t2      = resolved_transcript.clone();
             let p2      = llm_result.polished.clone();
             let ta2     = target_app.clone();
             let model2  = model.clone();
