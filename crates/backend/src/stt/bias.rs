@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use voice_polish_core::deepgram::{BiasPackage, ReplacementRule, resolve_stt_mode};
@@ -7,28 +8,124 @@ use crate::{
     store::{DbPool, stt_replacements, vocabulary},
 };
 
-fn is_precise_keyterm(term: &vocabulary::VocabTerm) -> bool {
-    matches!(term.source.as_str(), "manual" | "starred")
-        || matches!(
-            term.term_type.as_deref(),
-            Some("acronym" | "proper_noun" | "brand" | "code_identifier" | "phrase")
-        )
-        || term.use_count > 1
-        || term.weight >= 1.5
+fn is_high_signal_term_type(term_type: Option<&str>) -> bool {
+    matches!(
+        term_type,
+        Some("acronym" | "proper_noun" | "brand" | "code_identifier" | "phrase")
+    )
 }
 
-fn replacement_threshold(term: Option<&vocabulary::VocabTerm>, correct_form: &str) -> i64 {
-    let jargon_like = term
-        .and_then(|t| t.term_type.as_deref())
-        .map(|kind| {
-            matches!(
-                kind,
-                "acronym" | "proper_noun" | "brand" | "code_identifier" | "phrase"
-            )
-        })
-        .unwrap_or(false)
-        || phonetics::jargon_score(correct_form) >= 0.4;
-    if jargon_like { 2 } else { 3 }
+fn term_is_commonish(term: &vocabulary::VocabTerm) -> bool {
+    let raw = term.term.trim();
+    if raw.is_empty() || raw.contains(char::is_whitespace) {
+        return false;
+    }
+    let alpha_only = raw.chars().all(|c| c.is_ascii_alphabetic());
+    let lower_only = raw.chars().all(|c| !c.is_ascii_uppercase());
+    alpha_only
+        && lower_only
+        && !is_high_signal_term_type(term.term_type.as_deref())
+        && phonetics::jargon_score(raw) < 0.35
+}
+
+fn is_precise_keyterm(term: &vocabulary::VocabTerm) -> bool {
+    matches!(term.source.as_str(), "manual" | "starred")
+        || (is_high_signal_term_type(term.term_type.as_deref()) && !term_is_commonish(term))
+        || (term.use_count > 1 && phonetics::jargon_score(&term.term) >= 0.4)
+        || (term.weight >= 1.5 && phonetics::jargon_score(&term.term) >= 0.45)
+}
+
+fn canonical_keyterm_score(term: &vocabulary::VocabTerm) -> f64 {
+    let mut score = 0.0;
+    match term.source.as_str() {
+        "starred" => score += 4.0,
+        "manual" => score += 3.0,
+        _ => {}
+    }
+    if is_high_signal_term_type(term.term_type.as_deref()) {
+        score += 2.0;
+    }
+    if !term_is_commonish(term) {
+        score += phonetics::jargon_score(&term.term) * 2.0;
+    }
+    score += term.weight.min(5.0) * 0.5;
+    score += (term.use_count.min(8) as f64) * 0.35;
+    score += (term.last_used.max(0) as f64) / 1_000_000_000_000.0;
+    score
+}
+
+fn alias_is_commonish(alias: &str) -> bool {
+    let trimmed = alias.trim();
+    if trimmed.is_empty() || trimmed.contains(char::is_whitespace) {
+        return false;
+    }
+    let alpha_only = trimmed.chars().all(|c| c.is_ascii_alphabetic());
+    let lower_only = trimmed.chars().all(|c| !c.is_ascii_uppercase());
+    alpha_only && lower_only && phonetics::jargon_score(trimmed) < 0.35 && trimmed.len() <= 10
+}
+
+fn replacement_threshold(term: &vocabulary::VocabTerm, alias: &str) -> Option<i64> {
+    if alias_is_commonish(alias) {
+        let alias_len = alias.trim().chars().count();
+        let canonical_kind = term.term_type.as_deref();
+        let allow_short_acronym_alias = alias_len <= 4
+            && matches!(canonical_kind, Some("acronym" | "code_identifier"))
+            && phonetics::similarity(alias, &term.term) >= 0.4;
+        if !allow_short_acronym_alias {
+            return None;
+        }
+    }
+
+    match term.term_type.as_deref() {
+        Some("acronym" | "proper_noun" | "brand" | "code_identifier" | "phrase") => Some(3),
+        _ => {
+            if phonetics::jargon_score(&term.term) >= 0.55 && phonetics::jargon_score(alias) >= 0.4
+            {
+                Some(3)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn replacement_trust_score(term: &vocabulary::VocabTerm, rule: &stt_replacements::SttReplacement) -> Option<f64> {
+    let alias = rule.transcript_form.trim();
+    let canonical = rule.correct_form.trim();
+    if alias.is_empty() || canonical.is_empty() {
+        return None;
+    }
+    if alias.eq_ignore_ascii_case(canonical) {
+        return None;
+    }
+
+    let threshold = replacement_threshold(term, alias)?;
+    if rule.use_count < threshold || rule.weight < threshold as f64 {
+        return None;
+    }
+    if canonical_keyterm_score(term) < 3.0 {
+        return None;
+    }
+
+    let phonetic = phonetics::similarity(alias, canonical);
+    let min_phonetic = match term.term_type.as_deref() {
+        Some("acronym") => 0.42,
+        Some("phrase") => 0.52,
+        Some("code_identifier") => 0.48,
+        Some("brand" | "proper_noun") => 0.58,
+        _ => 0.65,
+    };
+    if phonetic < min_phonetic {
+        return None;
+    }
+
+    let mut score = phonetic * 4.0;
+    score += phonetics::jargon_score(canonical) * 2.5;
+    score += phonetics::jargon_score(alias) * 1.5;
+    score += canonical_keyterm_score(term);
+    score += (rule.use_count.min(8) as f64) * 0.5;
+    score += rule.weight.min(5.0) * 0.35;
+    Some(score)
 }
 
 pub fn build_bias_package(
@@ -42,7 +139,16 @@ pub fn build_bias_package(
 
     let mut seen_terms = HashSet::new();
     let mut keyterms = Vec::new();
-    for term in vocab_terms.iter().filter(|t| is_precise_keyterm(t)) {
+    let mut keyterm_candidates: Vec<&vocabulary::VocabTerm> = vocab_terms
+        .iter()
+        .filter(|t| is_precise_keyterm(t))
+        .collect();
+    keyterm_candidates.sort_by(|a, b| {
+        canonical_keyterm_score(b)
+            .partial_cmp(&canonical_keyterm_score(a))
+            .unwrap_or(Ordering::Equal)
+    });
+    for term in keyterm_candidates {
         let lowered = term.term.to_ascii_lowercase();
         if seen_terms.insert(lowered) {
             keyterms.push(term.term.clone());
@@ -58,7 +164,7 @@ pub fn build_bias_package(
         .collect();
 
     let mut seen_replacements = HashSet::new();
-    let mut replacements = Vec::new();
+    let mut replacement_candidates: Vec<(f64, ReplacementRule)> = Vec::new();
     for rule in stt_replacements::load_for_language(pool, user_id, output_language) {
         let find = rule.transcript_form.trim();
         let replace = rule.correct_form.trim();
@@ -72,10 +178,9 @@ pub fn build_bias_package(
         let Some(canonical) = vocab_by_term.get(&replace.to_ascii_lowercase()) else {
             continue;
         };
-        let threshold = replacement_threshold(Some(canonical), replace);
-        if rule.use_count < threshold {
+        let Some(score) = replacement_trust_score(canonical, &rule) else {
             continue;
-        }
+        };
 
         let dedupe_key = format!(
             "{}=>{}",
@@ -85,14 +190,21 @@ pub fn build_bias_package(
         if !seen_replacements.insert(dedupe_key) {
             continue;
         }
-        replacements.push(ReplacementRule {
-            find: find.to_ascii_lowercase(),
-            replace: Some(replace.to_string()),
-        });
-        if replacements.len() >= voice_polish_core::deepgram::MAX_REPLACEMENTS {
-            break;
-        }
+        replacement_candidates.push((
+            score,
+            ReplacementRule {
+                find: find.to_ascii_lowercase(),
+                replace: Some(replace.to_string()),
+            },
+        ));
     }
+
+    replacement_candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+    let replacements = replacement_candidates
+        .into_iter()
+        .take(voice_polish_core::deepgram::MAX_REPLACEMENTS)
+        .map(|(_, rule)| rule)
+        .collect();
 
     BiasPackage {
         stt_mode,
@@ -173,6 +285,12 @@ mod tests {
             &pool, "u1", "emi", "emi", "EMIAC", 1.0, "hinglish",
         );
         stt_replacements::upsert_aliases_for_language(
+            &pool, "u1", "emi", "emi", "EMIAC", 1.0, "hinglish",
+        );
+        stt_replacements::upsert_aliases_for_language(
+            &pool, "u1", "return", "return", "return", 1.0, "hinglish",
+        );
+        stt_replacements::upsert_aliases_for_language(
             &pool, "u1", "return", "return", "return", 1.0, "hinglish",
         );
         stt_replacements::upsert_aliases_for_language(
@@ -193,5 +311,39 @@ mod tests {
                 .iter()
                 .any(|r| r.find == "return" && r.replace.as_deref() == Some("return"))
         );
+    }
+
+    #[test]
+    fn common_word_aliases_never_export_as_replacements() {
+        let pool = mem_pool();
+        vocabulary::upsert_for_language_with_context(
+            &pool,
+            "u1",
+            "ProjectAtlas",
+            2.0,
+            "manual",
+            "hinglish",
+            Some("ProjectAtlas roadmap dekhna"),
+        );
+        for _ in 0..5 {
+            stt_replacements::upsert_aliases_for_language(
+                &pool,
+                "u1",
+                "return",
+                "return",
+                "ProjectAtlas",
+                1.0,
+                "hinglish",
+            );
+        }
+
+        let bias = build_bias_package(&pool, "u1", "auto", "hinglish");
+        assert!(
+            !bias
+                .replacements
+                .iter()
+                .any(|r| r.find == "return" && r.replace.as_deref() == Some("ProjectAtlas"))
+        );
+        assert!(bias.keyterms.contains(&"ProjectAtlas".to_string()));
     }
 }
