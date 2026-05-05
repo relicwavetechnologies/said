@@ -2,6 +2,8 @@ use std::sync::atomic::AtomicUsize;
 
 use serde::{Deserialize, Serialize};
 
+pub mod deepgram;
+
 // ── Gateway constants ─────────────────────────────────────────────────────────
 
 pub const GATEWAY_BASE: &str = "https://gateway.outreachdeal.com";

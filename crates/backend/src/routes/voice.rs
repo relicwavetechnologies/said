@@ -31,6 +31,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+use voice_polish_core::deepgram::{BiasPackage, TranscriptMeta};
 
 // ── Audio file helpers ────────────────────────────────────────────────────────
 
@@ -91,7 +92,7 @@ use crate::{
         vectors::retrieve_similar,
         vocab_embeddings, vocabulary,
     },
-    stt::deepgram,
+    stt::{bias as stt_bias, deepgram},
 };
 
 fn invalidate_openai_session_on_auth_error(
@@ -113,12 +114,15 @@ struct VoicePolishInput {
     wav_data: Vec<u8>,
     target_app: Option<String>,
     pre_transcript: Option<String>,
+    pre_transcript_meta: Option<TranscriptMeta>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct TranscriptPolishRequest {
     transcript: String,
     target_app: Option<String>,
+    #[serde(default)]
+    pre_transcript_meta: Option<TranscriptMeta>,
 }
 
 pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> impl IntoResponse {
@@ -126,6 +130,7 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
     let mut wav_data: Vec<u8> = Vec::new();
     let mut target_app: Option<String> = None;
     let mut pre_transcript: Option<String> = None; // P5: from Deepgram WS
+    let mut pre_transcript_meta: Option<TranscriptMeta> = None;
 
     while let Ok(Some(field)) = multipart.next_field().await {
         match field.name() {
@@ -138,6 +143,13 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
             Some("pre_transcript") => {
                 pre_transcript = field.text().await.ok().filter(|s| !s.is_empty());
             }
+            Some("pre_transcript_meta") => {
+                pre_transcript_meta = field
+                    .text()
+                    .await
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<TranscriptMeta>(&s).ok());
+            }
             _ => {}
         }
     }
@@ -148,6 +160,7 @@ pub async fn polish(State(state): State<AppState>, mut multipart: Multipart) -> 
             wav_data,
             target_app,
             pre_transcript,
+            pre_transcript_meta,
         },
     )
     .await
@@ -169,6 +182,7 @@ pub async fn polish_transcript(
             wav_data: Vec::new(),
             target_app: req.target_app,
             pre_transcript: Some(transcript),
+            pre_transcript_meta: req.pre_transcript_meta,
         },
     )
     .await
@@ -179,6 +193,7 @@ async fn polish_with_input(state: AppState, input: VoicePolishInput) -> Response
         wav_data,
         target_app,
         pre_transcript,
+        pre_transcript_meta,
     } = input;
 
     // Allow empty WAV when the caller supplied a pre_transcript (P5 / WS path).
@@ -230,10 +245,6 @@ async fn polish_with_input(state: AppState, input: VoicePolishInput) -> Response
         crate::get_lexicon_cached(&state.lexicon_cache, &pool, &user_id),
         async { vocab_task.await.unwrap_or_default() },
     );
-    // Bare term strings for Deepgram keyterm bias (always all top terms by
-    // weight — Deepgram bias has no context awareness, so we feed it the
-    // most-trusted slate).
-    let vocab_terms: Vec<String> = vocab_full.iter().map(|v| v.term.clone()).collect();
     // The polish-prompt vocab slice is computed below, AFTER the transcript
     // embedding lands, so we can do relevance retrieval.
 
@@ -269,22 +280,94 @@ async fn polish_with_input(state: AppState, input: VoicePolishInput) -> Response
             .or_else(|| std::env::var("GROQ_API_KEY").ok())
             .unwrap_or_default();
 
+        let stt_bias_package = tokio::task::spawn_blocking({
+            let pool = pool.clone();
+            let user_id = user_id.clone();
+            let language = prefs.language.clone();
+            let output_language = prefs.output_language.clone();
+            move || stt_bias::build_bias_package(&pool, &user_id, &language, &output_language)
+        })
+        .await
+        .unwrap_or_else(|_| BiasPackage::default());
+
         // ── STEP 1: STT ───────────────────────────────────────────────────────────
+        let audio_seconds = wav_duration_seconds(&wav_data);
         let (stt_transcript_raw, enriched_raw, stt_confidence, transcribe_ms) = if let Some(t) = pre_transcript {
             let plain = strip_confidence_markers(&t);
-            let ms = total_start.elapsed().as_millis();
-            info!("[timing] STT=0ms (WS pre-transcript, {} words) @{ms}ms", plain.split_whitespace().count());
-            (plain, t, 0.95_f64, 0_i64)
+            let ws_meta = pre_transcript_meta.unwrap_or_else(|| TranscriptMeta {
+                enriched_transcript: t.clone(),
+                confidence: 0.95,
+                mean_word_confidence: 0.95,
+                word_count: plain.split_whitespace().count(),
+                stt_mode: stt_bias_package.stt_mode.clone(),
+                ..TranscriptMeta::default()
+            });
+            let primary = TranscriptCandidate {
+                transcript: plain,
+                meta: TranscriptMeta {
+                    enriched_transcript: t.clone(),
+                    ..ws_meta.clone()
+                },
+                source: "ws".to_string(),
+            };
+            let (chosen, rescue_ms) = match maybe_rescue_transcript(
+                &http_client,
+                &deepgram_key,
+                wav_data.clone(),
+                audio_seconds,
+                &stt_bias_package,
+                Some(primary),
+            )
+            .await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("[voice] STT error: {e}");
+                    yield Ok(Event::default().event("error").data(
+                        json!({"message": e, "audio_id": aid}).to_string()
+                    ));
+                    return;
+                }
+            };
+            let ms = total_start.elapsed().as_millis() as i64;
+            info!(
+                "[timing] STT={}ms (WS pre-transcript{} {} words)",
+                ms,
+                if rescue_ms > 0 { " + rescue" } else { "" },
+                chosen.meta.word_count,
+            );
+            (
+                chosen.transcript,
+                chosen.meta.enriched_transcript.clone(),
+                chosen.meta.confidence,
+                ms,
+            )
         } else {
             yield Ok(Event::default().event("status")
                 .data(json!({"phase": "transcribing"}).to_string()));
-            let t_start = Instant::now();
-            match deepgram::transcribe(&http_client, &deepgram_key, wav_data, &prefs.language, &vocab_terms).await {
-                Ok(r) => {
-                    let ms = t_start.elapsed().as_millis() as i64;
-                    info!("[timing] STT={}ms (batch, {} words, conf={:.2})",
-                        ms, r.transcript.split_whitespace().count(), r.confidence);
-                    (r.transcript, r.enriched_transcript, r.confidence, ms)
+            match maybe_rescue_transcript(
+                &http_client,
+                &deepgram_key,
+                wav_data.clone(),
+                audio_seconds,
+                &stt_bias_package,
+                None,
+            )
+            .await {
+                Ok((chosen, _rescue_ms)) => {
+                    let ms = total_start.elapsed().as_millis() as i64;
+                    info!(
+                        "[timing] STT={}ms ({}, {} words, conf={:.2})",
+                        ms,
+                        chosen.source,
+                        chosen.meta.word_count,
+                        chosen.meta.confidence
+                    );
+                    (
+                        chosen.transcript,
+                        chosen.meta.enriched_transcript.clone(),
+                        chosen.meta.confidence,
+                        ms,
+                    )
                 }
                 Err(e) => {
                     warn!("[voice] STT error: {e}");
@@ -607,6 +690,239 @@ async fn polish_with_input(state: AppState, input: VoicePolishInput) -> Response
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptCandidate {
+    transcript: String,
+    meta: TranscriptMeta,
+    source: String,
+}
+
+#[derive(Debug, Clone)]
+struct QualityAssessment {
+    score: f64,
+    poor: bool,
+    mostly_hindi: bool,
+    code_switch_hint: bool,
+    protected_hits: usize,
+    too_short: bool,
+}
+
+async fn maybe_rescue_transcript(
+    client: &reqwest::Client,
+    api_key: &str,
+    wav_data: Vec<u8>,
+    audio_seconds: f64,
+    bias: &BiasPackage,
+    primary_ws: Option<TranscriptCandidate>,
+) -> Result<(TranscriptCandidate, i64), String> {
+    if let Some(primary) = primary_ws {
+        let primary_quality = assess_candidate(&primary, audio_seconds, bias);
+        let Some(rescue_mode) = rescue_mode_for(&primary_quality, &primary.meta.stt_mode) else {
+            return Ok((primary, 0));
+        };
+        if wav_data.is_empty() {
+            return Ok((primary, 0));
+        }
+        let rescue = run_batch_transcript(
+            client,
+            api_key,
+            wav_data,
+            with_mode(bias, &rescue_mode),
+            format!("rescue:{rescue_mode}"),
+        )
+        .await?;
+        let rescue_quality = assess_candidate(&rescue, audio_seconds, bias);
+        let chosen = choose_candidate(primary, primary_quality, rescue, rescue_quality);
+        return Ok((chosen, 1));
+    }
+
+    let primary = run_batch_transcript(
+        client,
+        api_key,
+        wav_data.clone(),
+        bias.clone(),
+        format!("batch:{}", bias.stt_mode),
+    )
+    .await?;
+    let primary_quality = assess_candidate(&primary, audio_seconds, bias);
+    let Some(rescue_mode) = rescue_mode_for(&primary_quality, &bias.stt_mode) else {
+        return Ok((primary, 0));
+    };
+    let rescue = run_batch_transcript(
+        client,
+        api_key,
+        wav_data,
+        with_mode(bias, &rescue_mode),
+        format!("rescue:{rescue_mode}"),
+    )
+    .await?;
+    let rescue_quality = assess_candidate(&rescue, audio_seconds, bias);
+    let chosen = choose_candidate(primary, primary_quality, rescue, rescue_quality);
+    Ok((chosen, 1))
+}
+
+fn with_mode(bias: &BiasPackage, stt_mode: &str) -> BiasPackage {
+    let mut next = bias.clone();
+    next.stt_mode = stt_mode.to_string();
+    next
+}
+
+async fn run_batch_transcript(
+    client: &reqwest::Client,
+    api_key: &str,
+    wav_data: Vec<u8>,
+    bias: BiasPackage,
+    source: String,
+) -> Result<TranscriptCandidate, String> {
+    let result = deepgram::transcribe(client, api_key, wav_data, &bias).await?;
+    let meta = result.meta();
+    Ok(TranscriptCandidate {
+        transcript: result.transcript,
+        meta,
+        source,
+    })
+}
+
+fn choose_candidate(
+    primary: TranscriptCandidate,
+    primary_quality: QualityAssessment,
+    rescue: TranscriptCandidate,
+    rescue_quality: QualityAssessment,
+) -> TranscriptCandidate {
+    info!(
+        "[voice] transcript quality primary(score={:.2}, poor={}, protected_hits={}, too_short={}) rescue(score={:.2}, poor={}, protected_hits={}, too_short={})",
+        primary_quality.score,
+        primary_quality.poor,
+        primary_quality.protected_hits,
+        primary_quality.too_short,
+        rescue_quality.score,
+        rescue_quality.poor,
+        rescue_quality.protected_hits,
+        rescue_quality.too_short,
+    );
+    if rescue_quality.score > primary_quality.score + 0.5 {
+        info!("[voice] rescue transcript won over primary");
+        rescue
+    } else {
+        primary
+    }
+}
+
+fn rescue_mode_for(quality: &QualityAssessment, current_mode: &str) -> Option<String> {
+    if !quality.poor {
+        return None;
+    }
+    match current_mode {
+        "multi" if quality.mostly_hindi => Some("hi".to_string()),
+        "hi" if quality.code_switch_hint => Some("multi".to_string()),
+        _ => None,
+    }
+}
+
+fn assess_candidate(
+    candidate: &TranscriptCandidate,
+    audio_seconds: f64,
+    bias: &BiasPackage,
+) -> QualityAssessment {
+    let word_count = if candidate.meta.word_count > 0 {
+        candidate.meta.word_count
+    } else {
+        candidate.transcript.split_whitespace().count()
+    };
+    let mean_confidence = if candidate.meta.mean_word_confidence > 0.0 {
+        candidate.meta.mean_word_confidence
+    } else if candidate.meta.confidence > 0.0 {
+        candidate.meta.confidence
+    } else {
+        0.75
+    };
+    let low_conf_ratio = if word_count == 0 {
+        1.0
+    } else {
+        candidate.meta.low_confidence_count as f64 / word_count as f64
+    };
+    let expected_min_words = if audio_seconds > 3.0 {
+        (audio_seconds / 2.0).max(1.0) as usize
+    } else {
+        0
+    };
+    let too_short = expected_min_words > 0 && word_count < expected_min_words;
+    let protected_hits = count_protected_hits(&candidate.transcript, bias);
+    let has_ascii = candidate
+        .transcript
+        .chars()
+        .any(|c| c.is_ascii_alphabetic());
+    let devanagari_chars = candidate
+        .transcript
+        .chars()
+        .filter(|c| ('\u{0900}'..='\u{097F}').contains(c))
+        .count();
+    let alpha_chars = candidate
+        .transcript
+        .chars()
+        .filter(|c| c.is_alphabetic())
+        .count()
+        .max(1);
+    let mostly_hindi = candidate
+        .meta
+        .languages
+        .iter()
+        .all(|lang| lang.starts_with("hi"))
+        || (devanagari_chars as f64 / alpha_chars as f64) > 0.55;
+    let code_switch_hint = candidate
+        .meta
+        .languages
+        .iter()
+        .any(|lang| lang.starts_with("en"))
+        || (has_ascii && devanagari_chars > 0)
+        || protected_hits > 0;
+    let score = protected_hits as f64 * 2.0 + mean_confidence * 2.0
+        - low_conf_ratio * 2.0
+        - if too_short { 2.0 } else { 0.0 }
+        + if candidate.meta.languages.len() > 1 {
+            0.5
+        } else {
+            0.0
+        };
+    let poor = too_short
+        || mean_confidence < 0.65
+        || (mean_confidence < 0.8 && low_conf_ratio > 0.35)
+        || score < 1.0;
+    QualityAssessment {
+        score,
+        poor,
+        mostly_hindi,
+        code_switch_hint,
+        protected_hits,
+        too_short,
+    }
+}
+
+fn count_protected_hits(transcript: &str, bias: &BiasPackage) -> usize {
+    let lower = transcript.to_ascii_lowercase();
+    let mut hits = 0usize;
+    for keyterm in &bias.keyterms {
+        if !keyterm.is_empty() && lower.contains(&keyterm.to_ascii_lowercase()) {
+            hits += 1;
+        }
+    }
+    for replacement in &bias.replacements {
+        if let Some(canonical) = replacement.replace.as_deref() {
+            if !canonical.is_empty() && lower.contains(&canonical.to_ascii_lowercase()) {
+                hits += 1;
+            }
+        }
+    }
+    hits
+}
+
+fn wav_duration_seconds(wav_data: &[u8]) -> f64 {
+    if wav_data.len() <= 44 {
+        return 0.0;
+    }
+    (wav_data.len().saturating_sub(44)) as f64 / 32_000.0
 }
 
 /// Strip `[word?XX%]`-style confidence markers from a string.

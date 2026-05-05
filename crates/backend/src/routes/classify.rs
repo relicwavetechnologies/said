@@ -423,13 +423,14 @@ pub async fn classify(
                 // the rule stored on one shape can never fire on the other —
                 // the bug we hit when MACOBS learned but next recording's
                 // raw STT ("मैं corps") didn't match the polish-side rule.
-                let aliases_written = stt_replacements::upsert_aliases(
+                let aliases_written = stt_replacements::upsert_aliases_for_language(
                     &state.pool,
                     &state.default_user_id,
                     cand.hunk.transcript_window.as_str(), // raw STT span
                     from,                                 // polish span
                     correct,
                     1.0,
+                    &output_language,
                 );
                 promoted_count += aliases_written;
                 if vocabulary::top_terms(&state.pool, &state.default_user_id, 200)

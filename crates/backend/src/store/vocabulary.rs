@@ -317,6 +317,45 @@ pub fn top_terms(pool: &DbPool, user_id: &str, limit: usize) -> Vec<VocabTerm> {
     .unwrap_or_default()
 }
 
+pub fn top_terms_for_language(
+    pool: &DbPool,
+    user_id: &str,
+    language: &str,
+    limit: usize,
+) -> Vec<VocabTerm> {
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT term, weight, use_count, last_used, source,
+                example_context, term_type, meaning
+           FROM vocabulary
+          WHERE user_id = ?1
+            AND (language = ?2 OR language IS NULL)
+          ORDER BY weight DESC, last_used DESC
+          LIMIT ?3",
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    stmt.query_map(params![user_id, language, limit as i64], |row| {
+        Ok(VocabTerm {
+            term: row.get(0)?,
+            weight: row.get(1)?,
+            use_count: row.get(2)?,
+            last_used: row.get(3)?,
+            source: row.get(4)?,
+            example_context: row.get(5).ok(),
+            term_type: row.get(6).ok(),
+            meaning: row.get(7).ok(),
+        })
+    })
+    .ok()
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
+
 /// Convenience: extract just the term strings, for STT API injection.
 pub fn top_term_strings(pool: &DbPool, user_id: &str, limit: usize) -> Vec<String> {
     top_terms(pool, user_id, limit)
@@ -335,26 +374,10 @@ pub fn top_term_strings_for_language(
     language: &str,
     limit: usize,
 ) -> Vec<String> {
-    let conn = match pool.get() {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-    let mut stmt = match conn.prepare(
-        "SELECT term FROM vocabulary
-          WHERE user_id = ?1
-            AND (language = ?2 OR language IS NULL)
-          ORDER BY weight DESC, last_used DESC
-          LIMIT ?3",
-    ) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-    stmt.query_map(params![user_id, language, limit as i64], |row| {
-        row.get::<_, String>(0)
-    })
-    .ok()
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default()
+    top_terms_for_language(pool, user_id, language, limit)
+        .into_iter()
+        .map(|t| t.term)
+        .collect()
 }
 
 /// Threshold: number of new examples before triggering a meaning regeneration.

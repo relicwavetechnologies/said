@@ -1,0 +1,170 @@
+use serde::{Deserialize, Serialize};
+
+pub const DEEPGRAM_MODEL: &str = "nova-3";
+pub const MAX_KEYTERMS: usize = 50;
+pub const MAX_REPLACEMENTS: usize = 50;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplacementRule {
+    pub find: String,
+    #[serde(default)]
+    pub replace: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BiasPackage {
+    pub stt_mode: String,
+    #[serde(default)]
+    pub keyterms: Vec<String>,
+    #[serde(default)]
+    pub replacements: Vec<ReplacementRule>,
+}
+
+impl Default for BiasPackage {
+    fn default() -> Self {
+        Self {
+            stt_mode: "multi".to_string(),
+            keyterms: vec![],
+            replacements: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct TranscriptMeta {
+    #[serde(default)]
+    pub enriched_transcript: String,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub mean_word_confidence: f64,
+    #[serde(default)]
+    pub low_confidence_count: usize,
+    #[serde(default)]
+    pub word_count: usize,
+    #[serde(default)]
+    pub languages: Vec<String>,
+    #[serde(default)]
+    pub stt_mode: String,
+}
+
+pub fn resolve_stt_mode(language: &str) -> String {
+    match language.trim() {
+        "" | "auto" | "multi" => "multi".to_string(),
+        "hi" => "hi".to_string(),
+        "en" => "en".to_string(),
+        "en-IN" => "en-IN".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub fn endpointing_for_mode(stt_mode: &str) -> u32 {
+    if stt_mode == "multi" { 100 } else { 500 }
+}
+
+pub fn build_batch_url(base: &str, bias: &BiasPackage) -> String {
+    let mut url = format!(
+        "{base}?model={DEEPGRAM_MODEL}&language={}&punctuate=true",
+        urlencode(&bias.stt_mode)
+    );
+    append_bias_params(&mut url, bias);
+    url
+}
+
+pub fn build_ws_url(base: &str, bias: &BiasPackage, sample_rate: u32) -> String {
+    let mut url = format!(
+        "{base}?model={DEEPGRAM_MODEL}&language={}&punctuate=true&encoding=linear16&sample_rate={sample_rate}&channels=1&interim_results=true&endpointing={}&utterance_end_ms=1000",
+        urlencode(&bias.stt_mode),
+        endpointing_for_mode(&bias.stt_mode),
+    );
+    append_bias_params(&mut url, bias);
+    url
+}
+
+fn append_bias_params(url: &mut String, bias: &BiasPackage) {
+    for term in bias
+        .keyterms
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .take(MAX_KEYTERMS)
+    {
+        url.push_str("&keyterm=");
+        url.push_str(&urlencode(term));
+    }
+
+    for replacement in bias
+        .replacements
+        .iter()
+        .filter(|r| !r.find.trim().is_empty())
+        .take(MAX_REPLACEMENTS)
+    {
+        url.push_str("&replace=");
+        url.push_str(&urlencode(replacement.find.trim()));
+        if let Some(replace) = replacement.replace.as_deref().map(str::trim) {
+            if !replace.is_empty() {
+                url.push(':');
+                url.push_str(&urlencode(replace));
+            }
+        }
+    }
+}
+
+pub fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(out, "%{:02X}", b);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_and_multi_resolve_to_multi() {
+        assert_eq!(resolve_stt_mode(""), "multi");
+        assert_eq!(resolve_stt_mode("auto"), "multi");
+        assert_eq!(resolve_stt_mode("multi"), "multi");
+        assert_eq!(resolve_stt_mode("hi"), "hi");
+    }
+
+    #[test]
+    fn batch_url_includes_keyterms_and_replacements() {
+        let bias = BiasPackage {
+            stt_mode: "multi".into(),
+            keyterms: vec!["EMIAC".into(), "n8n".into()],
+            replacements: vec![
+                ReplacementRule {
+                    find: "n10n".into(),
+                    replace: Some("n8n".into()),
+                },
+                ReplacementRule {
+                    find: "main corps".into(),
+                    replace: Some("MACOBS".into()),
+                },
+            ],
+        };
+        let url = build_batch_url("https://api.deepgram.com/v1/listen", &bias);
+        assert!(url.contains("language=multi"));
+        assert!(url.contains("&keyterm=EMIAC"));
+        assert!(url.contains("&replace=n10n:n8n"));
+        assert!(url.contains("&replace=main%20corps:MACOBS"));
+    }
+
+    #[test]
+    fn ws_url_uses_multi_endpointing() {
+        let bias = BiasPackage::default();
+        let url = build_ws_url("wss://api.deepgram.com/v1/listen", &bias, 16000);
+        assert!(url.contains("endpointing=100"));
+    }
+}

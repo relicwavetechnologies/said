@@ -545,7 +545,9 @@ struct EditTargetState(Mutex<Option<i32>>);
 
 /// P5: Holds the oneshot receiver that delivers the pre-transcript from the
 /// Deepgram WebSocket streaming task.  Replaced on every new recording.
-struct StreamingState(Mutex<Option<tokio::sync::oneshot::Receiver<String>>>);
+struct StreamingState(
+    Mutex<Option<tokio::sync::oneshot::Receiver<dg_stream::StreamingTranscript>>>,
+);
 
 /// Stores the most-recently polished text. Populated after every voice/text polish;
 /// cleared after it's pasted via Ctrl+Cmd+V or the `paste_latest` Tauri command.
@@ -562,8 +564,14 @@ struct HotPathCache(Arc<tokio::sync::RwLock<HotPathCacheInner>>);
 struct HotPathCacheInner {
     /// User's STT language setting (e.g. "hi", "multi", "auto").
     language: String,
+    /// Saved Deepgram API key from preferences.
+    deepgram_key: String,
+    /// Resolved STT mode sent to Deepgram.
+    stt_mode: String,
     /// Personal vocabulary terms sent to Deepgram as `keyterm=` biases.
     keyterms: Vec<String>,
+    /// Trusted upstream replacement rules sent as `replace=`.
+    replacements: Vec<voice_polish_core::deepgram::ReplacementRule>,
 }
 
 /// Holds a pre-warmed Deepgram WS connection ready for the next recording.
@@ -1130,8 +1138,21 @@ async fn patch_preferences(
             // Keep hot-path cache in sync — no HTTP needed next recording.
             let mut hot = hot_cache.0.write().await;
             hot.language = p.language.clone();
+            hot.deepgram_key = p.deepgram_api_key.clone().unwrap_or_default();
         }
         Err(e) => tracing::warn!("[patch_prefs] backend error: {e}"),
+    }
+    if result.is_ok() {
+        let arc = Arc::clone(&hot_cache.0);
+        let ep2 = ep.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Ok(bias) = api::get_stt_bias(&ep2).await {
+                let mut hot = arc.write().await;
+                hot.stt_mode = bias.stt_mode;
+                hot.keyterms = bias.keyterms;
+                hot.replacements = bias.replacements;
+            }
+        });
     }
     result
 }
@@ -1161,12 +1182,17 @@ async fn submit_edit_feedback(
         let arc = Arc::clone(&hot_cache.0);
         let ep2 = ep.clone();
         tauri::async_runtime::spawn(async move {
-            if let Ok(terms) = api::get_vocabulary_terms(&ep2).await {
+            if let Ok(bias) = api::get_stt_bias(&ep2).await {
                 tracing::debug!(
-                    "[hot_cache] refreshed keyterms after feedback ({} terms)",
-                    terms.len()
+                    "[hot_cache] refreshed STT bias after feedback (mode={} keyterms={} replacements={})",
+                    bias.stt_mode,
+                    bias.keyterms.len(),
+                    bias.replacements.len()
                 );
-                arc.write().await.keyterms = terms;
+                let mut hot = arc.write().await;
+                hot.stt_mode = bias.stt_mode;
+                hot.keyterms = bias.keyterms;
+                hot.replacements = bias.replacements;
             }
         });
     }
@@ -1282,7 +1308,7 @@ fn toggle_recording(
             let app2 = app.clone();
             let back_arc2 = Arc::clone(&backend.0);
             // UI button path: no WS streaming pre-transcript (hotkey path handles it)
-            let pre_tx_ui: Option<String> = None;
+            let pre_tx_ui: Option<dg_stream::StreamingTranscript> = None;
             tauri::async_runtime::spawn(async move {
                 let result = run_voice_polish_sse(&back_arc2, wav, None, pre_tx_ui, &app2).await;
 
@@ -1400,7 +1426,8 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
     let chunk_recv = shared.lock().ok().and_then(|mut d| d.take_chunk_receiver());
     if let Some(chunk_recv) = chunk_recv {
         let streaming_state = app.state::<StreamingState>();
-        let (transcript_tx, transcript_rx) = tokio::sync::oneshot::channel::<String>();
+        let (transcript_tx, transcript_rx) =
+            tokio::sync::oneshot::channel::<dg_stream::StreamingTranscript>();
         if let Some(mut g) = streaming_state.0.lock().ok() {
             *g = Some(transcript_rx);
         }
@@ -1410,16 +1437,30 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
         let prewarm_arc = Arc::clone(&app.state::<PrewarmedWsState>().0);
 
         tauri::async_runtime::spawn(async move {
-            let deepgram_key = std::env::var("DEEPGRAM_API_KEY").unwrap_or_default();
+            let (deepgram_key, language, stt_mode, keyterms, replacements) = {
+                let c = hot_cache_arc.read().await;
+                (
+                    c.deepgram_key.clone(),
+                    c.language.clone(),
+                    c.stt_mode.clone(),
+                    c.keyterms.clone(),
+                    c.replacements.clone(),
+                )
+            };
             if deepgram_key.is_empty() {
-                tracing::warn!("[dg_stream] DEEPGRAM_API_KEY not set — WS streaming disabled");
-                let _ = transcript_tx.send(String::new());
+                tracing::warn!(
+                    "[dg_stream] Deepgram API key not configured in preferences — WS streaming disabled"
+                );
                 return;
             }
-
-            let (language, keyterms) = {
-                let c = hot_cache_arc.read().await;
-                (c.language.clone(), c.keyterms.clone())
+            let bias = voice_polish_core::deepgram::BiasPackage {
+                stt_mode: if stt_mode.is_empty() {
+                    voice_polish_core::deepgram::resolve_stt_mode(&language)
+                } else {
+                    stt_mode
+                },
+                keyterms,
+                replacements,
             };
 
             // Take the pre-warmed WS (if one is ready) so this recording skips TLS handshake.
@@ -1437,8 +1478,7 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
             let transcript = dg_stream::stream_to_deepgram(
                 chunk_recv,
                 &deepgram_key,
-                &language,
-                &keyterms,
+                &bias,
                 pre_embed_ref,
                 prewarmed,
             )
@@ -1447,20 +1487,22 @@ fn do_start_recording(shared: &Arc<Mutex<DesktopApp>>, app: &tauri::AppHandle) {
             tracing::info!(
                 "[dg_stream] pre-transcript: {}",
                 transcript
-                    .as_deref()
+                    .as_ref()
+                    .map(|t| t.transcript.as_str())
                     .unwrap_or("<none — WS produced no output>")
             );
-            let _ = transcript_tx.send(transcript.unwrap_or_default());
+            if let Some(transcript) = transcript {
+                let _ = transcript_tx.send(transcript);
+            }
 
             // ── Pre-warm the NEXT recording's WS connection immediately ──────────
             // Fires right after CloseStream+drain complete. By the time the user
             // presses the hotkey again, the TLS handshake is already done.
             let key2 = deepgram_key.clone();
-            let lang2 = language.clone();
-            let terms2 = keyterms.clone();
+            let bias2 = bias.clone();
             let pw_arc2 = Arc::clone(&prewarm_arc);
             tauri::async_runtime::spawn(async move {
-                if let Some(pw) = dg_stream::connect_ws(&key2, &lang2, &terms2).await {
+                if let Some(pw) = dg_stream::connect_ws(&key2, &bias2).await {
                     *pw_arc2.lock().await = Some(pw);
                     tracing::info!("[dg_stream] next WS pre-warmed and ready");
 
@@ -1566,29 +1608,36 @@ fn do_finish_recording(
         // 16kHz × 16-bit × mono = 32,000 bytes/sec, plus 44 byte WAV header
         let wav_duration_s = (wav.len().saturating_sub(44)) as f64 / 32_000.0;
 
-        let pre_transcript: Option<String> = if let Some(rx) = transcript_rx {
+        let pre_transcript: Option<dg_stream::StreamingTranscript> = if let Some(rx) = transcript_rx
+        {
             match tokio::time::timeout(std::time::Duration::from_secs(4), rx).await {
-                Ok(Ok(t)) if !t.is_empty() => {
+                Ok(Ok(t)) if !t.transcript.is_empty() => {
                     // Quality gate: reject suspiciously short transcripts.
                     // Typical Hindi/English speech: ~2 words/second.
                     // If we get fewer than 1 word per 2 seconds of audio,
                     // the WS likely returned a partial — fall back to HTTP STT.
-                    let word_count = t.split_whitespace().count();
+                    let word_count = if t.meta.word_count > 0 {
+                        t.meta.word_count
+                    } else {
+                        t.transcript.split_whitespace().count()
+                    };
                     let expected_min_words = (wav_duration_s / 2.0).max(1.0) as usize;
                     if word_count < expected_min_words && wav_duration_s > 3.0 {
                         tracing::warn!(
-                            "[finish] WS transcript too short: {} words for {:.1}s recording (expected ≥{}) — falling back to HTTP STT. transcript={t:?}",
+                            "[finish] WS transcript too short: {} words for {:.1}s recording (expected ≥{}) — falling back to HTTP STT. transcript={:?}",
                             word_count,
                             wav_duration_s,
-                            expected_min_words
+                            expected_min_words,
+                            t.transcript
                         );
                         None
                     } else {
                         tracing::info!(
-                            "[finish] ✓ WS pre-transcript ready ({} chars, {} words, {:.1}s audio): {t:?}",
-                            t.len(),
+                            "[finish] ✓ WS pre-transcript ready ({} chars, {} words, {:.1}s audio): {:?}",
+                            t.transcript.len(),
                             word_count,
-                            wav_duration_s
+                            wav_duration_s,
+                            t.transcript
                         );
                         Some(t)
                     }
@@ -1652,7 +1701,7 @@ async fn run_voice_polish_sse(
     back_arc: &Arc<Mutex<Option<BackendEndpoint>>>,
     wav: Vec<u8>,
     target_app: Option<String>,
-    pre_transcript: Option<String>,
+    pre_transcript: Option<dg_stream::StreamingTranscript>,
     app: &tauri::AppHandle,
 ) -> Result<api::PolishDone, String> {
     let ep = {
@@ -1676,11 +1725,11 @@ async fn run_voice_polish_sse(
         pre_transcript
             .as_ref()
             .map(|t| {
-                let truncated: String = t.chars().take(80).collect();
-                if truncated.len() < t.len() {
+                let truncated: String = t.transcript.chars().take(80).collect();
+                if truncated.len() < t.transcript.len() {
                     format!("\"{truncated}…\"")
                 } else {
-                    format!("\"{t}\"")
+                    format!("\"{}\"", t.transcript)
                 }
             })
             .unwrap_or_else(|| "none (will use HTTP STT)".into()),
@@ -1787,20 +1836,19 @@ async fn run_voice_polish_sse(
         }
     };
 
-    let mut deferred_audio_upload: Option<(BackendEndpoint, String, Vec<u8>)> = None;
     let done = if let Some(transcript) = pre_transcript {
-        tracing::info!(
-            "[pipeline] fast path: sending transcript-only polish request, deferring WAV upload"
-        );
-        let done =
-            api::stream_voice_polish_transcript(&ep, transcript, target_app, &mut on_polish_event)
-                .await?;
-        if !wav.is_empty() {
-            deferred_audio_upload = Some((ep.clone(), done.recording_id.clone(), wav));
-        }
-        done
+        tracing::info!("[pipeline] fast path: sending WAV + WS transcript to backend");
+        api::stream_voice_polish(
+            &ep,
+            wav,
+            target_app,
+            Some(transcript.transcript),
+            Some(transcript.meta),
+            &mut on_polish_event,
+        )
+        .await?
     } else {
-        api::stream_voice_polish(&ep, wav, target_app, None, &mut on_polish_event).await?
+        api::stream_voice_polish(&ep, wav, target_app, None, None, &mut on_polish_event).await?
     };
 
     let n_typed = token_count.load(std::sync::atomic::Ordering::Relaxed);
@@ -1891,28 +1939,6 @@ async fn run_voice_polish_sse(
             "message": output_message,
         }),
     );
-
-    if let Some((ep_upload, recording_id, wav_upload)) = deferred_audio_upload {
-        let app_for_upload = app.clone();
-        tauri::async_runtime::spawn(async move {
-            match api::upload_recording_audio(&ep_upload, &recording_id, wav_upload).await {
-                Ok(()) => {
-                    tracing::info!(
-                        "[pipeline] deferred audio upload attached to recording {recording_id}"
-                    );
-                    let _ = app_for_upload.emit(
-                        "recording-audio-attached",
-                        serde_json::json!({ "recording_id": recording_id }),
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "[pipeline] deferred audio upload failed for recording {recording_id}: {e}"
-                    );
-                }
-            }
-        });
-    }
 
     Ok(done)
 }
@@ -2127,12 +2153,17 @@ async fn resolve_pending_edit(
         let arc = Arc::clone(&hot_cache.0);
         let ep2 = ep.clone();
         tauri::async_runtime::spawn(async move {
-            if let Ok(terms) = api::get_vocabulary_terms(&ep2).await {
+            if let Ok(bias) = api::get_stt_bias(&ep2).await {
                 tracing::info!(
-                    "[hot_cache] refreshed after pending-edit approval ({} terms)",
-                    terms.len()
+                    "[hot_cache] refreshed after pending-edit approval (mode={} keyterms={} replacements={})",
+                    bias.stt_mode,
+                    bias.keyterms.len(),
+                    bias.replacements.len()
                 );
-                arc.write().await.keyterms = terms;
+                let mut hot = arc.write().await;
+                hot.stt_mode = bias.stt_mode;
+                hot.keyterms = bias.keyterms;
+                hot.replacements = bias.replacements;
             }
         });
     }
@@ -3024,12 +3055,17 @@ async fn watch_for_edit(
                     let hot_arc = Arc::clone(&app.state::<HotPathCache>().0);
                     let ep2 = ep.clone();
                     tokio::spawn(async move {
-                        if let Ok(terms) = api::get_vocabulary_terms(&ep2).await {
+                        if let Ok(bias) = api::get_stt_bias(&ep2).await {
                             tracing::info!(
-                                "[hot_cache] refreshed after learning — {} term(s) now cached",
-                                terms.len()
+                                "[hot_cache] refreshed after learning — mode={} keyterms={} replacements={}",
+                                bias.stt_mode,
+                                bias.keyterms.len(),
+                                bias.replacements.len()
                             );
-                            hot_arc.write().await.keyterms = terms;
+                            let mut hot = hot_arc.write().await;
+                            hot.stt_mode = bias.stt_mode;
+                            hot.keyterms = bias.keyterms;
+                            hot.replacements = bias.replacements;
                         }
                     });
                 }
@@ -3318,10 +3354,10 @@ fn main() {
                         // menu already shows the correct model checkmark.
                         let app_h = app.handle().clone();
                         tauri::async_runtime::spawn(async move {
-                            // Fetch prefs + vocab in parallel — both needed at startup.
-                            let (prefs_res, vocab_res) = tokio::join!(
+                            // Fetch prefs + STT bias in parallel — both needed at startup.
+                            let (prefs_res, stt_bias_res) = tokio::join!(
                                 api::get_preferences(&ep),
-                                api::get_vocabulary_terms(&ep),
+                                api::get_stt_bias(&ep),
                             );
                             if let Ok(prefs) = &prefs_res {
                                 if let Ok(mut cache) = app_h.state::<TrayCache>().0.lock() {
@@ -3337,17 +3373,30 @@ fn main() {
                                 }
                             }
                             // Seed hot-path cache so the first recording needs zero HTTP.
-                            let language = prefs_res.as_ref().ok()
+                            let language = prefs_res
+                                .as_ref()
+                                .ok()
                                 .map(|p| p.language.clone())
                                 .unwrap_or_default();
-                            let keyterms = vocab_res.unwrap_or_default();
-                            if !keyterms.is_empty() {
-                                tracing::info!("[hot_cache] seeded with {} vocab term(s)", keyterms.len());
-                            }
+                            let deepgram_key = prefs_res
+                                .as_ref()
+                                .ok()
+                                .and_then(|p| p.deepgram_api_key.clone())
+                                .unwrap_or_default();
+                            let stt_bias = stt_bias_res.unwrap_or_default();
+                            tracing::info!(
+                                "[hot_cache] seeded mode={} keyterms={} replacements={}",
+                                stt_bias.stt_mode,
+                                stt_bias.keyterms.len(),
+                                stt_bias.replacements.len()
+                            );
                             let hot = app_h.state::<HotPathCache>();
                             let mut c = hot.0.write().await;
                             c.language = language;
-                            c.keyterms = keyterms;
+                            c.deepgram_key = deepgram_key;
+                            c.stt_mode = stt_bias.stt_mode;
+                            c.keyterms = stt_bias.keyterms;
+                            c.replacements = stt_bias.replacements;
                         });
 
                         // ── Periodic cache refresh every 5 minutes ────────────
@@ -3362,12 +3411,19 @@ fn main() {
                             interval.tick().await; // skip the immediate first tick
                             loop {
                                 interval.tick().await;
-                                match api::get_vocabulary_terms(&ep2).await {
-                                    Ok(terms) => {
+                                match api::get_stt_bias(&ep2).await {
+                                    Ok(bias) => {
                                         tracing::debug!(
-                                            "[hot_cache] periodic refresh — {} term(s)", terms.len()
+                                            "[hot_cache] periodic refresh — mode={} keyterms={} replacements={}",
+                                            bias.stt_mode,
+                                            bias.keyterms.len(),
+                                            bias.replacements.len()
                                         );
-                                        app_h.state::<HotPathCache>().0.write().await.keyterms = terms;
+                                        let hot_state = app_h.state::<HotPathCache>();
+                                        let mut hot = hot_state.0.write().await;
+                                        hot.stt_mode = bias.stt_mode;
+                                        hot.keyterms = bias.keyterms;
+                                        hot.replacements = bias.replacements;
                                     }
                                     Err(e) => {
                                         tracing::warn!("[hot_cache] periodic refresh failed: {e}");

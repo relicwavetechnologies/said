@@ -33,8 +33,8 @@ type ToneKey = (typeof TONE_PRESETS)[number]["key"];
 // ── Language options ──────────────────────────────────────────────────────────
 
 const LANGUAGES = [
-  { key: "auto",  label: "Auto-detect" },
-  { key: "hi",    label: "Hindi / Hinglish" },
+  { key: "auto",  label: "Auto (Hindi + English)" },
+  { key: "hi",    label: "Hindi" },
   { key: "multi", label: "Hindi + English (code-switching)" },
   { key: "en",    label: "English" },
   { key: "en-IN", label: "English (India)" },
@@ -571,7 +571,7 @@ export function SettingsView({
               <div className="flex-1">
                 <p className="text-[13px] font-medium text-foreground mb-1">Transcription Language</p>
                 <p className="text-[12px] text-muted-foreground">
-                  Use "code-switching" if you mix Hindi and English mid-sentence
+                  Use "Auto" for mixed Hindi + English, or "code-switching" to force multilingual recognition
                 </p>
               </div>
               <select

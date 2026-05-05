@@ -73,6 +73,35 @@ pub fn upsert(
     correct_form: &str,
     bump: f64,
 ) -> bool {
+    upsert_inner(pool, user_id, transcript_form, correct_form, bump, None)
+}
+
+pub fn upsert_with_language(
+    pool: &DbPool,
+    user_id: &str,
+    transcript_form: &str,
+    correct_form: &str,
+    bump: f64,
+    language: &str,
+) -> bool {
+    upsert_inner(
+        pool,
+        user_id,
+        transcript_form,
+        correct_form,
+        bump,
+        Some(language),
+    )
+}
+
+fn upsert_inner(
+    pool: &DbPool,
+    user_id: &str,
+    transcript_form: &str,
+    correct_form: &str,
+    bump: f64,
+    language: Option<&str>,
+) -> bool {
     let conn = match pool.get() {
         Ok(c) => c,
         Err(_) => return false,
@@ -91,13 +120,14 @@ pub fn upsert(
     let rows = conn
         .execute(
             "INSERT INTO stt_replacements
-            (user_id, transcript_form, correct_form, phonetic_key, weight, use_count, last_used)
-         VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)
+            (user_id, transcript_form, correct_form, phonetic_key, weight, use_count, last_used, language)
+         VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7)
          ON CONFLICT(user_id, transcript_form, correct_form) DO UPDATE SET
             weight    = MIN(5.0, weight + ?5),
             use_count = use_count + 1,
-            last_used = excluded.last_used",
-            params![user_id, from, to, key, bump, now],
+            last_used = excluded.last_used,
+            language  = COALESCE(excluded.language, stt_replacements.language)",
+            params![user_id, from, to, key, bump, now, language],
         )
         .unwrap_or(0);
 
@@ -132,14 +162,40 @@ pub fn upsert_aliases(
     correct_form: &str,
     bump: f64,
 ) -> usize {
+    upsert_aliases_for_language(
+        pool,
+        user_id,
+        transcript_window,
+        polish_window,
+        correct_form,
+        bump,
+        "",
+    )
+}
+
+pub fn upsert_aliases_for_language(
+    pool: &DbPool,
+    user_id: &str,
+    transcript_window: &str,
+    polish_window: &str,
+    correct_form: &str,
+    bump: f64,
+    language: &str,
+) -> usize {
     let mut written = 0;
-    if !polish_window.trim().is_empty() && upsert(pool, user_id, polish_window, correct_form, bump)
+    let lang = if language.trim().is_empty() {
+        None
+    } else {
+        Some(language)
+    };
+    if !polish_window.trim().is_empty()
+        && upsert_inner(pool, user_id, polish_window, correct_form, bump, lang)
     {
         written += 1;
     }
     if !transcript_window.trim().is_empty()
         && transcript_window.trim() != polish_window.trim()
-        && upsert(pool, user_id, transcript_window, correct_form, bump)
+        && upsert_inner(pool, user_id, transcript_window, correct_form, bump, lang)
     {
         written += 1;
     }
@@ -215,32 +271,59 @@ pub fn delete_by_correct_form(pool: &DbPool, user_id: &str, correct_form: &str) 
 /// Load all replacements for a user.  Always small (tens of rows); we apply
 /// them in a single linear pass over the transcript.
 pub fn load_all(pool: &DbPool, user_id: &str) -> Vec<SttReplacement> {
+    load_for_language(pool, user_id, "")
+}
+
+pub fn load_for_language(pool: &DbPool, user_id: &str, language: &str) -> Vec<SttReplacement> {
     let conn = match pool.get() {
         Ok(c) => c,
         Err(_) => return vec![],
     };
-    let mut stmt = match conn.prepare(
+    let sql = if language.trim().is_empty() {
         "SELECT transcript_form, correct_form, phonetic_key, weight, use_count, last_used
            FROM stt_replacements
           WHERE user_id = ?1
-          ORDER BY weight DESC",
-    ) {
+          ORDER BY weight DESC"
+    } else {
+        "SELECT transcript_form, correct_form, phonetic_key, weight, use_count, last_used
+           FROM stt_replacements
+          WHERE user_id = ?1
+            AND (language = ?2 OR language IS NULL)
+          ORDER BY weight DESC"
+    };
+    let mut stmt = match conn.prepare(sql) {
         Ok(s) => s,
         Err(_) => return vec![],
     };
-    stmt.query_map(params![user_id], |row| {
-        Ok(SttReplacement {
-            transcript_form: row.get(0)?,
-            correct_form: row.get(1)?,
-            phonetic_key: row.get(2)?,
-            weight: row.get(3)?,
-            use_count: row.get(4)?,
-            last_used: row.get(5)?,
+    if language.trim().is_empty() {
+        stmt.query_map(params![user_id], |row| {
+            Ok(SttReplacement {
+                transcript_form: row.get(0)?,
+                correct_form: row.get(1)?,
+                phonetic_key: row.get(2)?,
+                weight: row.get(3)?,
+                use_count: row.get(4)?,
+                last_used: row.get(5)?,
+            })
         })
-    })
-    .ok()
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default()
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    } else {
+        stmt.query_map(params![user_id, language], |row| {
+            Ok(SttReplacement {
+                transcript_form: row.get(0)?,
+                correct_form: row.get(1)?,
+                phonetic_key: row.get(2)?,
+                weight: row.get(3)?,
+                use_count: row.get(4)?,
+                last_used: row.get(5)?,
+            })
+        })
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
 }
 
 /// Apply replacements to a transcript. Pure function; safe to unit-test.
@@ -554,6 +637,7 @@ mod tests {
                  weight           REAL NOT NULL DEFAULT 1.0,
                  use_count        INTEGER NOT NULL DEFAULT 1,
                  last_used        INTEGER NOT NULL,
+                 language         TEXT,
                  UNIQUE(user_id, transcript_form, correct_form)
              );",
         )

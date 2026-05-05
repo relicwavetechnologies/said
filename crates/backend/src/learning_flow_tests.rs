@@ -52,6 +52,7 @@ fn pool() -> DbPool {
              weight           REAL NOT NULL DEFAULT 1.0,
              use_count        INTEGER NOT NULL DEFAULT 1,
              last_used        INTEGER NOT NULL,
+             language         TEXT,
              UNIQUE(user_id, transcript_form, correct_form)
          );
 

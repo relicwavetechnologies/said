@@ -6,6 +6,7 @@
 use reqwest::Client;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
+use voice_polish_core::deepgram::{BiasPackage, TranscriptMeta, build_batch_url};
 
 const DEEPGRAM_URL: &str = "https://api.deepgram.com/v1/listen";
 
@@ -30,6 +31,8 @@ struct DGAlternative {
     transcript: String,
     confidence: f64,
     #[serde(default)]
+    languages: Vec<String>,
+    #[serde(default)]
     words: Vec<DGWord>,
 }
 #[derive(Deserialize)]
@@ -38,6 +41,8 @@ struct DGWord {
     confidence: f64,
     #[serde(default)]
     punctuated_word: Option<String>,
+    #[serde(default)]
+    language: Option<String>,
 }
 
 pub struct TranscriptResult {
@@ -50,6 +55,24 @@ pub struct TranscriptResult {
     pub confidence: f64,
     /// Number of words flagged as low-confidence.
     pub uncertain_count: usize,
+    pub mean_word_confidence: f64,
+    pub word_count: usize,
+    pub languages: Vec<String>,
+    pub stt_mode: String,
+}
+
+impl TranscriptResult {
+    pub fn meta(&self) -> TranscriptMeta {
+        TranscriptMeta {
+            enriched_transcript: self.enriched_transcript.clone(),
+            confidence: self.confidence,
+            mean_word_confidence: self.mean_word_confidence,
+            low_confidence_count: self.uncertain_count,
+            word_count: self.word_count,
+            languages: self.languages.clone(),
+            stt_mode: self.stt_mode.clone(),
+        }
+    }
 }
 
 /// Send WAV audio bytes to Deepgram and return the top transcript.
@@ -60,35 +83,25 @@ pub async fn transcribe(
     client: &Client,
     api_key: &str,
     wav_data: Vec<u8>,
-    language: &str,
-    keyterms: &[String],
+    bias: &BiasPackage,
 ) -> Result<TranscriptResult, String> {
-    let lang = if language.is_empty() || language == "auto" {
-        "hi"
-    } else {
-        language
-    };
-
-    // Build URL — smart_format intentionally omitted: it mangles numbers into
-    // times/dates/phones (e.g. "2305" → "2 03:05") which breaks dictation of
-    // email addresses, IDs, and numbers in Hindi context.
-    let mut url = format!("{DEEPGRAM_URL}?model=nova-3&language={lang}&punctuate=true");
-    let bias_count = keyterms.len().min(100);
-    for term in keyterms.iter().take(100) {
-        let cleaned = term.trim();
-        if cleaned.is_empty() {
-            continue;
-        }
-        url.push_str("&keyterm=");
-        url.push_str(&urlencode(cleaned));
-    }
-    if bias_count > 0 {
-        debug!("[stt] biasing Deepgram with {bias_count} personal term(s)");
+    let url = build_batch_url(DEEPGRAM_URL, bias);
+    if !bias.keyterms.is_empty() || !bias.replacements.is_empty() {
+        debug!(
+            "[stt] biasing Deepgram with {} keyterm(s), {} replacement(s)",
+            bias.keyterms
+                .len()
+                .min(voice_polish_core::deepgram::MAX_KEYTERMS),
+            bias.replacements
+                .len()
+                .min(voice_polish_core::deepgram::MAX_REPLACEMENTS),
+        );
     }
 
     debug!(
         "[stt] sending {} bytes to Deepgram (lang={lang})",
-        wav_data.len()
+        wav_data.len(),
+        lang = bias.stt_mode,
     );
 
     let resp = client
@@ -127,12 +140,19 @@ pub async fn transcribe(
     }
 
     // Build enriched transcript with confidence markers
-    let (enriched, uncertain_count) = if alt.words.is_empty() {
-        // No word-level data — fall back to plain transcript
-        (alt.transcript.clone(), 0)
-    } else {
-        enrich_words(&alt.words)
-    };
+    let (enriched, uncertain_count, mean_word_confidence, word_count, word_languages) =
+        if alt.words.is_empty() {
+            // No word-level data — fall back to plain transcript
+            (
+                alt.transcript.clone(),
+                0,
+                alt.confidence,
+                alt.transcript.split_whitespace().count(),
+                vec![],
+            )
+        } else {
+            enrich_words(&alt.words)
+        };
 
     debug!(
         "[stt] transcript ({:.2}): {}",
@@ -152,17 +172,33 @@ pub async fn transcribe(
         enriched_transcript: enriched,
         confidence: alt.confidence,
         uncertain_count,
+        mean_word_confidence,
+        word_count,
+        languages: if alt.languages.is_empty() {
+            word_languages
+        } else {
+            alt.languages
+        },
+        stt_mode: bias.stt_mode.clone(),
     })
 }
 
 /// Build an enriched transcript from word-level data.
 /// Words with confidence < threshold are marked as `[word?XX%]`.
-fn enrich_words(words: &[DGWord]) -> (String, usize) {
+fn enrich_words(words: &[DGWord]) -> (String, usize, f64, usize, Vec<String>) {
     let mut parts = Vec::with_capacity(words.len());
     let mut uncertain = 0usize;
+    let mut confidence_sum = 0.0_f64;
+    let mut languages = Vec::new();
 
     for w in words {
         let display = w.punctuated_word.as_deref().unwrap_or(&w.word);
+        confidence_sum += w.confidence;
+        if let Some(language) = &w.language {
+            if !languages.iter().any(|seen| seen == language) {
+                languages.push(language.clone());
+            }
+        }
 
         if w.confidence < LOW_CONFIDENCE_THRESHOLD {
             parts.push(format!("[{}?{:.0}%]", display, w.confidence * 100.0));
@@ -172,38 +208,40 @@ fn enrich_words(words: &[DGWord]) -> (String, usize) {
         }
     }
 
-    (parts.join(" "), uncertain)
-}
-
-/// Minimal URL encoder for query-string values: percent-encode anything that
-/// isn't unreserved per RFC 3986 (alphanumerics, `-`, `_`, `.`, `~`).  Spaces
-/// become `%20` (not `+`) for path/query consistency.
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => {
-                use std::fmt::Write;
-                let _ = write!(out, "%{:02X}", b);
-            }
-        }
-    }
-    out
+    (
+        parts.join(" "),
+        uncertain,
+        confidence_sum / words.len() as f64,
+        words.len(),
+        languages,
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::urlencode;
+    use super::DEEPGRAM_URL;
+    use voice_polish_core::deepgram::{
+        BiasPackage, ReplacementRule, build_batch_url, resolve_stt_mode,
+    };
 
     #[test]
-    fn urlencode_basics() {
-        assert_eq!(urlencode("hello"), "hello");
-        assert_eq!(urlencode("n8n"), "n8n");
-        assert_eq!(urlencode("hi there"), "hi%20there");
-        assert_eq!(urlencode("a&b"), "a%26b");
-        assert_eq!(urlencode("a=b"), "a%3Db");
+    fn auto_maps_to_multi_for_batch() {
+        assert_eq!(resolve_stt_mode("auto"), "multi");
+    }
+
+    #[test]
+    fn batch_url_contains_replacements() {
+        let bias = BiasPackage {
+            stt_mode: "multi".into(),
+            keyterms: vec!["EMIAC".into()],
+            replacements: vec![ReplacementRule {
+                find: "n10n".into(),
+                replace: Some("n8n".into()),
+            }],
+        };
+        let url = build_batch_url(DEEPGRAM_URL, &bias);
+        assert!(url.contains("language=multi"));
+        assert!(url.contains("keyterm=EMIAC"));
+        assert!(url.contains("replace=n10n:n8n"));
     }
 }

@@ -8,6 +8,7 @@ pub mod openai_oauth;
 pub mod pending_edits;
 pub mod pre_embed;
 pub mod prefs;
+pub mod stt;
 pub mod text;
 pub mod vocabulary;
 pub mod voice;

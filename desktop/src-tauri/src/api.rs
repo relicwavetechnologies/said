@@ -8,6 +8,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, warn};
+use voice_polish_core::deepgram::{BiasPackage, TranscriptMeta};
 
 use crate::backend::BackendEndpoint;
 
@@ -144,6 +145,7 @@ pub async fn stream_voice_polish<F>(
     wav_data: Vec<u8>,
     target_app: Option<String>,
     pre_transcript: Option<String>,
+    pre_transcript_meta: Option<TranscriptMeta>,
     on_event: F,
 ) -> Result<PolishDone, String>
 where
@@ -168,6 +170,12 @@ where
     // P5: forward pre-transcribed text so backend can skip Deepgram HTTP call
     if let Some(transcript) = pre_transcript {
         form = form.text("pre_transcript", transcript);
+    }
+    if let Some(meta) = pre_transcript_meta {
+        form = form.text(
+            "pre_transcript_meta",
+            serde_json::to_string(&meta).map_err(|e| format!("encode transcript meta: {e}"))?,
+        );
     }
 
     let resp = client
@@ -199,6 +207,7 @@ pub async fn stream_voice_polish_transcript<F>(
     ep: &BackendEndpoint,
     transcript: String,
     target_app: Option<String>,
+    pre_transcript_meta: Option<TranscriptMeta>,
     on_event: F,
 ) -> Result<PolishDone, String>
 where
@@ -209,6 +218,7 @@ where
     let body = serde_json::json!({
         "transcript": transcript,
         "target_app": target_app,
+        "pre_transcript_meta": pre_transcript_meta,
     });
 
     let resp = client
@@ -940,6 +950,20 @@ pub async fn get_vocabulary_terms_for_language(
         .await
         .map_err(|e| format!("parse vocab terms: {e}"))?;
     Ok(resp.terms)
+}
+
+pub async fn get_stt_bias(ep: &BackendEndpoint) -> Result<BiasPackage, String> {
+    let url = format!("{}/v1/stt/bias", ep.url);
+    Client::new()
+        .get(&url)
+        .header("Authorization", ep.bearer())
+        .timeout(std::time::Duration::from_millis(800))
+        .send()
+        .await
+        .map_err(|e| format!("get stt bias failed: {e}"))?
+        .json::<BiasPackage>()
+        .await
+        .map_err(|e| format!("parse stt bias: {e}"))
 }
 
 // ── Vocabulary management API (settings UI) ─────────────────────────────────

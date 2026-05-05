@@ -197,6 +197,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/v1/preferences", get(routes::prefs::get_prefs))
         .route("/v1/preferences", patch(routes::prefs::patch_prefs))
         .route("/v1/corrections", get(routes::prefs::get_corrections))
+        .route("/v1/stt/bias", get(routes::stt::get_bias))
         // Cloud auth bridge — store/clear cloud token, query cloud status
         .route(
             "/v1/cloud/token",

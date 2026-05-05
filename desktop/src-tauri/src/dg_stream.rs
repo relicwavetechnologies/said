@@ -16,6 +16,7 @@ use tokio_tungstenite::{
     tungstenite::{Message, client::IntoClientRequest},
 };
 use tracing::{debug, info, warn};
+use voice_polish_core::deepgram::{BiasPackage, TranscriptMeta, build_ws_url};
 use voice_polish_recorder::{ChunkReceiver, SAMPLE_RATE, resample_to_16k};
 
 /// Confidence threshold — words below this get [word?XX%] markers for the LLM.
@@ -28,59 +29,27 @@ pub struct PrewarmedWs {
     pub ws: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
-    pub language: String,
-    pub keyterms: Vec<String>,
+    pub bias: BiasPackage,
     pub created_at: std::time::Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct StreamingTranscript {
+    pub transcript: String,
+    pub meta: TranscriptMeta,
 }
 
 /// Deepgram closes idle sockets after ~10s with no audio or KeepAlive.
 /// Discard pre-warms older than this to avoid handing a dead socket to streaming.
 const PREWARM_MAX_AGE: Duration = Duration::from_secs(8);
 
-/// Build the Deepgram WS URL for the given language and keyterms.
-fn build_ws_url(lang: &str, keyterms: &[String]) -> (String, usize) {
-    let endpointing = if lang == "multi" { 100 } else { 500 };
-    let mut url_str = format!(
-        "wss://api.deepgram.com/v1/listen\
-         ?model=nova-3\
-         &language={lang}\
-         &punctuate=true\
-         &encoding=linear16\
-         &sample_rate={SAMPLE_RATE}\
-         &channels=1\
-         &interim_results=true\
-         &endpointing={endpointing}\
-         &utterance_end_ms=1000"
-    );
-    let mut bias_count = 0usize;
-    for term in keyterms.iter().take(100) {
-        let cleaned = term.trim();
-        if cleaned.is_empty() {
-            continue;
-        }
-        url_str.push_str("&keyterm=");
-        url_str.push_str(&urlencode(cleaned));
-        bias_count += 1;
-    }
-    (url_str, bias_count)
-}
-
 /// Open a fresh Deepgram WebSocket connection and return it ready for audio.
 /// Called both for cold-start and for pre-warming the next recording's connection.
-pub async fn connect_ws(
-    deepgram_key: &str,
-    language: &str,
-    keyterms: &[String],
-) -> Option<PrewarmedWs> {
+pub async fn connect_ws(deepgram_key: &str, bias: &BiasPackage) -> Option<PrewarmedWs> {
     if deepgram_key.is_empty() {
         return None;
     }
-    let lang = if language.is_empty() || language == "auto" {
-        "hi"
-    } else {
-        language
-    };
-    let (url_str, bias_count) = build_ws_url(lang, keyterms);
+    let url_str = build_ws_url("wss://api.deepgram.com/v1/listen", bias, SAMPLE_RATE);
 
     let mut req = match url_str.into_client_request() {
         Ok(r) => r,
@@ -112,11 +81,15 @@ pub async fn connect_ws(
             None
         }
         Ok(Ok((ws, _))) => {
-            info!("[dg_stream] ✓ WS connected in {ms}ms (lang={lang} keyterms={bias_count})");
+            info!(
+                "[dg_stream] ✓ WS connected in {ms}ms (lang={} keyterms={} replacements={})",
+                bias.stt_mode,
+                bias.keyterms.len(),
+                bias.replacements.len(),
+            );
             Some(PrewarmedWs {
                 ws,
-                language: lang.to_string(),
-                keyterms: keyterms.to_vec(),
+                bias: bias.clone(),
                 created_at: std::time::Instant::now(),
             })
         }
@@ -131,34 +104,27 @@ pub async fn connect_ws(
 pub async fn stream_to_deepgram(
     chunk_recv: ChunkReceiver,
     deepgram_key: &str,
-    language: &str,
-    keyterms: &[String],
+    bias: &BiasPackage,
     pre_embed: Option<(&str, &str)>,
     prewarmed: Option<PrewarmedWs>,
-) -> Option<String> {
+) -> Option<StreamingTranscript> {
     if deepgram_key.is_empty() {
         warn!("[dg_stream] no Deepgram API key — WS streaming disabled");
         return None;
     }
 
-    let lang = if language.is_empty() || language == "auto" {
-        "hi"
-    } else {
-        language
-    };
-
     // Use pre-warmed WS if params match AND it's still fresh enough.
     let ws = if let Some(pw) = prewarmed {
         let age = pw.created_at.elapsed();
-        if pw.language != lang || pw.keyterms != keyterms {
+        if pw.bias != *bias {
             info!("[dg_stream] pre-warm params mismatch — connecting fresh");
-            connect_ws(deepgram_key, lang, keyterms).await?.ws
+            connect_ws(deepgram_key, bias).await?.ws
         } else if age > PREWARM_MAX_AGE {
             info!(
                 "[dg_stream] pre-warm stale (age={}ms) — connecting fresh",
                 age.as_millis()
             );
-            connect_ws(deepgram_key, lang, keyterms).await?.ws
+            connect_ws(deepgram_key, bias).await?.ws
         } else {
             info!(
                 "[dg_stream] ✓ using pre-warmed WS (0ms connect, age={}ms)",
@@ -168,7 +134,7 @@ pub async fn stream_to_deepgram(
         }
     } else {
         info!("[dg_stream] no pre-warm — connecting fresh");
-        connect_ws(deepgram_key, lang, keyterms).await?.ws
+        connect_ws(deepgram_key, bias).await?.ws
     };
 
     let (mut ws_tx, mut ws_rx) = ws.split();
@@ -197,6 +163,10 @@ pub async fn stream_to_deepgram(
 
     // ── Main loop: send PCM chunks + receive Deepgram messages ───────────────
     let mut transcript_parts: Vec<String> = Vec::new();
+    let mut total_word_count = 0usize;
+    let mut total_low_confidence = 0usize;
+    let mut total_confidence = 0.0_f64;
+    let mut languages_seen: Vec<String> = vec![];
     let mut chunks_sent = 0usize;
     // Track whether speech_final arrived during streaming so the drain loop
     // can start its 500ms timer immediately instead of waiting the full 2500ms.
@@ -276,10 +246,18 @@ pub async fn stream_to_deepgram(
                                 let is_f = v["is_final"].as_bool().unwrap_or(false);
                                 let sp_f = v["speech_final"].as_bool().unwrap_or(false);
                                 if is_f {
-                                    let enriched = enrich_from_words(&v["channel"]["alternatives"][0]["words"]);
-                                    if !enriched.is_empty() {
+                                    if let Some(chunk) = extract_result_chunk(&v) {
+                                        let enriched = chunk.enriched.clone();
                                         info!("[dg_stream] segment: {enriched:?} (speech_final={sp_f})");
                                         transcript_parts.push(enriched);
+                                        total_word_count += chunk.word_count;
+                                        total_low_confidence += chunk.low_confidence_count;
+                                        total_confidence += chunk.confidence_sum;
+                                        for language in chunk.languages {
+                                            if !languages_seen.iter().any(|seen| seen == &language) {
+                                                languages_seen.push(language);
+                                            }
+                                        }
                                     }
                                 }
                                 if sp_f {
@@ -358,10 +336,16 @@ pub async fn stream_to_deepgram(
                         let is_f = v["is_final"].as_bool().unwrap_or(false);
                         let sp_f = v["speech_final"].as_bool().unwrap_or(false);
                         if is_f {
-                            let enriched =
-                                enrich_from_words(&v["channel"]["alternatives"][0]["words"]);
-                            if !enriched.is_empty() {
-                                transcript_parts.push(enriched);
+                            if let Some(chunk) = extract_result_chunk(&v) {
+                                transcript_parts.push(chunk.enriched);
+                                total_word_count += chunk.word_count;
+                                total_low_confidence += chunk.low_confidence_count;
+                                total_confidence += chunk.confidence_sum;
+                                for language in chunk.languages {
+                                    if !languages_seen.iter().any(|seen| seen == &language) {
+                                        languages_seen.push(language);
+                                    }
+                                }
                             }
                         }
                         if sp_f {
@@ -397,13 +381,29 @@ pub async fn stream_to_deepgram(
         warn!("[dg_stream] no transcript — chunks={chunks_sent} drain={drain_ms}ms");
         None
     } else {
+        let mean_word_confidence = if total_word_count == 0 {
+            0.0
+        } else {
+            total_confidence / total_word_count as f64
+        };
         info!(
             "[dg_stream] ✓ transcript ready — drain={}ms chunks={} parts={} : {full:?}",
             drain_ms,
             chunks_sent,
             transcript_parts.len()
         );
-        Some(full)
+        Some(StreamingTranscript {
+            transcript: full.clone(),
+            meta: TranscriptMeta {
+                enriched_transcript: full,
+                confidence: mean_word_confidence,
+                mean_word_confidence,
+                low_confidence_count: total_low_confidence,
+                word_count: total_word_count,
+                languages: languages_seen,
+                stt_mode: bias.stt_mode.clone(),
+            },
+        })
     }
 }
 
@@ -412,15 +412,28 @@ pub async fn stream_to_deepgram(
 /// which words to scrutinize for context-based correction.
 ///
 /// Falls back to joining plain `punctuated_word`/`word` fields if parsing fails.
-fn enrich_from_words(words_val: &Value) -> String {
+struct ResultChunk {
+    enriched: String,
+    word_count: usize,
+    low_confidence_count: usize,
+    confidence_sum: f64,
+    languages: Vec<String>,
+}
+
+fn extract_result_chunk(v: &Value) -> Option<ResultChunk> {
+    let alt = v["channel"]["alternatives"].as_array()?.first()?;
+    let words_val = &alt["words"];
     let Some(words) = words_val.as_array() else {
-        return String::new();
+        return None;
     };
     if words.is_empty() {
-        return String::new();
+        return None;
     }
 
     let mut parts = Vec::with_capacity(words.len());
+    let mut languages = Vec::new();
+    let mut confidence_sum = 0.0_f64;
+    let mut low_confidence_count = 0usize;
     for w in words {
         let word = w["punctuated_word"]
             .as_str()
@@ -431,14 +444,35 @@ fn enrich_from_words(words_val: &Value) -> String {
         }
 
         let conf = w["confidence"].as_f64().unwrap_or(1.0);
+        confidence_sum += conf;
+        if let Some(language) = w["language"].as_str() {
+            if !languages.iter().any(|seen| seen == language) {
+                languages.push(language.to_string());
+            }
+        }
         if conf < LOW_CONFIDENCE_THRESHOLD {
             parts.push(format!("[{}?{:.0}%]", word, conf * 100.0));
+            low_confidence_count += 1;
         } else {
             parts.push(word.to_string());
         }
     }
 
-    parts.join(" ")
+    if let Some(alt_languages) = alt["languages"].as_array() {
+        for language in alt_languages.iter().filter_map(|value| value.as_str()) {
+            if !languages.iter().any(|seen| seen == language) {
+                languages.push(language.to_string());
+            }
+        }
+    }
+
+    Some(ResultChunk {
+        enriched: parts.join(" "),
+        word_count: words.len(),
+        low_confidence_count,
+        confidence_sum,
+        languages,
+    })
 }
 
 /// Strip `[word?XX%]` confidence markers and join transcript parts into plain
@@ -488,34 +522,45 @@ fn plain_for_embed(parts: &[String]) -> String {
     result
 }
 
-/// Minimal URL encoder for query-string values (RFC 3986 unreserved set).
-/// Spaces become `%20` (not `+`).
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => {
-                use std::fmt::Write;
-                let _ = write!(out, "%{:02X}", b);
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
-    use super::urlencode;
+    use super::extract_result_chunk;
+    use serde_json::json;
+    use voice_polish_core::deepgram::{BiasPackage, ReplacementRule, build_ws_url};
 
     #[test]
-    fn urlencode_handles_jargon_and_special_chars() {
-        assert_eq!(urlencode("n8n"), "n8n");
-        assert_eq!(urlencode("k8s"), "k8s");
-        assert_eq!(urlencode("hello"), "hello");
-        assert_eq!(urlencode("hi there"), "hi%20there");
-        assert_eq!(urlencode("a&b=c"), "a%26b%3Dc");
+    fn ws_url_uses_multi_mode_and_replacements() {
+        let bias = BiasPackage {
+            stt_mode: "multi".into(),
+            keyterms: vec!["EMIAC".into()],
+            replacements: vec![ReplacementRule {
+                find: "n10n".into(),
+                replace: Some("n8n".into()),
+            }],
+        };
+        let url = build_ws_url("wss://api.deepgram.com/v1/listen", &bias, SAMPLE_RATE);
+        assert!(url.contains("language=multi"));
+        assert!(url.contains("endpointing=100"));
+        assert!(url.contains("replace=n10n:n8n"));
+    }
+
+    #[test]
+    fn result_chunk_tracks_languages_and_confidence() {
+        let value = json!({
+            "channel": {
+                "alternatives": [{
+                    "languages": ["hi", "en"],
+                    "words": [
+                        { "word": "EMIAC", "confidence": 0.95, "language": "en" },
+                        { "word": "hai", "confidence": 0.61, "language": "hi" }
+                    ]
+                }]
+            }
+        });
+        let chunk = extract_result_chunk(&value).expect("chunk");
+        assert_eq!(chunk.word_count, 2);
+        assert_eq!(chunk.low_confidence_count, 1);
+        assert!(chunk.languages.contains(&"en".to_string()));
+        assert!(chunk.enriched.contains("[hai?61%]"));
     }
 }
