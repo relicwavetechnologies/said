@@ -3167,8 +3167,10 @@ fn extract_kept(polished: &str, post_paste: &str, last_val: &str) -> String {
 ///   like token (digits + letters mixed, e.g. n8n, k8s, v2.0) is involved,
 ///   which is exactly the case where small char diffs ARE meaningful.
 fn is_meaningful_edit(polished: &str, user_kept: &str) -> bool {
-    let p = normalize_for_diff(polished);
-    let k = normalize_for_diff(user_kept);
+    let p_raw = normalize_spacing_and_punctuation(polished);
+    let k_raw = normalize_spacing_and_punctuation(user_kept);
+    let p = p_raw.to_lowercase();
+    let k = k_raw.to_lowercase();
 
     if p == k {
         tracing::info!("[edit-gate] normalized texts identical — not meaningful");
@@ -3179,20 +3181,26 @@ fn is_meaningful_edit(polished: &str, user_kept: &str) -> bool {
     // Compute this first so the char-distance gate can be context-aware.
     let p_words: Vec<&str> = p.split_whitespace().collect();
     let k_words: Vec<&str> = k.split_whitespace().collect();
+    let p_raw_words: Vec<&str> = p_raw.split_whitespace().collect();
+    let k_raw_words: Vec<&str> = k_raw.split_whitespace().collect();
     let max_len = p_words.len().max(k_words.len());
     let mut word_diffs = 0usize;
     let mut jargon_diff = false;
     for i in 0..max_len {
         let pw = p_words.get(i).copied().unwrap_or("");
         let kw = k_words.get(i).copied().unwrap_or("");
-        if pw != kw
-            && (pw.chars().any(|c| c.is_alphanumeric()) || kw.chars().any(|c| c.is_alphanumeric()))
+        let pw_raw = p_raw_words.get(i).copied().unwrap_or("");
+        let kw_raw = k_raw_words.get(i).copied().unwrap_or("");
+        let pw_core = alnum_word_core(pw);
+        let kw_core = alnum_word_core(kw);
+        if pw_core != kw_core
+            && (!pw_core.is_empty() || !kw_core.is_empty())
         {
             word_diffs += 1;
             // Jargon signal: if EITHER side of the diff has digits, the edit
             // is almost certainly a meaningful jargon correction (n8n, k8s,
             // v2.0, IP0 → IPO, etc.) regardless of how few chars differ.
-            if pw.chars().any(|c| c.is_ascii_digit()) || kw.chars().any(|c| c.is_ascii_digit()) {
+            if looks_jargon_like_word(pw_raw) || looks_jargon_like_word(kw_raw) {
                 jargon_diff = true;
             }
         }
@@ -3222,13 +3230,12 @@ fn is_meaningful_edit(polished: &str, user_kept: &str) -> bool {
     true
 }
 
-/// Normalize text for edit comparison: collapse whitespace, lowercase,
-/// replace common Unicode punctuation variants with ASCII equivalents.
-fn normalize_for_diff(s: &str) -> String {
+/// Normalize text for edit comparison: collapse whitespace and replace common
+/// Unicode punctuation variants with ASCII equivalents while preserving case.
+fn normalize_spacing_and_punctuation(s: &str) -> String {
     s.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-        .to_lowercase()
         .replace('\u{201c}', "\"") // left double smart quote
         .replace('\u{201d}', "\"") // right double smart quote
         .replace('\u{2018}', "'") // left single smart quote
@@ -3237,6 +3244,37 @@ fn normalize_for_diff(s: &str) -> String {
         .replace('\u{2013}', "-") // en-dash
         .replace('\u{2026}', "...") // ellipsis
         .replace('\u{00a0}', " ") // non-breaking space
+}
+
+fn looks_jargon_like_word(word: &str) -> bool {
+    let trimmed = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '.');
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let has_digit = trimmed.chars().any(|c| c.is_ascii_digit());
+    let alpha_len = trimmed.chars().filter(|c| c.is_ascii_alphabetic()).count();
+    let all_caps_alpha = alpha_len >= 2
+        && alpha_len <= 8
+        && trimmed.chars().all(|c| !c.is_ascii_lowercase() || !c.is_ascii_alphabetic())
+        && trimmed.chars().any(|c| c.is_ascii_uppercase());
+    let has_upper = trimmed.chars().any(|c| c.is_ascii_uppercase());
+    let has_lower = trimmed.chars().any(|c| c.is_ascii_lowercase());
+    let mixed_case = has_upper && has_lower;
+    let codey_punct = trimmed.contains('_') || trimmed.contains('-') || trimmed.contains('.');
+
+    has_digit || all_caps_alpha || mixed_case || codey_punct
+}
+
+fn alnum_word_core(word: &str) -> &str {
+    let start = word
+        .find(|c: char| c.is_alphanumeric())
+        .unwrap_or(word.len());
+    let end = word
+        .rfind(|c: char| c.is_alphanumeric())
+        .map(|i| i + word[i..].chars().next().unwrap().len_utf8())
+        .unwrap_or(start);
+    &word[start..end]
 }
 
 /// Simple positional character distance (diff chars at same index + length diff).
@@ -3718,6 +3756,14 @@ mod meaningful_edit_tests {
         assert!(is_meaningful_edit("I use written daily", "I use n8n daily"));
         assert!(is_meaningful_edit("I use k9s", "I use k8s")); // 1-char digit fix
         assert!(is_meaningful_edit("v2.1 release", "v2.0 release"));
+    }
+
+    #[test]
+    fn accepts_brand_or_acronym_corrections_even_at_one_char() {
+        assert!(is_meaningful_edit(
+            "MacOps ka kitna profit hai is saal",
+            "MACOBS ka kitna profit hai is saal",
+        ));
     }
 
     #[test]

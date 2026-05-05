@@ -526,6 +526,7 @@ fn plain_for_embed(parts: &[String]) -> String {
 mod tests {
     use super::extract_result_chunk;
     use serde_json::json;
+    use voice_polish_recorder::SAMPLE_RATE;
     use voice_polish_core::deepgram::{BiasPackage, ReplacementRule, build_ws_url};
 
     #[test]
