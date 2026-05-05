@@ -17,6 +17,7 @@ use reqwest::Client;
 use crate::{
     AppState,
     embedder::gemini,
+    stt::background as stt_background,
     store::{corrections, history, pending_edits, prefs::get_prefs, vectors},
 };
 
@@ -103,6 +104,20 @@ pub async fn resolve(
                         info!("[pending-edits] stored {} word correction(s)", diffs.len());
                     }
 
+                    let contradicted = crate::store::stt_replacements::note_negative_signals_for_edit(
+                        &state.pool,
+                        &state.default_user_id,
+                        &pe.ai_output,
+                        &pe.user_kept,
+                    );
+                    if contradicted > 0 {
+                        info!("[pending-edits] downgraded {} alias export signal(s)", contradicted);
+                        let state2 = state.clone();
+                        tokio::spawn(async move {
+                            stt_background::run_pending_alias_reviews(state2, 8).await;
+                        });
+                    }
+
                     info!("[pending-edits] approved {id} → edit_event {:?}", event_id);
 
                     // Fire-and-forget: embed transcript → upsert preference_vector
@@ -116,6 +131,10 @@ pub async fn resolve(
                             .or_else(|| std::env::var("GEMINI_API_KEY").ok())
                             .unwrap_or_default();
                         tokio::spawn(async move {
+                            if !vectors::should_embed_event(&pool2, &event_id2) {
+                                info!("[pending-edits] skipped low-info vector for {event_id2}");
+                                return;
+                            }
                             let http = Client::new();
                             match gemini::embed(&http, &pool2, &transcript2, &gemini_key).await {
                                 None => warn!("[pending-edits] embedding skipped for {event_id2}"),

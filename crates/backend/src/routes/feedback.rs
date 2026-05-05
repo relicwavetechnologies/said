@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 use crate::{
     AppState,
     embedder::gemini,
+    stt::background as stt_background,
     store::{corrections, history, prefs::get_prefs, vectors},
 };
 
@@ -71,6 +72,20 @@ pub async fn submit(State(state): State<AppState>, Json(body): Json<FeedbackBody
         crate::invalidate_lexicon_cache(&state.lexicon_cache).await;
     }
 
+    let contradicted = crate::store::stt_replacements::note_negative_signals_for_edit(
+        &pool,
+        &rec.user_id,
+        &rec.polished,
+        &body.user_kept,
+    );
+    if contradicted > 0 {
+        info!("[feedback] downgraded {} alias export signal(s)", contradicted);
+        let state2 = state.clone();
+        tokio::spawn(async move {
+            stt_background::run_pending_alias_reviews(state2, 8).await;
+        });
+    }
+
     info!(
         "[feedback] edit_event {} created for recording {}",
         edit_event_id, rec.id
@@ -90,6 +105,10 @@ pub async fn submit(State(state): State<AppState>, Json(body): Json<FeedbackBody
             .unwrap_or_default();
 
         tokio::spawn(async move {
+            if !vectors::should_embed_event(&pool2, &event_id2) {
+                info!("[feedback] skipped low-info vector for event {event_id2}");
+                return;
+            }
             let t_start = std::time::Instant::now();
             match gemini::embed(&http_client, &pool2, &transcript2, &gemini_key).await {
                 None => warn!("[feedback] embedding skipped for event {event_id2}"),

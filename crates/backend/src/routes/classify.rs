@@ -43,6 +43,7 @@ use crate::{
         corrections, history, pending_edits, prefs::get_prefs, stt_replacements, vocab_embeddings,
         vocab_fts, vocabulary,
     },
+    stt::{background as stt_background, bias as stt_bias},
 };
 
 #[derive(Deserialize)]
@@ -433,6 +434,44 @@ pub async fn classify(
                     &output_language,
                 );
                 promoted_count += aliases_written;
+                if aliases_written > 0 {
+                    if let Some(canonical) =
+                        vocabulary::get_term(&state.pool, &state.default_user_id, correct)
+                    {
+                        let mut alias_candidates = vec![from.to_string()];
+                        let transcript_alias = cand.hunk.transcript_window.trim();
+                        if !transcript_alias.is_empty() && transcript_alias != from {
+                            alias_candidates.push(transcript_alias.to_string());
+                        }
+                        for alias in alias_candidates {
+                            if let Some(rule) = stt_replacements::get_for_language(
+                                &state.pool,
+                                &state.default_user_id,
+                                &alias,
+                                correct,
+                                &output_language,
+                            ) {
+                                let tier = stt_bias::deterministic_export_tier(&canonical, &rule);
+                                let _ = stt_replacements::update_export_metadata(
+                                    &state.pool,
+                                    &state.default_user_id,
+                                    &alias,
+                                    correct,
+                                    tier,
+                                    stt_replacements::ReviewStatus::Pending,
+                                    Some("Deterministic export tier assigned at learn time."),
+                                    &output_language,
+                                );
+                                stt_background::spawn_alias_review(
+                                    state.clone(),
+                                    alias,
+                                    correct.to_string(),
+                                    output_language.clone(),
+                                );
+                            }
+                        }
+                    }
+                }
                 if vocabulary::top_terms(&state.pool, &state.default_user_id, 200)
                     .iter()
                     .any(|t| t.term.eq_ignore_ascii_case(correct) && t.use_count > 1)
@@ -835,7 +874,7 @@ fn spawn_meaning_refresh(state: AppState, term: String, latest_example: String) 
             }
             // Refinement: hand the LLM the prior description + recent ring.
             Some(prev) => {
-                let examples = vocab_embeddings::recent_example_texts(&pool, &uid, &term, 10);
+                let examples = vocab_embeddings::support_example_texts(&pool, &uid, &term, 4);
                 if examples.is_empty() {
                     None
                 } else {

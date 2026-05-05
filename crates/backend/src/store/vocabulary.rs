@@ -317,6 +317,31 @@ pub fn top_terms(pool: &DbPool, user_id: &str, limit: usize) -> Vec<VocabTerm> {
     .unwrap_or_default()
 }
 
+pub fn get_term(pool: &DbPool, user_id: &str, term: &str) -> Option<VocabTerm> {
+    let conn = pool.get().ok()?;
+    conn.query_row(
+        "SELECT term, weight, use_count, last_used, source,
+                example_context, term_type, meaning
+           FROM vocabulary
+          WHERE user_id = ?1 AND term = ?2
+          LIMIT 1",
+        params![user_id, term.trim()],
+        |row| {
+            Ok(VocabTerm {
+                term: row.get(0)?,
+                weight: row.get(1)?,
+                use_count: row.get(2)?,
+                last_used: row.get(3)?,
+                source: row.get(4)?,
+                example_context: row.get(5).ok(),
+                term_type: row.get(6).ok(),
+                meaning: row.get(7).ok(),
+            })
+        },
+    )
+    .ok()
+}
+
 pub fn top_terms_for_language(
     pool: &DbPool,
     user_id: &str,

@@ -79,7 +79,7 @@ async fn main() {
     polish_backend::routes::vocabulary::spawn_prompt_artifact_repair(state.clone());
 
     // ── Build router ──────────────────────────────────────────────────────────
-    let router = polish_backend::router_with_state(state);
+    let router = polish_backend::router_with_state(state.clone());
 
     // ── Bind listener ─────────────────────────────────────────────────────────
     let addr = format!("127.0.0.1:{}", cli.port);
@@ -117,6 +117,20 @@ async fn main() {
             loop {
                 interval.tick().await;
                 send_metering_report(&pool3, &user_id2, &http, &cloud_url).await;
+            }
+        });
+    }
+
+    // ── Background alias review lane ────────────────────────────────────────
+    {
+        let state2 = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
+            interval.tick().await; // skip immediate startup run
+            loop {
+                interval.tick().await;
+                polish_backend::stt::background::run_pending_alias_reviews(state2.clone(), 12)
+                    .await;
             }
         });
     }

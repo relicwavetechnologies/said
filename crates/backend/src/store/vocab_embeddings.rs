@@ -204,6 +204,101 @@ pub fn recent_example_texts(pool: &DbPool, user_id: &str, term: &str, limit: usi
     .unwrap_or_default()
 }
 
+/// Curate a small support set for meaning generation/refinement.
+///
+/// The support set is intentionally stable and diverse:
+///   • earliest anchor-rich example
+///   • latest example
+///   • strongest lexical-anchor example
+///   • one diverse outlier when examples differ materially
+///
+/// This gives the background meaning LLM a better view of the term than
+/// "just the newest sentence", while keeping prompt size bounded.
+pub fn support_example_texts(pool: &DbPool, user_id: &str, term: &str, limit: usize) -> Vec<String> {
+    let Ok(conn) = pool.get() else {
+        return vec![];
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT example_text, recorded_at FROM vocab_embedding_examples
+          WHERE user_id = ?1 AND term = ?2
+          ORDER BY recorded_at ASC",
+    ) else {
+        return vec![];
+    };
+    let rows: Vec<(String, i64)> = stmt
+        .query_map(params![user_id, term.trim()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .ok()
+        .map(|iter| iter.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return vec![];
+    }
+    if rows.len() == 1 || limit <= 1 {
+        return vec![rows[0].0.clone()];
+    }
+
+    let anchor_score = |text: &str| -> usize {
+        text.split_whitespace()
+            .filter(|tok| {
+                let trimmed = tok.trim_matches(|c: char| !c.is_alphanumeric());
+                trimmed.chars().any(|c| c.is_ascii_digit()) || trimmed.chars().count() >= 4
+            })
+            .count()
+    };
+
+    let mut chosen: Vec<String> = Vec::new();
+    let push_unique = |chosen: &mut Vec<String>, candidate: &str| {
+        if !candidate.trim().is_empty() && !chosen.iter().any(|s| s == candidate) {
+            chosen.push(candidate.to_string());
+        }
+    };
+
+    // Earliest useful anchor-rich example.
+    if let Some((text, _)) = rows.iter().max_by_key(|(text, recorded_at)| {
+        (
+            anchor_score(text),
+            std::cmp::Reverse(*recorded_at),
+        )
+    }) {
+        push_unique(&mut chosen, text);
+    }
+
+    // Latest example.
+    if let Some((text, _)) = rows.last() {
+        push_unique(&mut chosen, text);
+    }
+
+    // Strongest lexical anchor example.
+    if let Some((text, _)) = rows.iter().max_by_key(|(text, _)| anchor_score(text)) {
+        push_unique(&mut chosen, text);
+    }
+
+    // One diverse outlier if available.
+    let seed = chosen.first().cloned().unwrap_or_else(|| rows[0].0.clone());
+    let seed_tokens: std::collections::HashSet<String> = seed
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if let Some((text, _)) = rows.iter().max_by_key(|(text, _)| {
+        let tokens: std::collections::HashSet<String> = text
+            .split_whitespace()
+            .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let overlap = tokens.intersection(&seed_tokens).count();
+        let novelty = tokens.len().saturating_sub(overlap);
+        (novelty, anchor_score(text))
+    }) {
+        push_unique(&mut chosen, text);
+    }
+
+    chosen.truncate(limit.max(1));
+    chosen
+}
+
 /// Bump `last_used` on a set of vocab terms — called after polish completes
 /// so terms that actually appeared in the prompt get reinforced. This is
 /// the "use signal" half of the time-decay scoring (the other half is the
@@ -869,6 +964,35 @@ mod tests {
     /// Build a tiny 4-d unit-ish vector for testing cosine math.
     fn vec4(a: f32, b: f32, c: f32, d: f32) -> Vec<f32> {
         vec![a, b, c, d]
+    }
+
+    #[test]
+    fn support_examples_curate_stable_meaning_contexts() {
+        let pool = mem_pool();
+        seed(&pool, "EMIAC", 2.0, "manual", &vec4(1.0, 0.0, 0.0, 0.0), "hinglish");
+        let conn = pool.get().unwrap();
+        let emb = crate::embedder::gemini::floats_to_blob(&vec4(1.0, 0.0, 0.0, 0.0));
+        let cases = [
+            (1_i64, "EMIAC growth in FY2026 premium segment"),
+            (2_i64, "EMIAC company overview"),
+            (3_i64, "EMIAC trimmer margin compared with MACOBS"),
+            (4_i64, "Latest EMIAC update for retail expansion"),
+        ];
+        for (recorded_at, text) in cases {
+            conn.execute(
+                "INSERT INTO vocab_embedding_examples (user_id, term, embedding, example_text, recorded_at)
+                 VALUES ('u1', 'EMIAC', ?1, ?2, ?3)",
+                params![emb, text, recorded_at],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let support = support_example_texts(&pool, "u1", "EMIAC", 4);
+        assert!(support.contains(&"Latest EMIAC update for retail expansion".to_string()));
+        assert!(support.contains(&"EMIAC trimmer margin compared with MACOBS".to_string()));
+        assert!(support.len() >= 2);
+        assert!(support.len() <= 4);
     }
 
     // ── Centroid ring + drift detection ───────────────────────────────────────

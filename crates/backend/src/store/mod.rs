@@ -37,6 +37,7 @@ const MIGRATION_015: &str = include_str!("migrations/015_vocab_embeddings.sql");
 const MIGRATION_016: &str = include_str!("migrations/016_vocab_term_type.sql");
 const MIGRATION_017: &str = include_str!("migrations/017_centroid_decay_fts.sql");
 const MIGRATION_018: &str = include_str!("migrations/018_vocab_meaning.sql");
+const MIGRATION_019: &str = include_str!("migrations/019_background_learning_trust.sql");
 
 /// Open (or create) the SQLite database at `path`, run pending migrations,
 /// and return a connection pool.
@@ -226,6 +227,14 @@ fn run_migrations(pool: &DbPool) {
             .expect("migration 018 failed");
         conn.execute_batch("PRAGMA user_version = 18")
             .expect("failed to set user_version to 18");
+    }
+
+    if version < 19 {
+        info!("running migration 019_background_learning_trust");
+        conn.execute_batch(MIGRATION_019)
+            .expect("migration 019 failed");
+        conn.execute_batch("PRAGMA user_version = 19")
+            .expect("failed to set user_version to 19");
     }
 }
 

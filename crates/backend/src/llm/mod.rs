@@ -1,3 +1,4 @@
+pub mod alias_review;
 pub mod classifier;
 pub mod edit_diff;
 pub mod gateway;

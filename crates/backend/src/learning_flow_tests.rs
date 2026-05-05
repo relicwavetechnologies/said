@@ -53,6 +53,12 @@ fn pool() -> DbPool {
              use_count        INTEGER NOT NULL DEFAULT 1,
              last_used        INTEGER NOT NULL,
              language         TEXT,
+             export_tier      TEXT NOT NULL DEFAULT 'local_only',
+             contradiction_count INTEGER NOT NULL DEFAULT 0,
+             last_contradicted_at INTEGER,
+             review_status    TEXT NOT NULL DEFAULT 'pending',
+             review_reason    TEXT,
+             last_reviewed_at INTEGER,
              UNIQUE(user_id, transcript_form, correct_form)
          );
 

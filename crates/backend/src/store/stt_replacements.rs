@@ -13,7 +13,7 @@
 //! that the exact pass would miss without exploding the table size.
 
 use rusqlite::params;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use super::{DbPool, now_ms};
@@ -27,6 +27,68 @@ pub struct SttReplacement {
     pub weight: f64,
     pub use_count: i64,
     pub last_used: i64,
+    pub language: Option<String>,
+    pub export_tier: ExportTier,
+    pub contradiction_count: i64,
+    pub review_status: ReviewStatus,
+    pub review_reason: Option<String>,
+    pub last_reviewed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ExportTier {
+    LocalOnly,
+    ExportKeytermSupport,
+    ExportReplaceReady,
+    Blocked,
+}
+
+impl ExportTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalOnly => "local_only",
+            Self::ExportKeytermSupport => "export_keyterm_support",
+            Self::ExportReplaceReady => "export_replace_ready",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim() {
+            "export_keyterm_support" => Self::ExportKeytermSupport,
+            "export_replace_ready" => Self::ExportReplaceReady,
+            "blocked" => Self::Blocked,
+            _ => Self::LocalOnly,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ReviewStatus {
+    Pending,
+    Approved,
+    Blocked,
+    Skipped,
+}
+
+impl ReviewStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Blocked => "blocked",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim() {
+            "approved" => Self::Approved,
+            "blocked" => Self::Blocked,
+            "skipped" => Self::Skipped,
+            _ => Self::Pending,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,13 +182,18 @@ fn upsert_inner(
     let rows = conn
         .execute(
             "INSERT INTO stt_replacements
-            (user_id, transcript_form, correct_form, phonetic_key, weight, use_count, last_used, language)
-         VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7)
+            (user_id, transcript_form, correct_form, phonetic_key, weight, use_count, last_used, language,
+             export_tier, contradiction_count, review_status)
+         VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, 'local_only', 0, 'pending')
          ON CONFLICT(user_id, transcript_form, correct_form) DO UPDATE SET
             weight    = MIN(5.0, weight + ?5),
             use_count = use_count + 1,
             last_used = excluded.last_used,
-            language  = COALESCE(excluded.language, stt_replacements.language)",
+            language  = COALESCE(excluded.language, stt_replacements.language),
+            review_status = CASE
+                              WHEN stt_replacements.review_status = 'blocked' THEN 'blocked'
+                              ELSE 'pending'
+                            END",
             params![user_id, from, to, key, bump, now, language],
         )
         .unwrap_or(0);
@@ -280,12 +347,14 @@ pub fn load_for_language(pool: &DbPool, user_id: &str, language: &str) -> Vec<St
         Err(_) => return vec![],
     };
     let sql = if language.trim().is_empty() {
-        "SELECT transcript_form, correct_form, phonetic_key, weight, use_count, last_used
+        "SELECT transcript_form, correct_form, phonetic_key, weight, use_count, last_used,
+                language, export_tier, contradiction_count, review_status, review_reason, last_reviewed_at
            FROM stt_replacements
           WHERE user_id = ?1
           ORDER BY weight DESC"
     } else {
-        "SELECT transcript_form, correct_form, phonetic_key, weight, use_count, last_used
+        "SELECT transcript_form, correct_form, phonetic_key, weight, use_count, last_used,
+                language, export_tier, contradiction_count, review_status, review_reason, last_reviewed_at
            FROM stt_replacements
           WHERE user_id = ?1
             AND (language = ?2 OR language IS NULL)
@@ -304,10 +373,16 @@ pub fn load_for_language(pool: &DbPool, user_id: &str, language: &str) -> Vec<St
                 weight: row.get(3)?,
                 use_count: row.get(4)?,
                 last_used: row.get(5)?,
+                language: row.get(6).ok(),
+                export_tier: ExportTier::parse(&row.get::<_, String>(7)?),
+                contradiction_count: row.get(8)?,
+                review_status: ReviewStatus::parse(&row.get::<_, String>(9)?),
+                review_reason: row.get(10).ok(),
+                last_reviewed_at: row.get(11).ok(),
             })
         })
         .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
         .unwrap_or_default()
     } else {
         stmt.query_map(params![user_id, language], |row| {
@@ -318,12 +393,195 @@ pub fn load_for_language(pool: &DbPool, user_id: &str, language: &str) -> Vec<St
                 weight: row.get(3)?,
                 use_count: row.get(4)?,
                 last_used: row.get(5)?,
+                language: row.get(6).ok(),
+                export_tier: ExportTier::parse(&row.get::<_, String>(7)?),
+                contradiction_count: row.get(8)?,
+                review_status: ReviewStatus::parse(&row.get::<_, String>(9)?),
+                review_reason: row.get(10).ok(),
+                last_reviewed_at: row.get(11).ok(),
             })
         })
         .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
         .unwrap_or_default()
     }
+}
+
+pub fn get_for_language(
+    pool: &DbPool,
+    user_id: &str,
+    transcript_form: &str,
+    correct_form: &str,
+    language: &str,
+) -> Option<SttReplacement> {
+    let conn = pool.get().ok()?;
+    let from = transcript_form.trim().to_ascii_lowercase();
+    let to = correct_form.trim();
+    if from.is_empty() || to.is_empty() {
+        return None;
+    }
+    conn.query_row(
+        "SELECT transcript_form, correct_form, phonetic_key, weight, use_count, last_used,
+                language, export_tier, contradiction_count, review_status, review_reason, last_reviewed_at
+           FROM stt_replacements
+          WHERE user_id = ?1
+            AND transcript_form = ?2
+            AND correct_form = ?3
+            AND (language = ?4 OR (?4 = '' AND language IS NULL) OR (?4 != '' AND language IS NULL))
+          ORDER BY CASE WHEN language = ?4 THEN 0 ELSE 1 END
+          LIMIT 1",
+        params![user_id, from, to, language],
+        |row| {
+            Ok(SttReplacement {
+                transcript_form: row.get(0)?,
+                correct_form: row.get(1)?,
+                phonetic_key: row.get(2)?,
+                weight: row.get(3)?,
+                use_count: row.get(4)?,
+                last_used: row.get(5)?,
+                language: row.get(6).ok(),
+                export_tier: ExportTier::parse(&row.get::<_, String>(7)?),
+                contradiction_count: row.get(8)?,
+                review_status: ReviewStatus::parse(&row.get::<_, String>(9)?),
+                review_reason: row.get(10).ok(),
+                last_reviewed_at: row.get(11).ok(),
+            })
+        },
+    )
+    .ok()
+}
+
+pub fn update_export_metadata(
+    pool: &DbPool,
+    user_id: &str,
+    transcript_form: &str,
+    correct_form: &str,
+    export_tier: ExportTier,
+    review_status: ReviewStatus,
+    review_reason: Option<&str>,
+    language: &str,
+) -> bool {
+    let Ok(conn) = pool.get() else {
+        return false;
+    };
+    let now = now_ms();
+    conn.execute(
+        "UPDATE stt_replacements
+            SET export_tier = ?5,
+                review_status = ?6,
+                review_reason = ?7,
+                last_reviewed_at = ?8
+          WHERE user_id = ?1
+            AND transcript_form = ?2
+            AND correct_form = ?3
+            AND (language = ?4 OR (?4 = '' AND language IS NULL) OR (?4 != '' AND language IS NULL))",
+        params![
+            user_id,
+            transcript_form.trim().to_ascii_lowercase(),
+            correct_form.trim(),
+            language,
+            export_tier.as_str(),
+            review_status.as_str(),
+            review_reason,
+            now
+        ],
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
+pub fn note_negative_signal(
+    pool: &DbPool,
+    user_id: &str,
+    correct_form: &str,
+    penalty: i64,
+) -> usize {
+    let Ok(conn) = pool.get() else {
+        return 0;
+    };
+    let now = now_ms();
+    conn.execute(
+        "UPDATE stt_replacements
+            SET contradiction_count = contradiction_count + ?3,
+                last_contradicted_at = ?4,
+                export_tier = CASE
+                    WHEN contradiction_count + ?3 >= 4 THEN 'blocked'
+                    WHEN contradiction_count + ?3 >= 2 THEN 'local_only'
+                    WHEN export_tier = 'export_replace_ready' THEN 'export_keyterm_support'
+                    ELSE export_tier
+                END,
+                review_status = CASE
+                    WHEN review_status = 'blocked' THEN 'blocked'
+                    ELSE 'pending'
+                END
+          WHERE user_id = ?1
+            AND lower(correct_form) = lower(?2)",
+        params![user_id, correct_form.trim(), penalty, now],
+    )
+    .unwrap_or(0)
+}
+
+pub fn review_candidates(pool: &DbPool, user_id: &str, limit: usize) -> Vec<SttReplacement> {
+    let Ok(conn) = pool.get() else {
+        return vec![];
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT transcript_form, correct_form, phonetic_key, weight, use_count, last_used,
+                language, export_tier, contradiction_count, review_status, review_reason, last_reviewed_at
+           FROM stt_replacements
+          WHERE user_id = ?1
+            AND (
+                review_status = 'pending'
+                OR contradiction_count > 0
+                OR (last_reviewed_at IS NULL AND export_tier != 'local_only')
+            )
+          ORDER BY contradiction_count DESC, use_count DESC, weight DESC, last_used DESC
+          LIMIT ?2",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return vec![],
+    };
+    stmt.query_map(params![user_id, limit as i64], |row| {
+        Ok(SttReplacement {
+            transcript_form: row.get(0)?,
+            correct_form: row.get(1)?,
+            phonetic_key: row.get(2)?,
+            weight: row.get(3)?,
+            use_count: row.get(4)?,
+            last_used: row.get(5)?,
+            language: row.get(6).ok(),
+            export_tier: ExportTier::parse(&row.get::<_, String>(7)?),
+            contradiction_count: row.get(8)?,
+            review_status: ReviewStatus::parse(&row.get::<_, String>(9)?),
+            review_reason: row.get(10).ok(),
+            last_reviewed_at: row.get(11).ok(),
+        })
+    })
+    .ok()
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
+
+pub fn note_negative_signals_for_edit(
+    pool: &DbPool,
+    user_id: &str,
+    ai_output: &str,
+    user_kept: &str,
+) -> usize {
+    let ai_lower = ai_output.to_ascii_lowercase();
+    let kept_lower = user_kept.to_ascii_lowercase();
+    let mut seen = std::collections::HashSet::new();
+    let mut updated = 0;
+    for rule in load_all(pool, user_id) {
+        let canonical = rule.correct_form.to_ascii_lowercase();
+        if canonical.is_empty() || !ai_lower.contains(&canonical) || kept_lower.contains(&canonical) {
+            continue;
+        }
+        if seen.insert(canonical.clone()) {
+            updated += note_negative_signal(pool, user_id, &canonical, 1);
+        }
+    }
+    updated
 }
 
 /// Apply replacements to a transcript. Pure function; safe to unit-test.
@@ -558,6 +816,12 @@ mod tests {
             weight: 1.0,
             use_count: 1,
             last_used: 0,
+            language: None,
+            export_tier: ExportTier::LocalOnly,
+            contradiction_count: 0,
+            review_status: ReviewStatus::Pending,
+            review_reason: None,
+            last_reviewed_at: None,
         }
     }
 
@@ -638,6 +902,12 @@ mod tests {
                  use_count        INTEGER NOT NULL DEFAULT 1,
                  last_used        INTEGER NOT NULL,
                  language         TEXT,
+                 export_tier      TEXT NOT NULL DEFAULT 'local_only',
+                 contradiction_count INTEGER NOT NULL DEFAULT 0,
+                 last_contradicted_at INTEGER,
+                 review_status    TEXT NOT NULL DEFAULT 'pending',
+                 review_reason    TEXT,
+                 last_reviewed_at INTEGER,
                  UNIQUE(user_id, transcript_form, correct_form)
              );",
         )
@@ -696,6 +966,40 @@ mod tests {
         assert_eq!(n, 1);
         let rules = super::load_all(&pool, "u1");
         assert_eq!(rules.len(), 1);
+    }
+
+    #[test]
+    fn contradiction_signal_revokes_export_before_blocking_local_memory() {
+        let pool = mem_pool();
+        assert!(super::upsert_with_language(
+            &pool, "u1", "emi", "EMIAC", 3.0, "hinglish"
+        ));
+        assert!(super::update_export_metadata(
+            &pool,
+            "u1",
+            "emi",
+            "EMIAC",
+            ExportTier::ExportReplaceReady,
+            ReviewStatus::Approved,
+            Some("trusted"),
+            "hinglish",
+        ));
+
+        assert_eq!(super::note_negative_signal(&pool, "u1", "EMIAC", 1), 1);
+        let once = super::get_for_language(&pool, "u1", "emi", "EMIAC", "hinglish").unwrap();
+        assert_eq!(once.contradiction_count, 1);
+        assert_eq!(once.export_tier, ExportTier::ExportKeytermSupport);
+        assert_eq!(once.review_status, ReviewStatus::Pending);
+
+        assert_eq!(super::note_negative_signal(&pool, "u1", "EMIAC", 1), 1);
+        let twice = super::get_for_language(&pool, "u1", "emi", "EMIAC", "hinglish").unwrap();
+        assert_eq!(twice.contradiction_count, 2);
+        assert_eq!(twice.export_tier, ExportTier::LocalOnly);
+
+        assert_eq!(super::note_negative_signal(&pool, "u1", "EMIAC", 2), 1);
+        let blocked = super::get_for_language(&pool, "u1", "emi", "EMIAC", "hinglish").unwrap();
+        assert_eq!(blocked.contradiction_count, 4);
+        assert_eq!(blocked.export_tier, ExportTier::Blocked);
     }
 
     #[test]

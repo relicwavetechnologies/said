@@ -5,7 +5,11 @@ use voice_polish_core::deepgram::{BiasPackage, ReplacementRule, resolve_stt_mode
 
 use crate::{
     llm::phonetics,
-    store::{DbPool, stt_replacements, vocabulary},
+    store::{
+        DbPool,
+        stt_replacements::{self, ExportTier, ReviewStatus, SttReplacement},
+        vocabulary,
+    },
 };
 
 fn is_high_signal_term_type(term_type: Option<&str>) -> bool {
@@ -52,6 +56,19 @@ fn canonical_keyterm_score(term: &vocabulary::VocabTerm) -> f64 {
     score += (term.use_count.min(8) as f64) * 0.35;
     score += (term.last_used.max(0) as f64) / 1_000_000_000_000.0;
     score
+}
+
+fn alias_support_score(rule: &SttReplacement) -> f64 {
+    let mut score = 0.0;
+    match rule.export_tier {
+        ExportTier::ExportReplaceReady => score += 2.0,
+        ExportTier::ExportKeytermSupport => score += 1.0,
+        ExportTier::Blocked => score -= 2.0,
+        ExportTier::LocalOnly => {}
+    }
+    score += (rule.use_count.min(8) as f64) * 0.2;
+    score += rule.weight.min(5.0) * 0.2;
+    score - (rule.contradiction_count as f64 * 0.75)
 }
 
 fn alias_is_commonish(alias: &str) -> bool {
@@ -128,6 +145,45 @@ fn replacement_trust_score(term: &vocabulary::VocabTerm, rule: &stt_replacements
     Some(score)
 }
 
+pub fn deterministic_export_tier(
+    canonical: &vocabulary::VocabTerm,
+    rule: &SttReplacement,
+) -> ExportTier {
+    if rule.contradiction_count >= 4 {
+        return ExportTier::Blocked;
+    }
+    if alias_is_commonish(&rule.transcript_form) && !matches!(canonical.term_type.as_deref(), Some("acronym" | "code_identifier")) {
+        return ExportTier::LocalOnly;
+    }
+    if replacement_trust_score(canonical, rule).is_some() {
+        return ExportTier::ExportReplaceReady;
+    }
+    if is_precise_keyterm(canonical)
+        && canonical_keyterm_score(canonical) >= 3.0
+        && rule.use_count >= 2
+        && rule.weight >= 2.0
+        && rule.contradiction_count < 2
+    {
+        return ExportTier::ExportKeytermSupport;
+    }
+    ExportTier::LocalOnly
+}
+
+fn effective_export_tier(
+    canonical: &vocabulary::VocabTerm,
+    rule: &SttReplacement,
+) -> ExportTier {
+    if rule.review_status == ReviewStatus::Blocked || rule.export_tier == ExportTier::Blocked {
+        return ExportTier::Blocked;
+    }
+    let deterministic = deterministic_export_tier(canonical, rule);
+    match rule.review_status {
+        ReviewStatus::Approved | ReviewStatus::Skipped => rule.export_tier,
+        ReviewStatus::Pending => deterministic,
+        ReviewStatus::Blocked => ExportTier::Blocked,
+    }
+}
+
 pub fn build_bias_package(
     pool: &DbPool,
     user_id: &str,
@@ -136,6 +192,27 @@ pub fn build_bias_package(
 ) -> BiasPackage {
     let stt_mode = resolve_stt_mode(transcription_language);
     let vocab_terms = vocabulary::top_terms_for_language(pool, user_id, output_language, 200);
+    let alias_rules = stt_replacements::load_for_language(pool, user_id, output_language);
+    let vocab_by_term: HashMap<String, vocabulary::VocabTerm> = vocab_terms
+        .iter()
+        .cloned()
+        .map(|term| (term.term.to_ascii_lowercase(), term))
+        .collect();
+    let mut alias_support_by_canonical: HashMap<String, f64> = HashMap::new();
+    for rule in &alias_rules {
+        let Some(canonical) = vocab_by_term.get(&rule.correct_form.to_ascii_lowercase()) else {
+            continue;
+        };
+        let effective_tier = effective_export_tier(canonical, rule);
+        if effective_tier == ExportTier::Blocked {
+            continue;
+        }
+        let mut effective_rule = rule.clone();
+        effective_rule.export_tier = effective_tier;
+        *alias_support_by_canonical
+            .entry(rule.correct_form.to_ascii_lowercase())
+            .or_insert(0.0) += alias_support_score(&effective_rule);
+    }
 
     let mut seen_terms = HashSet::new();
     let mut keyterms = Vec::new();
@@ -144,8 +221,17 @@ pub fn build_bias_package(
         .filter(|t| is_precise_keyterm(t))
         .collect();
     keyterm_candidates.sort_by(|a, b| {
-        canonical_keyterm_score(b)
-            .partial_cmp(&canonical_keyterm_score(a))
+        let sb = canonical_keyterm_score(b)
+            + alias_support_by_canonical
+                .get(&b.term.to_ascii_lowercase())
+                .copied()
+                .unwrap_or(0.0);
+        let sa = canonical_keyterm_score(a)
+            + alias_support_by_canonical
+                .get(&a.term.to_ascii_lowercase())
+                .copied()
+                .unwrap_or(0.0);
+        sb.partial_cmp(&sa)
             .unwrap_or(Ordering::Equal)
     });
     for term in keyterm_candidates {
@@ -158,14 +244,9 @@ pub fn build_bias_package(
         }
     }
 
-    let vocab_by_term: HashMap<String, vocabulary::VocabTerm> = vocab_terms
-        .into_iter()
-        .map(|term| (term.term.to_ascii_lowercase(), term))
-        .collect();
-
     let mut seen_replacements = HashSet::new();
     let mut replacement_candidates: Vec<(f64, ReplacementRule)> = Vec::new();
-    for rule in stt_replacements::load_for_language(pool, user_id, output_language) {
+    for rule in alias_rules {
         let find = rule.transcript_form.trim();
         let replace = rule.correct_form.trim();
         if find.is_empty() || replace.is_empty() {
@@ -174,10 +255,17 @@ pub fn build_bias_package(
         if find.eq_ignore_ascii_case(replace) {
             continue;
         }
+        if rule.review_status == ReviewStatus::Blocked {
+            continue;
+        }
 
         let Some(canonical) = vocab_by_term.get(&replace.to_ascii_lowercase()) else {
             continue;
         };
+        let effective_tier = effective_export_tier(canonical, &rule);
+        if effective_tier != ExportTier::ExportReplaceReady {
+            continue;
+        }
         let Some(score) = replacement_trust_score(canonical, &rule) else {
             continue;
         };
@@ -250,6 +338,12 @@ mod tests {
                  use_count INTEGER NOT NULL,
                  last_used INTEGER NOT NULL,
                  language TEXT,
+                 export_tier TEXT NOT NULL DEFAULT 'local_only',
+                 contradiction_count INTEGER NOT NULL DEFAULT 0,
+                 last_contradicted_at INTEGER,
+                 review_status TEXT NOT NULL DEFAULT 'pending',
+                 review_reason TEXT,
+                 last_reviewed_at INTEGER,
                  UNIQUE(user_id, transcript_form, correct_form)
              );",
         )
